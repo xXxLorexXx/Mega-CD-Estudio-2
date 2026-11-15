@@ -1,0 +1,34 @@
+{
+  "origen": "Recursos del reproductor conservados de MegaCD Video Studio 7.0; véase THIRD_PARTY_NOTICES.md.",
+  "sha256_exe": "a50540d078237221386c755d7864319e32cb3c7170085d31131cd7ae0e90875b",
+  "recursos": {
+    "IP_BIN": {
+      "bytes": 5164,
+      "sha256": "c25757007f601aa08581fed968e1927ba93bca8f18184f613210012a1eb12c63"
+    },
+    "MAINPLAY_BIN": {
+      "bytes": 5116,
+      "sha256": "87b3ed1b91185446806bae093a1519462b637bf3d5b9a491dc1e3ed2603bb4fe"
+    },
+    "SUBPLAY_BIN": {
+      "bytes": 6132,
+      "sha256": "2732d5b9dc062f64d78f666a5e98d36bb31db2f2f74e45a0e73016c6f751eb86"
+    },
+    "HEAD_EU": {
+      "bytes": 51200,
+      "sha256": "99c2f3f06a5a5f19649ac590a160f9aebcdf59f8583d4b8f90d829a1560cdd22"
+    },
+    "HEAD_US": {
+      "bytes": 51200,
+      "sha256": "42cb3ebddc5f57b22ede3f0986f1e9a63b07ce981d219748f5086f6b4d4ebfad"
+    },
+    "HEAD_JP": {
+      "bytes": 51200,
+      "sha256": "0b13b75d92d8a7e07444ba1334db5dea9d379c7bb8a2f9606dcbb891de67a489"
+    },
+    "MAINFONT_BIN": {
+      "bytes": 768,
+      "sha256": "fd6e78ea1b823ce91e77816f2e2b6c3bd6f0638017f847cdbcbd253fd4ddc9cd"
+    }
+  }
+}

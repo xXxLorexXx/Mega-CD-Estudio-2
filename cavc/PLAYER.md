@@ -1,0 +1,1168 @@
+EN / [JP](#jp)
+
+# Player Memory Maps and Runtime Sequence
+
+This document describes the player as currently built: the Sub PRG-RAM,
+Word RAM 1M/1M, and Main RAM maps, the startup sequence, and the per-frame
+CPU handoff. Each map row carries a short range name (shown as `CODE`) so a
+range can be referenced unambiguously in issues, commits, and reviews.
+
+**fps dependence.** Across 15, 24, and 30 fps content, the only address-map
+difference is the `PRG-BUF` / `JITTER` split inside the fixed
+`0x0D800..0x74FFF` region; that split is the one place below where both
+15 and 30 fps values are listed side by side. Every other row of every map,
+and the whole startup / per-frame sequence, apply at all three rates. Word-RAM
+WordBuf and routing sizes vary by
+profile (frame count, cell count, cold cap), not by fps.
+
+**Display cadence.** The player derives one authoritative repeating VBlank
+schedule from the packed header. The 15 fps path repeats `(4)`, 24 fps repeats
+`(2, 3)` beginning with two VBlanks from frame 0 to frame 1, and 30 fps repeats
+`(2)`. Main's display deadline and Sub's CD-sector allowance advance in the
+same phase. Their effective rates are 15000/1001, 24000/1001, and 30000/1001
+fps respectively.
+
+The 24 fps display controller remains phase-locked after a missed deadline.
+It counts whole-VBlank lateness as debt and repays that debt only by shortening
+a later nominal three-VBlank display step to two. It never shortens a
+two-VBlank step to one. The Sub CPU's physical `(2, 3)` sector schedule remains
+unchanged; the late frame has already given the reader the extra physical time
+that the compensating display step consumes. This prevents isolated display
+misses from becoming permanent reader lead and filling the APPLY queue.
+
+## RAM Copy Timing Reference
+
+These are instruction-based estimates for copies among Main RAM, PRG-RAM,
+and Word RAM, not measured hardware throughput or a player scheduling budget.
+Use approximately 7.67 MHz for Main (NTSC) and 12.5 MHz for Sub.
+For other Main clock rates, scale these estimates by the clock ratio.
+MB/s below means 1,000,000 payload bytes/s, counting copied bytes once.
+
+The per-frame and per-scanline columns use the project's nominal NTSC
+display timebase: `60000/1001` display frames/s and 262 scanlines/display frame
+(including blanking). One display frame is about 16.6833 ms and one scanline
+about 63.6768 us. Calculate `B/display frame = B/s * 1001/60000` and
+`B/scanline = B/display frame / 262` from the unrounded instruction rate,
+then round to one decimal place. These are continuous-copy time equivalents,
+not guaranteed whole-instruction completion counts, crystal-accurate timings,
+or VBlank-only budgets. They inherit every no-wait/conditional-ceiling limit
+of their source rate. A movie frame spanning N display frames provides N times
+this time interval, before other work is deducted.
+
+### Instruction cost
+
+With no additional bus waits, aligned `move.l (a0)+,(a1)+` copies four bytes
+in 20 CPU clocks, including instruction fetch, source reads, and destination
+writes. A continuing `dbra` adds 10 clocks per iteration; setup and the final
+iteration are excluded from these steady-state estimates.
+
+| Copy loop | Clocks per payload block | Main MB/s | Main B/display frame | Main B/scanline | Sub MB/s | Sub B/display frame | Sub B/scanline |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Consecutive `move.l`, excluding loop control | 20 / 4 B | 1.534 | 25,592.2 | 97.7 | 2.500 | 41,708.3 | 159.2 |
+| One `move.l` followed by `dbra` | 30 / 4 B | 1.023 | 17,061.5 | 65.1 | 1.667 | 27,805.6 | 106.1 |
+| Eight `move.l` followed by `dbra` | 170 / 32 B | 1.444 | 24,086.8 | 91.9 | 2.353 | 39,254.9 | 149.8 |
+
+The calculation is `bytes * CPU_Hz / clocks`. For a 32-byte pattern, the
+copy instructions alone take 160 clocks: about 20.86 us on Main or 12.80 us
+on Sub. These are baselines for this instruction sequence, not CPU-wide
+maximum rates; a `movem` implementation needs its own accounting.
+
+### Routes and ownership
+
+The rates in this table all use consecutive `move.l` without loop control.
+They assume no additional waits on instruction fetches or data accesses.
+The Sega manual describes non-wait memory access when devices do not compete,
+with Sub access to PRG-RAM and Word RAM as examples.
+
+| Source and destination | Copying CPU | No-wait estimate | B/display frame | B/scanline | Access condition |
+|---|---|---:|---:|---:|---|
+| Main RAM to Main RAM | Main | 1.534 MB/s | 25,592.2 | 97.7 | Main bus available |
+| PRG-RAM to PRG-RAM | Sub | 2.500 MB/s | 41,708.3 | 159.2 | Excludes arbitration with refresh/CDC DMA |
+| Word RAM to Word RAM within the owned region | Sub | 2.500 MB/s | 41,708.3 | 159.2 | Sub owns that region |
+| Word RAM to Word RAM within the owned region | Main | 1.534 MB/s | 25,592.2 | 97.7 | Main owns that region |
+| PRG-RAM to/from Word RAM | Sub | 2.500 MB/s | 41,708.3 | 159.2 | Sub owns the target Word RAM region |
+| Main RAM to/from Word RAM | Main | 1.534 MB/s | 25,592.2 | 97.7 | Main owns the target Word RAM region |
+| Main RAM to/from PRG-RAM | Main | 1.534 MB/s, conditional ceiling | 25,592.2 | 97.7 | Main must acquire the Sub bus; additional access timing is unqualified |
+| PRG-RAM to/from Word RAM | Main | 1.534 MB/s, conditional ceiling | 25,592.2 | 97.7 | Main must acquire the Sub bus and own the Word RAM region; additional access timing is unqualified |
+| PRG-RAM to PRG-RAM | Main | 1.534 MB/s, conditional ceiling | 25,592.2 | 97.7 | Both addresses must be in the selected 128 KiB PRG window; additional access timing is unqualified |
+
+Sub cannot directly access Main RAM. Main access to PRG-RAM requires a Sub
+bus request/reset handshake and prevents concurrent Sub CPU execution.
+Include bus acquisition and PRG window changes separately from payload copies.
+
+In 2M mode, one CPU owns the full 256 KiB Word RAM. In 1M/1M mode, each CPU
+owns a different 128 KiB bank. Swapping banks changes ownership without copying
+their bytes. A CPU cannot directly copy WordBuf0 to WordBuf1 while remaining
+in 1M/1M mode: staging and a bank exchange, or a mode change, are required.
+Ownership covers the physical bank; WordBuf is a pattern sequence
+within that bank, not a separate memory device.
+
+For a design estimate, add loop control, address/index work, interrupts, bus
+arbitration, and ownership waits to the instruction cost. Code location also
+matters because instruction fetches use the bus. Validate the actual assembled
+copy path before using these figures as deadline evidence. This table does not
+describe PCM RAM, backup RAM, Z80 RAM, CDC transfers, or graphics operations.
+
+### VDP DMA boundary
+
+RAM-to-VDP transfers use a separate timing model. Sega's H40 memory-to-VRAM DMA
+table gives 18 bytes per scanline during active display and 205 bytes per
+scanline during VBlank. These are transfer capacities during those intervals,
+not sustained whole-frame rates. The manual specifies words instead of bytes
+for CRAM/VSRAM destinations. Use the player's VBlank budget described
+below for admission. For every Word-RAM DMA chunk, use source `src+2`, full
+length, and the normal destination, then repair the destination's first word
+with the CPU. Main-RAM DMA needs no such repair.
+
+### Sources
+
+- [Motorola M68000 User's Manual](https://www.nxp.com/docs/en/reference-manual/MC68000UM.pdf), section 8, tables 8-3, 8-9, and 8-10: `MOVE.L`, `DBcc`, and `MOVEM` timing.
+- [Sega Mega-CD manual collection](https://www.megadrive.org/elbarto/megacd/Official%20Sega%20CD%20Manual/segacd_toc.html), Outline p.4: CPU clocks.
+- [Sega Mega-CD Hardware Manual](https://segaretro.org/images/5/51/Mega-CD_Hardware_Manual.pdf), printed pp.6–10, 14–18, 22–25, 56–57, and 61: arbitration, mapping, ownership controls, and Word-RAM VDP DMA precautions.
+- [Sega Genesis Technical Overview](https://segaretro.org/images/1/18/GenesisTechnicalOverview.pdf), printed p.45: DMA transfer capacity by display mode.
+
+## Unallocated Space Summary
+
+These are the only ranges with no live owner data. Guards, reserves, and
+jitter ranges elsewhere in the maps are allocated to their protective role
+and are listed in place.
+
+| Domain | Unallocated ranges |
+|---|---|
+| Sub PRG-RAM | `SP-GAP` 224 B, `SCRATCH` 256 B, and `RING-ALIGN` 448 B |
+| Word RAM (each bank) | none — every complete sector is assigned; `WB-GAP` is a sector-rounding remainder, not an allocatable range |
+| Main RAM | `M-FREE` 4.19 KiB; the 192 B cushion below `M-STACK` is a guard, not allocatable |
+| VRAM | `0xDE80..0xDFFF` 384 B; unused Window/HScroll table rows remain reserved to those VDP structures. DEBUG shapes its HUD row with reg 18 only; reg 17 must stay 0 because Window row 24 cols 0-1 alias the HScroll table at `0xFC00`, which now carries nonzero scroll values |
+
+## Sub PRG-RAM Map
+
+PRG-RAM is 512 KiB at `0x00000..0x7FFFF`.
+
+| Name | Address | Size | Contents |
+|---|---|---:|---|
+| `BIOS-LOW` | `0x00000..0x05FFF` | 24.00 KiB | BIOS / low PRG work area |
+| `SP-RES` | `0x06000..0x073FF` | 5.00 KiB | BIOS-loaded resident specialized SP image; the linker rejects a larger image |
+| `ADP-IDX` | `0x07400..0x07F1F` | 2,848 B | persistent ADPCM next-index table, copied once at boot; the full range is continuous-read marker-qualified |
+| `SP-GAP` | `0x07F20..0x07FFF` | 224 B | unallocated marker-qualified tail |
+| `PCM-BUF` | `0x08000..0x085FF` | 1.50 KiB | live decoded ADPCM buffer |
+| `WORD-PENDING0` | `0x08600..0x08DFF` | 2.00 KiB | first Sub-owned sector waiting for its parity WordBuf bank |
+| `WORD-PENDING1` | `0x08E00..0x095FF` | 2.00 KiB | second pending WordBuf sector |
+| `ADP-OUT` | `0x09600..0x096FF` | 256 B | persistent predictor-high-byte to RF5C164 output lookup |
+| `SCRATCH` | `0x09700..0x097FF` | 256 B | unallocated marker-qualified scratch; the SP-tail diagnostic installs its checker here |
+| `BIOS-CD` | `0x09800..0x0BFFF` | 10.00 KiB | BIOS-touched during continuous reads |
+| `ADP-DELTA` | `0x0C000..0x0D63F` | 5,696 B | persistent signed ADPCM delta table, copied once at boot |
+| `RING-ALIGN` | `0x0D640..0x0D7FF` | 448 B | unallocated gap that sector-aligns PrgBuf |
+| `PRG-BUF` | fps split, see next table | 374 / 394 KiB | streamed PrgBuf normal ceiling |
+| `JITTER` | fps split, see next table | 40 / 20 KiB | live delivery-jitter reserve above the scheduled ceiling |
+| `OBS-GUARD` | `0x75000..0x757FF` | 2.00 KiB | observation guard below pump back-pressure |
+| `OVF-GUARD` | `0x75800..0x767FF` | 4.00 KiB | physical PrgBuf overflow guard |
+| `WORD-PENDING3` | `0x76800..0x76FFF` | 2.00 KiB | third Sub-PRG pending destination (`WORD_PENDING3` in the player); the boot-only extension executes here before timed playback |
+| `APPLY` | `0x77000..0x7F7FF` | 34.00 KiB | APPLY circular queue |
+| `SUB-STACK` | `0x7F800..0x7FEFF` | 1.75 KiB | Sub stack reserve |
+| `STACK-TOP` | `0x7FF00..0x7FFFF` | 256 B | area above the configured stack top |
+
+### `PRG-BUF` / `JITTER` fps split
+
+The physical bounds are fixed at every fps: the PrgBuf ring is 420 KiB at
+`0x0D800..0x767FF`, pump back-pressure begins at 416 KiB, and the delivery
+observation boundary is 414 KiB (`..0x74FFF`). Inside that fixed region the
+normal/scheduled ceiling and the jitter reserve move with content cadence:
+
+```text
+normal PrgBuf KiB = 414 - cadence reserve KiB
+cadence reserve KiB = ceil(20 * 30 / fps)
+```
+
+| Item | 15 fps | 30 fps |
+|---|---|---|
+| cadence reserve | 40 KiB | 20 KiB |
+| `PRG-BUF` normal / scheduled ceiling | 374 KiB | 394 KiB |
+| `PRG-BUF` address | `0x0D800..0x6AFFF` | `0x0D800..0x6FFFF` |
+| `JITTER` address | `0x6B000..0x74FFF` | `0x70000..0x74FFF` |
+
+Other rates follow the same formula (24 fps: reserve 25 KiB, ceiling 389 KiB,
+`PRG-BUF` = `0x0D800..0x6EBFF`). The values come from
+`cadence_jitter_reserve_kb()`, `prg_buf_cap_kb()`, and
+`scheduled_delivery_cap_kb()` in `tools/av_config.py`; this document defines
+no independent capacity. The `JITTER` reserve is kept for live sector-arrival
+variation and is never encoder Supply.
+
+### `SP-RES` usage
+
+The 32 KiB disc system area places the SP source at offset `0x06000` and
+reserves its final 5 KiB. The BIOS loads the exact linked image contiguously
+at Sub PRG `0x06000`; it is not limited to one 4 KiB sector pair. The image
+is profile-specialized (`PLAYER_SPECIALIZE`) and the linker enforces the hard
+end at `0x07400`. Continuous-read marker qualification covers the reclaimed
+`0x07400..0x07FFF` interval before `ADP-IDX` uses its leading 2,848 bytes.
+
+The packer places the exact 1,108-byte hash-bound extension after the
+8,800-byte ADPCM table in its existing five-sector padding. Sub stages that
+image at `SP-STAGE` (`0x7B000`) and runs the extension from `0x7D260` in two
+ways: its qualified first 88 bytes run from `EXT-RUN` (`0x76800`, the unused
+timed-ring tail); when routing is at most 8 KiB, the second entry runs in
+place at `0x7D2B8` after prebuffer, while longer-route builds copy the
+complete extension first. The extension also initializes wave RAM from its
+fixed `+0x300` entry at staged address `0x7D560`. These boot-only entries copy
+all three ADPCM tables once to their Sub PRG destinations, prepare routing,
+and initialize PCM plus the ring/APPLY/frame state. Frame-0 staging may then
+overwrite both temporary extension locations.
+
+### Boot-only overlays
+
+| Name | Address | Phase |
+|---|---|---|
+| `ISO-SCR` | `0x67000..0x76FFF` | 64 KiB scratch image during ISO discovery only |
+| `F0-STAGE` | `0x72000..0x7AFFF` | frame-0 pattern staging |
+| `SP-STAGE` | `0x7B000..` | staged SP image containing the extension source |
+| `ROUTE-MIRROR` | `0x7B000..0x7B7FF` | 2 KiB scratch for sector-wise mirroring of tables above 16 KiB, after HEADER EOF |
+| `EXT-RUN` | `0x76800..0x76C53` | boot-only extension execution window; timed playback reuses its first sector as `WORD-PENDING3` |
+
+`ISO-SCR` and `F0-STAGE` may overlap the timed ring tail, and `F0-STAGE` may
+also overlap `APPLY`, because those timed owners are inactive in each boot
+phase. Neither overlay changes the timed map.
+
+Routing supports 1..83,520 frames and reserves only its sector-rounded
+actual length in each Word bank. Tables above 16 KiB are loaded into the
+frame-0 bank, then mirrored one sector at a time after HEADER EOF. This
+boot-only scratch does not change the 420 KiB PrgBuf or 34 KiB APPLY bounds.
+At 65,536 frames and above, WordBuf0/1 are disabled. A full 320x224 frame-0
+output uses 35,872 bytes including alignment; the 82 KiB maximum route and
+10,496-byte fixed tail leave 736 bytes after that output. Main/Sub frame
+counters are 32-bit; the HUD displays their low 16 bits.
+The specialized long-movie PCM frequency phase uses two bytes inside `SP-RES`;
+its adjacent-FD writes obey the PCM internal-register spacing and preserve
+the wave write cursor and source sample order. Short streams omit this state.
+
+The APPLY queue retains deliberate back-pressure headroom; its unused
+instantaneous occupancy is not a fixed allocation.
+
+## Word RAM 1M/1M Map
+
+There are two independent 128 KiB physical banks. Sub owns one bank while
+Main owns the other. A bank swap exchanges ownership; it does not make one
+copy simultaneously visible to both CPUs. This map varies by profile, not by
+fps.
+
+`tools/pattern_supply.py` derives the map from frame count, the final
+source-grouped run plan, and cold cap. Routing occupies
+`ceil(frames / 2048) * 2048` bytes at the bank end. The fixed tail is packed
+immediately below routing:
+
+| Name | Relative order, high to low | Size | Contents |
+|---|---|---:|---|
+| `ROUTE` | bank end | variable, sector-rounded | resident routing table |
+| `SECT-STG` | next | 2,048 B | CD-sector stage / pad discard |
+| `CTRL-SCR` | next | 8,192 B | linear control scratch |
+| `DBG-HDR` | next | 256 B | DEBUG counters and copied header |
+
+The front of each bank starts with `W-HDR`: `O_NRUN` and `O_NLOAD`, two bytes
+each. `LOADS` (`O_LOADS`) follows at `+0x0004`. Main reads name updates
+directly from `CTRL-SCR`; `O_CRAM`, `O_NUPD`, and `O_UPDS` do not exist.
+
+Sub expands each on-disc four-byte source run into one 22-byte `O_LOADS v2`
+record containing VDP-ready DMA length, registers, destination command, and
+resolved source. Only Prg records carry their 32-byte-per-pattern payload
+inline immediately after the record. Wr and Dic records point at their
+persistent stores. Main reads this one cursor in place; it does not build or
+copy a run table. The encoder splits a Wr descriptor at its parity WordBuf
+ring end before packing. Sub therefore emits only linear source spans, and
+Main can run each Word-RAM DMA without wrapping a source address.
+
+| Record offset | Size | Value |
+|---:|---:|---|
+| `+0` | 2 B | DMA length in words (`patterns * 16`) |
+| `+2`, `+4` | 2 B each | prebuilt VDP registers 93 and 94 |
+| `+6` | 4 B | destination VDP command without the DMA trigger bit |
+| `+10` | 2 B | raw destination byte address for split-run continuation |
+| `+12`, `+14`, `+16` | 2 B each | prebuilt VDP source registers 95, 96, and 97 |
+| `+18` | 4 B | raw Main-view source address; for Prg it equals the following inline-payload cursor |
+
+`WORDBUF` starts after the parity-specific exact `LOADS` peak and ends before
+the fixed tail. The encoder recomputes the even and odd maxima over every
+frame as `32 * inline Prg patterns + 22 * runs`, writes both byte counts to
+PSUP, and freezes the resulting starts in `player_constants.inc`. Only the
+residual after that first reservation becomes WordBuf capacity, rounded down
+to complete 2 KiB preload sectors. The two banks can therefore have different
+starts and capacities; `WB-GAP` is the remaining sub-sector rounding space.
+
+During boot, `BOOT-STG` uses `+0x0000..+0x5FFF` for the optional boot-VRAM
+sidecar records; `DIC-STG` uses `+0x6000..+0x9FFF` for DicBuf staging. The
+palette table and switch table are not staged here: the Main-IP image embeds
+`paltab.bin` / `palidx.bin` and copies both to `M-PALTAB` / `M-PALIDX` at
+entry, before generated code reuses the transient `.startup` area. Sub
+gives the staging bank to Main, Main copies the dictionary and optional VRAM
+sidecar to their persistent homes, and Main returns the bank. Sub stops `HEADER.DAT` before
+this handoff and restarts at the exact first unread sector after the return,
+so the copy interval cannot create a sector slip. Sub then reads the finite
+untimed BODY arm and expands frame 0; frame 0 and `WORDBUF` may overwrite the
+temporary staging range safely. Dump diagnostics write list-form updates into
+`CTRL-SCR`.
+
+When starting HEADER, the BODY arm, or the timed suffix, Sub sets the expected
+first MSF from the requested LBA plus 150. Buffered sectors older than that
+first sector are acknowledged and discarded without consuming this file's
+remaining count or issuing a recovery seek. They cannot establish a new file's
+anchor, including on replay. A sector ahead of the expected first sector, or
+a gap after an accepted sector, still triggers normal slip recovery. Recovery
+seeks retain the existing file anchor. PCM stays stopped until the first timed
+control arrives, and the timed suffix remains one continuous read.
+
+Main clears its name-table stage at initial boot and every replay. Scroll
+builds clear all 64x32 words, including hidden columns and rows that fine
+scrolling can expose; frame 0 rebuilds the encoded picture afterward.
+
+## Main RAM Map
+
+Main RAM is `0xFF0000..0xFFFFFF`. This map is completely fixed: it is
+identical in every build, profile, and fps. Generated code grows upward and is
+build-time checked against the `M-STATE` base.
+
+| Name | Address | Size | Contents |
+|---|---|---:|---|
+| `M-CODE` | `0xFF0000..0xFF66FF` | 25.75 KiB | permanent player, transient boot UI, generated bitmap handlers and guard |
+| `M-STATE` | `0xFF6700..0xFF87FF` | 8.25 KiB | BSS, shadow, DEBUG HUD row, name-table stage (a persistent 4,096 B 64x32 plane band on a scroll build), scroll state (`scroll_next_h`/`scroll_next_v`/`scroll_h_dirty`), state; worst-case fixed reserve |
+| `M-FCRAM` | `0xFF8800..0xFF887F` | 128 B | current inline fade CRAM image, copied before the consumed Word RAM bank is returned |
+| `M-FREE` | `0xFF8880..0xFF993F` | 4.19 KiB | unallocated space (4,288 B) |
+| `M-PALTAB` | `0xFF9940..0xFFB93F` | 8.00 KiB | 64-entry PALTAB (player-embedded paltab.bin) |
+| `M-PALIDX` | `0xFFB940..0xFFBA3F` | 256 B | 64-entry palette-switch table, 63 switches + sentinel (player-embedded palidx.bin) |
+| `M-DIC` | `0xFFBA40..0xFFFA3F` | 16.00 KiB | 512-pattern persistent DicBuf |
+| guard | `0xFFFA40..0xFFFAFF` | 192 B | cushion below the stack guard |
+| `M-STACK` | `0xFFFB00..0xFFFCFF` | 512 B | stack and interrupt reserve |
+| `M-TOP` | `0xFFFD00..0xFFFFFF` | 768 B | area above stack top / BIOS reserve |
+
+The realized generated-code end inside `M-CODE` and the realized `.bss` end
+inside `M-STATE` vary per build and profile; build-time assertions keep each
+inside its fixed range. A scroll DEBUG build fills the `M-STATE` reservation
+completely, with zero spare bytes. Main keeps no run-plan cursor or WordBuf
+read cursor: Sub owns both parity cursors and hands off already-resolved
+records.
+
+## VRAM Map
+
+The movie uses one displayed Plane A name table. No per-frame register-2
+switch selects another table.
+
+| Name | Address | Size | Contents |
+|---|---|---:|---|
+| blank tile | `0x0000..0x001F` | 32 B | fixed transparent tile 0 |
+| resident pool | `0x0020..0xD9FF` | 1,743 tiles | contiguous movie-pattern slots 1–1,743 |
+| HUD font | `0xDA00..0xDBFF` | 16 tiles | hexadecimal glyphs shared by DEBUG and release startup |
+| sprite table | `0xDC00..0xDE7F` | 640 B | complete 80-record hardware SAT footprint at the highest 0x400-aligned base below the name table; DEBUG uses 24 B (3 records) |
+| gap | `0xDE80..0xDFFF` | 384 B | unallocated VRAM |
+| movie NT | `0xE000..0xEFFF` | 4 KiB | single 64x32 Plane A table |
+| HUD Window row | `0xF000..0xF04F` | 80 B | first DEBUG row; one word per each of the 40 screen columns |
+| horizontal scroll | `0xFC00..0xFC03` | 4 B | Plane A/B full-screen HScroll pair; zero outside a scroll window, rewritten every flip inside one |
+
+VSRAM entries 0 and 1 carry the Plane A/B VScroll. The stream's scroll value
+follows the `y - vscroll` convention while the VDP adds VSRAM to the line
+counter, so the player writes the negated value; both pairs are zero outside
+a scroll window and republished in the same VBlank as the band DMA.
+
+Main expands the logical grid into a zero-gapped, 64-entry-pitch Main-RAM
+stage. During the cadence-final VBlank it DMAs the contiguous band from the
+grid's centered top-left cell through its final cell into `movie NT`. The
+transfer length is `(rows - 1) * 64 + cols`: 1,192 words for 40x19 and 1,768
+for the full-height 40x28 grid. Inside a scroll window the
+DMA instead covers the full 64-column band — `rows * 64` words, or all 32
+plane rows (2,048 words) on a vertical window. DEBUG then sends the first
+screen-width HUD row to the Window table and its three spill digits as
+sprites. Generic and specialized players use the same routes at every cadence.
+
+## Multipart loader ownership
+
+`MULTIPART` builds reserve overlays in the otherwise free regions below.
+The ordinary movie map and the PrgBuf/APPLY capacities remain unchanged.
+
+| Memory | Multipart use |
+|---|---|
+| Main `0xFF8880..0xFF98FF` | Copy/return stub; builder checks actual assembled length |
+| Main `0xFF9900..0xFF990F` | Persistent magic, part index, cycle and visit counters; outside BSS and PALTAB |
+| Sub `0x07F20..0x07F3F` | Dispatcher and selected HEADER/BODY extents |
+| Sub `0x07F42..0x07F4D` | Selected SP extent and exact byte length |
+| Sub `0x07F50..0x07F65` | Permanent 20-byte bank-switch stub and 2-byte BIOS interrupt/user return |
+| Sub `0x07F70..0x07F77`, `0x07F80..0x07F87` | Loader read parameters and ISO directory/volume bounds |
+| Sub `0x0D680..0x0D7FF` | EOF return routine; builder checks assembled length against 384 bytes |
+| Sub `0x67000..0x76FFF` | Untimed root-directory scratch; later reused for exact SP staging |
+| Each Word RAM bank, offset `0x00000..0x04FFF` | Transient 20 KiB Main dispatcher |
+| Each Word RAM bank, offset `0x05000..0x09FFF` | Selected Main module staging |
+| Each Word RAM bank, offset `0x1E000..0x1FFFF` | Transient 8 KiB Sub dispatcher, executing at `0xDE000` |
+
+The BIOS starts a small resident Sub bootstrap at `0x6000`. It installs the
+permanent stubs, places the Sub dispatcher in both physical Word RAM banks,
+and redirects BIOS interrupt/user callbacks before overwriting the bootstrap.
+Bank swaps execute from PRG RAM. The selected Main image becomes Main-visible
+only after the swap; Main acknowledges after copying its last word. The Sub
+module is copied by exact byte length into the 5 KiB resident SP slot, so the
+sector-rounded ISO read cannot overwrite ADP-IDX.
+
+After both modules start, ordinary movie boot owns Word RAM and replaces the
+transient loader images with WordBuf/output data. At EOF Sub stops PCM and
+enters its persistent return routine. Main requests the dispatcher and executes
+its copy from the reserved stub. The loader is reloaded before choosing the
+next part; the last wraps to part 1. Every movie resets its own BSS and restores
+its own palette and pattern state. There is a loading pause, no menu, and no
+15-second single-movie tail. Frame -1 remains untimed; frame 0 is displayed
+before starting the timed suffix, and the first frame-1 control proves service
+before PCM starts, independently for every part.
+
+## Startup and Per-Frame CPU Sequence
+
+The sequences below are identical at 15, 24, and 30 fps; only the cadence
+differs.
+
+### Startup
+
+One `CMD_STREAM` command spans the complete startup. The BOOT_STAGE ownership
+exchange still uses `STAT_BOOT_STAGE` plus `COMCMD1`, because Main must copy
+palette, switch table, dictionary, and sidecar data before Sub reuses that physical bank.
+There is no separate frame-0/BODY-start handshake.
+
+`STAT_READY` exposes the completed frame-0 bank while the timed CD reader is
+still stopped. Clearing the original command after visible frame-0 publication
+launches timed BODY service. PCM stays stopped through `ROM_READN` startup and
+begins when the first frame-1 control sector arrives. Sub finishes that
+physical slot before acknowledging the clear, so its remainder and the next
+VBlank form the normal frame-0-to-frame-1 interval. Frame -1 therefore creates
+no unplanned PrgBuf lead, and the CD startup interval does not advance audio.
+
+```mermaid
+sequenceDiagram
+    participant CD as CD / CDC
+    participant S as Sub CPU
+    participant W as Word RAM 1M/1M
+    participant M as Main CPU
+    participant V as VDP
+
+    M->>M: Copy embedded PALTAB and PALIDX to Main RAM
+    M->>S: Assert CMD_STREAM
+    CD-->>S: Static HEADER
+    S-->>M: STAT_BOOT_STAGE
+    M->>W: Copy DicBuf and sidecar
+    M->>S: COMCMD1 stage acknowledgement
+    CD-->>S: Finish static HEADER
+    CD-->>S: Finite BODY arm (PCM + frame 0)
+    S->>S: Stop arm read and expand frame 0
+    S->>W: Exchange completed frame-0 bank
+    S-->>M: STAT_READY
+    Note over S,CD: Timed suffix remains stopped
+    M->>V: Show black frame -1 (DEBUG frame=FFFF)
+    M->>V: Build and publish frame 0 (frame=0000)
+    M->>S: Clear the original CMD_STREAM
+    S->>CD: Launch continuous timed suffix
+    CD-->>S: First frame-1 control sector
+    S->>S: Start PCM
+    CD-->>S: Finish frame-1 physical slot
+    S-->>M: Clear STAT_READY
+    M->>S: CMD_SWAP for frame 1
+```
+
+Frame -1 is a player/HUD state only. It does not add a sim frame, a control
+block, a routing entry, or a HUD TSV row.
+
+### Timed playback
+
+On every generic and specialized path, Main returns the consumed Word
+RAM bank as soon as its final pattern and status reads are complete. The bank
+exchange is started without blocking, before Main finishes the name-table,
+HUD, CRAM, and publication work for frame `N`.
+
+```mermaid
+sequenceDiagram
+    participant CD as CD / CDC
+    participant S as Sub CPU
+    participant W as Word RAM 1M/1M
+    participant M as Main CPU
+    participant V as VDP
+
+    par Sub prepares frame N+1
+        CD-->>S: BODY sectors
+        S->>S: Route control and Prg payload
+        S->>S: Decode ADPCM and write RF5C164
+        S->>W: Expand control and O_LOADS v2 records
+    and Main consumes frame N
+        M->>W: Read O_LOADS v2 in place
+        M->>M: Apply bitmap or update list
+        M->>M: Copy inline fade CRAM to M-FCRAM when present
+        M->>V: Transfer the final cold run and repair its first word
+    end
+
+    M->>S: Assert CMD_SWAP for prepared frame N+1; do not wait
+    S->>W: Exchange bank ownership
+    S-->>M: STAT_READY
+
+    par Sub uses the returned bank
+        S->>W: Flush pending WordBuf data
+        CD-->>S: Pump sectors while CMD_SWAP remains asserted
+    and Main finishes frame N without Word RAM
+        M->>V: DMA movie NT and HUD, update CRAM, commit cadence origin
+    end
+
+    M->>S: At the next loop head, wait only for any unfinished READY tail
+    M->>S: Clear CMD_SWAP
+```
+
+A zero residual wait means Sub completed the exchange during Main's remaining
+display work. It does not mean that the exchange itself was free. Inline fade
+CRAM is copied to `M-FCRAM` before the request, so Main makes no further access
+to the returned bank after asserting `CMD_SWAP`. Frame 0 keeps
+the startup `CMD_STREAM` ownership through its publication, so frame 1 is
+acquired by the ordinary synchronous request. The final frame is also excluded: Main
+requests `STAT_END` only after that frame has become visible.
+Non-specialized, periodic-cadence, and feature-clear paths use the same early
+handoff once a future frame exists.
+
+On a scroll build, a type-3 control takes a dedicated apply path: item 0
+supplies the absolute HScroll/VScroll pair, and the remaining completed-list
+items write directly into the persistent 64x32 plane band, leaving the
+logical shadow untouched and skipping the stage expansion. The flip then
+publishes the full plane band and both scroll pairs. On the first following
+non-scroll frame the player compacts the tile-aligned final viewport back
+into the logical shadow and rearms both scrolls at zero.
+
+CAVC controls store `n_runs` immediately followed by compact source-aware
+run descriptors. Sub keeps the existing CDC polling cadence while resolving
+those descriptors into `O_LOADS v2`; Main schedules the expanded records
+against the runtime residual budget. Fixed N is the healthy fresh-budget
+count: N2 permits two and N4 permits four; opening another budget remains
+bounded but raises a HUD warning. A light N4 frame may open only one or two
+budgets and leave the remaining cadence windows empty. These counters record
+explicit budget openings.
+
+For fixed-cadence playback, one transfer deadline can serve both
+the final cold-run tail and display publication. The Main CPU uses a
+conservative
+3,200 DMA-word-equivalent budget for each VBlank. A DMA word
+costs one unit. Every pattern run uses DMA. A Word-RAM DMA also pays four units
+for its required CPU first-word repair. Main grants a budget only after waiting for a
+new VBlank or while the V counter is still on its first blank line (`E0`).
+Entering an already-running blank later never creates a full budget; Main
+waits for the next head.
+
+Budgets 1 through the current cadence target minus one are available to
+patterns. Before pattern work enters the target budget, Main withholds the
+complete display reserve: the exact movie band, a 128-unit timing guard, the
+physical DEBUG HUD DMAs when present, and an optional CRAM replacement. CRAM
+is written by the CPU, so its 64 words reserve 256 units. Full-height H40 uses
+1,896 units in release or 1,948 in DEBUG; a palette switch raises those values
+to 2,152 and 2,204. Thus an N2 DEBUG full-height H40 frame has 3,200 units in
+VBlank 1 and 1,252 pattern units in VBlank 2, or 996 on a palette switch. A
+40x19 DEBUG frame reserves only 1,372 units, or 1,628 with a palette switch.
+A scroll build adds the fixed scroll term — the full-band excess over the
+trimmed band plus 16 units for the CPU-written HScroll/VScroll pairs (40
+units at full-height H40) — and a vertical window adds a further 256 units
+at runtime for the wrapped plane rows. A scroll frame carries no inline CRAM
+image, so the palette-switch variants never apply to it.
+
+A DMA run crossing a residual boundary is split exactly there and continued
+at the next fresh VBlank head, regardless of run length. After the pattern
+tail, Main restores the withheld reserve and admits the shared
+name-table/HUD/CRAM publication path only if the current phase is still inside
+that same VBlank. VBlank status is checked before and after the V counter, and terminal
+lines `FC..FF` are rejected. If any condition fails, Main waits for a fresh
+VBlank.
+
+For a multi-budget DEBUG pattern transfer, Main formats the stable HUD fields
+after the first transfer budget and before waiting for the next fresh VBlank.
+After the final pattern word, it patches only the transfer-final fields and
+the resolved palette segment in `dbg_row`. The exact-band movie NT DMA and the
+Window/SAT HUD DMAs then run as separate members of the same admitted VBlank;
+there is no CPU VDP-port HUD republish. Exact logical pattern
+word counters cover runtime VBlank budgets 1 through 4; they remain separate
+from the weighted capacity charge. `transfer_vblanks` exposes a fifth or later
+budget. The admission check charges the exact physical words for each display
+DMA.
+
+Sub wait loops service a pending `CMD_SWAP` before another opportunistic
+sector pump. CD pumping continues while Main is genuinely idle, but future
+payload work cannot delay an already-pending handoff.
+
+## Reproducing the Map Measurements
+
+Use the managed Python environment and an explicit profile:
+
+```sh
+tools/python.sh tools/check_player_ring.py \
+  --constants out/PROFILE/player_constants.inc \
+  --extension tmp/PROFILE/build/movieplay_sp_ext.bin \
+  --extension-constants tmp/PROFILE/build/sp_extension.inc
+make movieplay CONFIG=profiles/PROFILE.toml \
+  DEBUG=1 MAIN_CODEGEN=1 PLAYER_SPECIALIZE=1
+
+~/toolchains/mars/m68k-elf/bin/m68k-elf-size -A \
+  tmp/PROFILE/build/movieplay_ip.o \
+  tmp/PROFILE/build/movieplay_sp.o
+```
+
+The `SP-RES` loaded size is the linked size of
+`tmp/PROFILE/build/movieplay_sp.bin`. Rebuild, pack with verification, and
+complete the DEBUG recording and HUD gate before revising any address or
+size in this document.
+
+---
+
+<a id="jp"></a>
+
+# Player memory mapとruntime sequence
+
+この文書は、現在ビルドされているplayerをそのまま記述します。Sub PRG-RAM、
+Word RAM 1M/1M、Main RAMのmap、startup sequence、frameごとのCPU handoffが
+対象です。各map行には短いrange名（`CODE`表記）を付けており、issue・commit・
+reviewでrangeを曖昧さなく参照できます。
+
+**fps依存について。** 15、24、30 fpsのcontent間でaddress mapが変わるのは、
+固定領域`0x0D800..0x74FFF`内部の`PRG-BUF` / `JITTER`分割だけです。その分割
+だけを後述の表で15 fpsと30 fpsの両値併記にします。それ以外のすべてのmap行と
+startup / per-frame sequence全体は3 rateすべてに適用されます。
+Word RAMのWordBufとrouting sizeはprofile（frame数、cell数、cold cap）で変わる
+ものであり、fpsでは変わりません。
+
+**Display cadence。** playerはpacked headerから正式な反復VBlank scheduleを1つ
+導出します。15 fps pathは`(4)`、24 fps pathはframe 0からframe 1までの2 VBlankで
+始まる`(2, 3)`、30 fps pathは`(2)`を反復します。Mainのdisplay deadlineとSubの
+CD-sector allowanceは同じ位相で進みます。実効rateは順に15000/1001、24000/1001、
+30000/1001 fpsです。
+
+24 fps display controllerはdeadlineを外した後も位相を維持します。遅れをVBlank単位の
+debtとして数え、後の名目3 VBlank display stepを2へ短縮する場合だけdebtを返済します。
+2 VBlank stepを1へ短縮することはありません。Sub CPUの物理`(2, 3)` sector scheduleは
+変えません。遅れたframeがreaderへ追加の物理時間をすでに与えており、補償display stepは
+その時間を消費します。これにより、単発のdisplay missが恒久的なreader leadとなって
+APPLY queueを満たすことを防ぎます。
+
+## RAM コピー時間の参照値
+
+ここでは Main RAM、PRG-RAM、Word RAM 間のコピーを命令時間から見積もります。
+実機の測定値や player のスケジュール予算ではありません。
+Main は約 7.67 MHz（NTSC）、Sub は 12.5 MHz とします。
+Main のクロックが異なる場合は、その比率で換算します。
+MB/s は 1,000,000 バイト/秒で、コピーしたデータ量を 1 回だけ数えます。
+
+フレームあたりと走査線あたりの列には、プロジェクトの公称 NTSC 表示時間を使います。
+表示周期は `60000/1001` フレーム/秒、1 表示フレームはブランキングを含む 262 走査線です。
+1 表示フレームは約 16.6833 ms、1 走査線は約 63.6768 us です。
+丸める前の命令速度から `B/表示フレーム = B/秒 * 1001/60000`、`B/走査線 = B/表示フレーム / 262` を計算し、小数第 1 位に丸めます。
+これは連続コピーの時間換算値で、命令単位の完了量を保証する値、水晶発振器に基づく厳密な時間、VBlank のみの予算ではありません。
+換算後も、元の速度のウェイトなしという仮定や条件付き上限の制約を引き継ぎます。
+動画の 1 フレームが N 表示フレームにまたがる場合、他の処理時間を差し引く前の時間枠は N 倍になります。
+
+### 命令のコスト
+
+追加のバス待ちがなければ、偶数アドレスの `move.l (a0)+,(a1)+` は 4 バイトを 20 CPU クロックでコピーします。
+この値は命令の読み込み、転送元の読み出し、転送先への書き込みを含みます。
+繰り返しを継続する `dbra` は 1 回につき 10 クロックを加えます。
+以下の定常速度では初期設定と最終反復を除きます。
+
+| コピーのループ | データ量あたりのクロック数 | Main MB/s | Main B/表示フレーム | Main B/走査線 | Sub MB/s | Sub B/表示フレーム | Sub B/走査線 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `move.l` の連続実行。ループ制御を除く | 20 / 4 B | 1.534 | 25,592.2 | 97.7 | 2.500 | 41,708.3 | 159.2 |
+| `move.l` 1 回の後に `dbra` | 30 / 4 B | 1.023 | 17,061.5 | 65.1 | 1.667 | 27,805.6 | 106.1 |
+| `move.l` 8 回の後に `dbra` | 170 / 32 B | 1.444 | 24,086.8 | 91.9 | 2.353 | 39,254.9 | 149.8 |
+
+計算式は `バイト数 * CPU_Hz / クロック数` です。
+32 バイトのパターンはコピー命令だけで 160 クロックかかり、Main では約 20.86 us、Sub では 12.80 us です。
+これはこの命令列の基準値で、CPU 全体の最高速度ではありません。
+`movem` を使う実装は、その命令列について別に計算します。
+
+### 経路と所有権
+
+この表ではすべて、ループ制御を除いた `move.l` の連続実行を基準にします。
+命令の読み込みにもデータアクセスにも追加待ちがないと仮定します。
+セガの資料は、他デバイスとの競合がなければメモリアクセスはウェイトなしとし、Sub から PRG-RAM と Word RAM へのアクセスを例示しています。
+
+| 転送元と転送先 | コピーする CPU | ウェイトなしの計算値 | B/表示フレーム | B/走査線 | アクセス条件 |
+|---|---|---:|---:|---:|---|
+| Main RAM → Main RAM | Main | 1.534 MB/s | 25,592.2 | 97.7 | Main のバスが利用可能 |
+| PRG-RAM → PRG-RAM | Sub | 2.500 MB/s | 41,708.3 | 159.2 | リフレッシュや CDC DMA との調停を除く |
+| 所有領域内の Word RAM → Word RAM | Sub | 2.500 MB/s | 41,708.3 | 159.2 | Sub が対象領域を所有 |
+| 所有領域内の Word RAM → Word RAM | Main | 1.534 MB/s | 25,592.2 | 97.7 | Main が対象領域を所有 |
+| PRG-RAM ↔ Word RAM | Sub | 2.500 MB/s | 41,708.3 | 159.2 | Sub が対象 Word RAM 領域を所有 |
+| Main RAM ↔ Word RAM | Main | 1.534 MB/s | 25,592.2 | 97.7 | Main が対象 Word RAM 領域を所有 |
+| Main RAM ↔ PRG-RAM | Main | 1.534 MB/s、条件付き上限 | 25,592.2 | 97.7 | Sub のバス取得が必要。追加のアクセス時間は未検証 |
+| PRG-RAM ↔ Word RAM | Main | 1.534 MB/s、条件付き上限 | 25,592.2 | 97.7 | Sub のバス取得と Word RAM 領域の所有が必要。追加のアクセス時間は未検証 |
+| PRG-RAM → PRG-RAM | Main | 1.534 MB/s、条件付き上限 | 25,592.2 | 97.7 | 両アドレスが選択中の 128 KiB PRG ウィンドウ内にあること。追加のアクセス時間は未検証 |
+
+Sub は Main RAM に直接アクセスできません。
+Main が PRG-RAM にアクセスするには、Sub へのバス要求またはリセットによる受け渡しが必要で、その間 Sub CPU は並行実行できません。
+バスの取得と PRG ウィンドウの変更は、データのコピー時間とは別に計上します。
+
+2M モードでは、一方の CPU が 256 KiB の Word RAM 全体を所有します。
+1M/1M モードでは、各 CPU が別々の 128 KiB バンクを所有します。
+バンク交換は所有権の変更であり、データのコピーを伴いません。
+1M/1M モードのまま、一方の CPU が WordBuf0 から WordBuf1 へ直接コピーすることはできません。
+一時領域とバンク交換、またはモード変更が必要です。
+所有権は物理バンク全体に適用され、WordBuf はその中のパターン列です。
+WordBuf 自体が別のメモリデバイスではありません。
+
+設計時は、命令コストにループ制御、アドレスや索引の処理、割り込み、バス調停、所有権の待ち時間を加えます。
+命令の読み込みもバスを使うため、コードの配置も影響します。
+期限内に完了する根拠として使う前に、実際にアセンブルしたコピー経路を検証します。
+この表は PCM RAM、バックアップ RAM、Z80 RAM、CDC 転送、グラフィック処理を扱いません。
+
+### VDP DMA との境界
+
+RAM から VDP への転送には別の時間モデルを使います。
+セガの H40 メモリ → VRAM DMA 表では、表示中は 1 走査線あたり 18 バイト、VBlank 中は 205 バイトです。
+これは各期間内の転送容量で、フレーム全体の持続転送速度ではありません。
+マニュアルでは CRAM/VSRAM 宛ての場合、バイトではなくワード単位としています。
+転送の可否は、後述する player の VBlank 予算で判定します。
+Word RAM からの DMA は各チャンクで転送元を `src+2` とし、全長を通常の宛先へ転送した後、宛先の先頭ワードを CPU で修復します。
+Main RAM からの DMA にはこの修復は不要です。
+
+### 出典
+
+- [Motorola M68000 User's Manual](https://www.nxp.com/docs/en/reference-manual/MC68000UM.pdf)、第 8 章の表 8-3、8-9、8-10：`MOVE.L`、`DBcc`、`MOVEM` の時間。
+- [Sega Mega-CD マニュアル集](https://www.megadrive.org/elbarto/megacd/Official%20Sega%20CD%20Manual/segacd_toc.html)、Outline p.4：CPU クロック。
+- [Sega Mega-CD Hardware Manual](https://segaretro.org/images/5/51/Mega-CD_Hardware_Manual.pdf)、印刷ページ 6–10、14–18、22–25、56–57、61：バス調停、マッピング、所有権の制御、Word RAM からの VDP DMA の注意点。
+- [Sega Genesis Technical Overview](https://segaretro.org/images/1/18/GenesisTechnicalOverview.pdf)、印刷ページ 45：表示モード別の DMA 転送容量。
+
+## 未割当領域の要約
+
+live ownerのdataを持たないrangeは次だけです。map中のguard・reserve・jitter
+rangeは保護役として割り当て済みであり、各mapの該当行に記載しています。
+
+| Domain | 未割当range |
+|---|---|
+| Sub PRG-RAM | `SP-GAP` 224 B、`SCRATCH` 256 B、`RING-ALIGN` 448 B |
+| Word RAM（各bank） | なし。完全なsectorはすべて割当済み。`WB-GAP`はsector丸めの余りで、割当可能なrangeではない |
+| Main RAM | `M-FREE` 4.19 KiB。`M-STACK`直下の192 Bクッションはguardであり割当不可 |
+| VRAM | `0xDE80..0xDFFF` 384 B。未使用Window/HScroll table rowは各VDP structure用に予約したまま。DEBUGのHUD行はreg 18だけで形成し、reg 17は0のまま保つ。Window row 24 col 0-1は`0xFC00`のHScroll tableとaliasし、そこはいまや非ゼロのscroll値を運ぶため |
+
+## Sub PRG-RAM map
+
+PRG-RAMは`0x00000..0x7FFFF`の512 KiBです。
+
+| Name | Address | Size | 内容 |
+|---|---|---:|---|
+| `BIOS-LOW` | `0x00000..0x05FFF` | 24.00 KiB | BIOS / low PRG work area |
+| `SP-RES` | `0x06000..0x073FF` | 5.00 KiB | BIOS-loadされるresident specialized SP image。linkerがこれを超えるimageを拒否 |
+| `ADP-IDX` | `0x07400..0x07F1F` | 2,848 B | boot時に1回copyするpersistent ADPCM next-index table。全rangeをcontinuous-read markerで検証済み |
+| `SP-GAP` | `0x07F20..0x07FFF` | 224 B | 未割当のmarker検証済みtail |
+| `PCM-BUF` | `0x08000..0x085FF` | 1.50 KiB | live decoded ADPCM buffer |
+| `WORD-PENDING0` | `0x08600..0x08DFF` | 2.00 KiB | parity WordBuf bank待ちのSub所有1本目sector |
+| `WORD-PENDING1` | `0x08E00..0x095FF` | 2.00 KiB | 2本目のpending WordBuf sector |
+| `ADP-OUT` | `0x09600..0x096FF` | 256 B | persistent predictor-high-byte to RF5C164 output lookup |
+| `SCRATCH` | `0x09700..0x097FF` | 256 B | 未割当のmarker検証済みscratch。SP-tail diagnosticはここへcheckerを置く |
+| `BIOS-CD` | `0x09800..0x0BFFF` | 10.00 KiB | continuous read中にBIOSが使用 |
+| `ADP-DELTA` | `0x0C000..0x0D63F` | 5,696 B | boot時に1回copyするpersistent signed ADPCM delta table |
+| `RING-ALIGN` | `0x0D640..0x0D7FF` | 448 B | PrgBufをsector alignmentする未割当gap |
+| `PRG-BUF` | fps分割、次表参照 | 374 / 394 KiB | streamed PrgBufのnormal上限 |
+| `JITTER` | fps分割、次表参照 | 40 / 20 KiB | scheduled上限より上のlive delivery-jitter予約 |
+| `OBS-GUARD` | `0x75000..0x757FF` | 2.00 KiB | pump back-pressure前の観測guard |
+| `OVF-GUARD` | `0x75800..0x767FF` | 4.00 KiB | physical PrgBuf overflow guard |
+| `WORD-PENDING3` | `0x76800..0x76FFF` | 2.00 KiB | playerで`WORD_PENDING3`と呼ぶ3本目のSub-PRG pending destination。boot-only extensionはtimed playback前にここで実行 |
+| `APPLY` | `0x77000..0x7F7FF` | 34.00 KiB | APPLY circular queue |
+| `SUB-STACK` | `0x7F800..0x7FEFF` | 1.75 KiB | Sub stack reserve |
+| `STACK-TOP` | `0x7FF00..0x7FFFF` | 256 B | configured stack topより上 |
+
+### `PRG-BUF` / `JITTER`のfps分割
+
+物理境界はすべてのfpsで固定です。PrgBuf ringは`0x0D800..0x767FF`の420 KiB、
+pump back-pressureは416 KiBで始まり、delivery観測境界は414 KiB
+（`..0x74FFF`）です。この固定領域の内部で、normal/scheduled上限とjitter予約
+がcontent cadenceに応じて動きます。
+
+```text
+normal PrgBuf KiB = 414 - cadence reserve KiB
+cadence reserve KiB = ceil(20 * 30 / fps)
+```
+
+| 項目 | 15 fps | 30 fps |
+|---|---|---|
+| cadence reserve | 40 KiB | 20 KiB |
+| `PRG-BUF` normal / scheduled上限 | 374 KiB | 394 KiB |
+| `PRG-BUF` address | `0x0D800..0x6AFFF` | `0x0D800..0x6FFFF` |
+| `JITTER` address | `0x6B000..0x74FFF` | `0x70000..0x74FFF` |
+
+他のrateも同じ式に従います（24 fps: reserve 25 KiB、上限389 KiB、
+`PRG-BUF` = `0x0D800..0x6EBFF`）。数値は`tools/av_config.py`の
+`cadence_jitter_reserve_kb()`、`prg_buf_cap_kb()`、
+`scheduled_delivery_cap_kb()`から得ます。この文書では独立した容量を定義
+しません。`JITTER`予約はliveのsector到着変動のために保持され、encoder
+Supplyになることはありません。
+
+### `SP-RES`の使用量
+
+32 KiB disc system areaはSP sourceをoffset `0x06000`へ置き、最後の5 KiBを
+予約します。BIOSは正確なlinked imageをSub PRG `0x06000`へ連続loadし、
+1組の4 KiB sectorには制限されません。imageはprofile-specialized
+（`PLAYER_SPECIALIZE`）で、linkerがhard end `0x07400`を強制します。
+`ADP-IDX`が先頭2,848 byteを使う前に、回収した`0x07400..0x07FFF`全体を
+continuous-read markerで検証します。
+
+Packerはhashで固定した1,108-byte extensionを8,800-byte ADPCM table直後の既存
+5-sector paddingへ配置します。Subはそのimageを`SP-STAGE`（`0x7B000`）へ
+stageし、`0x7D260`のextensionを2通りに使います。qualified済み先頭88 byteは
+`EXT-RUN`（未使用timed-ring tailの`0x76800`）で実行します。routingが8 KiB
+以下なら第2入口をprebuffer後に`0x7D2B8`でそのまま実行し、長いroutingの
+buildはextension全体を先にcopyします。さらに固定`+0x300`入口をstaged address
+`0x7D560`で呼びwave RAMを初期化します。これらのboot-only入口が3つのADPCM
+tableを各Sub PRG destinationへ1回copyし、routing、PCM、初期ring/APPLY/frame
+stateを設定します。その後はframe-0 stagingが両temporary extension locationを
+上書きできます。
+
+### Boot-only overlay
+
+| Name | Address | Phase |
+|---|---|---|
+| `ISO-SCR` | `0x67000..0x76FFF` | ISO discovery中だけの64 KiB scratch image |
+| `F0-STAGE` | `0x72000..0x7AFFF` | frame-0 pattern staging |
+| `SP-STAGE` | `0x7B000..` | extension sourceを含むstaged SP image |
+| `ROUTE-MIRROR` | `0x7B000..0x7B7FF` | HEADER EOF後に16 KiB超の表をsector単位で複写する2 KiB scratch |
+| `EXT-RUN` | `0x76800..0x76C53` | boot-only extension実行window。timed playbackでは先頭sectorを`WORD-PENDING3`として再利用 |
+
+各boot phaseではtimed ownerがinactiveなので、`ISO-SCR`と`F0-STAGE`はtimed
+ring tailと重複でき、`F0-STAGE`は`APPLY`とも重複できます。どちらのoverlayも
+timed mapを変えません。
+
+Routingは1..83,520 frameに対応し、各Word bankには実際の長さをsector丸めして
+予約します。16 KiBを超える表はframe-0 bankへloadし、HEADER EOF後にsectorごとに
+複写します。このboot専用scratchは420 KiBのPrgBufと34 KiBのAPPLYの境界を変えません。
+65,536 frame以上ではWordBuf0/1を無効化します。320x224のframe-0出力は整列込みで
+35,872 byteです。最大82 KiBのrouteと10,496-byteの固定tailを確保しても736 byteが
+残ります。Main/Subのframe counterは32-bit、HUDはその下位16 bitを表示します。
+Specializedの長尺PCM frequency phaseは`SP-RES`内で2 byteを使います。隣接FDの
+writeはPCM internal-registerの間隔を守り、wave write cursorとsource sample順を
+維持します。短編ではこのstateを省きます。
+
+APPLY queueには意図的なback-pressure headroomがあります。瞬間的な未使用
+occupancyは固定allocationではありません。
+
+## Word RAM 1M/1M map
+
+128 KiBの独立したphysical bankが2つあります。Subが一方を所有するときMainは
+他方を所有します。Bank swapはownershipを交換するだけで、同じcopyを両CPUへ
+同時公開しません。このmapはprofileで変わり、fpsでは変わりません。
+
+`tools/pattern_supply.py`がframe数、最終source-grouped run計画、cold capから
+mapを導出します。Routingはbank末尾に`ceil(frames / 2048) * 2048` byteを
+使います。Fixed tailはroutingの直下へ次の順で詰めます。
+
+| Name | 上から下への相対順 | Size | 内容 |
+|---|---|---:|---|
+| `ROUTE` | bank末尾 | 可変、sector丸め | resident routing table |
+| `SECT-STG` | 次 | 2,048 B | CD-sector stage / pad discard |
+| `CTRL-SCR` | 次 | 8,192 B | linear control scratch |
+| `DBG-HDR` | 次 | 256 B | DEBUG counterとcopied header |
+
+各bank先頭の`W-HDR`は`O_NRUN`と`O_NLOAD`で、それぞれ2 byteです。
+`LOADS`（`O_LOADS`）は`+0x0004`から続きます。Mainはname updateを
+`CTRL-SCR`から直接読むため、`O_CRAM`、`O_NUPD`、`O_UPDS`は存在しません。
+
+Subはdisc上の各4-byte source runを、VDP-ready DMA length、register、
+destination command、解決済みsourceを持つ22-byte `O_LOADS v2` recordへ
+展開します。Prg recordだけが直後にpattern当たり32 byteのpayloadをinlineで
+持ちます。Wr/Dic recordはpersistent storeを直接指します。Mainは単一cursorを
+in-placeで読み、run tableを構築もcopyもしません。EncoderはWr descriptorを
+pack前にparity WordBuf ring末尾で分割します。Subが出力するsource spanは常に
+linearとなり、Mainはsource addressをwrapせず各Word-RAM DMAを実行できます。
+
+| Record offset | Size | 値 |
+|---:|---:|---|
+| `+0` | 2 B | word単位DMA length（`patterns * 16`） |
+| `+2`, `+4` | 各2 B | 構築済みVDP register 93、94 |
+| `+6` | 4 B | DMA trigger bitを除くdestination VDP command |
+| `+10` | 2 B | split run継続用のraw destination byte address |
+| `+12`, `+14`, `+16` | 各2 B | 構築済みVDP source register 95、96、97 |
+| `+18` | 4 B | Main-view raw source address。Prgでは直後のinline payload cursorと同値 |
+
+`WORDBUF`はparity別の正確な`LOADS`ピーク直後からfixed tail手前までです。
+Encoderは全frameから偶数・奇数それぞれの最大値を
+`32 * inline Prg patterns + 22 * runs`で再計算し、そのbyte数をPSUPへ書き、
+導出したstartを`player_constants.inc`へ固定します。この予約を先に引いた
+残余だけがWordBuf容量となり、完全な2 KiB preload sectorへ切り下げられます。
+したがって2 bankのstartとcapacityは異なり得ます。`WB-GAP`は残った
+sub-sector丸め領域です。
+
+Boot中は`BOOT-STG`が`+0x0000..+0x5FFF`（optionalなboot-VRAM sidecar record専用）、
+`DIC-STG`が`+0x6000..+0x9FFF`をDicBuf stagingに使います。palette表と切替表は
+ここにstageしません: Main-IP imageが`paltab.bin` / `palidx.bin`を内蔵し、生成
+codeが一時`.startup`領域を再利用する前のentry直後に`M-PALTAB` / `M-PALIDX`へ
+copyします。Subがstaging bankをMainへ渡し、Mainはdictionaryと任意のVRAM
+sidecarをpersistentな保存先へcopyしてbankを返します。Subはhandoff前に`HEADER.DAT`を停止し、返却後に正確な最初の
+未読sectorから再開するため、copy intervalがsector slipを発生させません。
+続いてSubは有限でuntimedなBODY armを読み、frame 0を展開します。その後は
+frame 0と`WORDBUF`がtemporary stage rangeを安全に上書きできます。Dump
+diagnosticはlist形式のupdateを`CTRL-SCR`へ書きます。
+
+HEADER、BODY arm、timed suffixの読取り開始時には、Subが要求LBAに150を足して
+最初の期待MSFを設定します。それより古い残留sectorはACKして破棄し、新しい
+fileの残sector数を減らしたり回復seekを発行したりしません。ループ再生でも、
+残留sectorを新しいfileの基準には使いません。期待する先頭より先のsectorや、
+sectorを受け付けた後の欠落には、従来どおりslip回復を行います。回復seekでは
+既存fileの基準を維持します。最初のtimed controlが届くまでPCMを停止したままに
+し、timed suffixは1本の連続読取りを保ちます。
+
+Mainは初回起動と各ループの再開時にname-table stageをクリアします。scroll
+buildでは64x32 word全体を消し、fine scrollで見える隠れた列や行も初期化します。
+その後、frame 0が符号化された画像を構築します。
+
+## Main RAM map
+
+Main RAMは`0xFF0000..0xFFFFFF`です。このmapは完全固定で、すべてのbuild・
+profile・fpsで同一です。Generated codeは上方向へ伸び、`M-STATE` baseに対して
+build-time checkされます。
+
+| Name | Address | Size | 内容 |
+|---|---|---:|---|
+| `M-CODE` | `0xFF0000..0xFF66FF` | 25.75 KiB | permanent player、transient boot UI、generated bitmap handler、guard |
+| `M-STATE` | `0xFF6700..0xFF87FF` | 8.25 KiB | BSS、shadow、DEBUG HUD row、name-table stage（scroll buildでは常駐4,096 Bの64x32 plane band）、scroll state（`scroll_next_h`/`scroll_next_v`/`scroll_h_dirty`）、state。最悪ケース固定予約 |
+| `M-FCRAM` | `0xFF8800..0xFF887F` | 128 B | 消費済みWord RAM bankを返す前にcopyする、現在のinline fade CRAM image |
+| `M-FREE` | `0xFF8880..0xFF993F` | 4.19 KiB | 未割当領域（4,288 B） |
+| `M-PALTAB` | `0xFF9940..0xFFB93F` | 8.00 KiB | 64-entry PALTAB（player内蔵paltab.bin） |
+| `M-PALIDX` | `0xFFB940..0xFFBA3F` | 256 B | 64-entry palette切替表、63切替+番兵（player内蔵palidx.bin） |
+| `M-DIC` | `0xFFBA40..0xFFFA3F` | 16.00 KiB | 512-pattern persistent DicBuf |
+| guard | `0xFFFA40..0xFFFAFF` | 192 B | stack guard直下のクッション |
+| `M-STACK` | `0xFFFB00..0xFFFCFF` | 512 B | stackとinterrupt reserve |
+| `M-TOP` | `0xFFFD00..0xFFFFFF` | 768 B | stack topより上 / BIOS reserve |
+
+`M-CODE`内の実generated-code末尾と`M-STATE`内の実`.bss`末尾はbuildとprofile
+ごとに変わり、build-time assertionが各固定rangeの内側に保ちます。scroll DEBUG
+buildは`M-STATE`予約を余りゼロで使い切ります。Mainは
+run-plan cursorもWordBuf read cursorも持たず、Subが両parity cursorを所有して
+解決済みrecordを渡します。
+
+## VRAM map
+
+Movieは表示用Plane A name tableを1枚だけ使います。Frameごとに別tableを選ぶ
+register-2 switchはありません。
+
+| Name | Address | Size | 内容 |
+|---|---|---:|---|
+| blank tile | `0x0000..0x001F` | 32 B | 固定transparent tile 0 |
+| resident pool | `0x0020..0xD9FF` | 1,743 tiles | 連続movie-pattern slot 1〜1,743 |
+| HUD font | `0xDA00..0xDBFF` | 16 tiles | DEBUGとrelease startupで共有するhexadecimal glyph |
+| sprite table | `0xDC00..0xDE7F` | 640 B | name table直下の最上位0x400整列baseに置いた80 record分の完全なhardware SAT領域。DEBUGの実使用は24 B（3 record） |
+| gap | `0xDE80..0xDFFF` | 384 B | 未割当VRAM |
+| movie NT | `0xE000..0xEFFF` | 4 KiB | 単一64x32 Plane A table |
+| HUD Window row | `0xF000..0xF04F` | 80 B | DEBUG先頭行。40 screen columnそれぞれに1 word |
+| horizontal scroll | `0xFC00..0xFC03` | 4 B | Plane A/Bのfull-screen HScroll対。scroll window外では0、window中は毎flip書き換え |
+
+VSRAM entry 0と1はPlane A/BのVScrollを運びます。streamのscroll値は
+`y - vscroll`規約に従い、VDPはVSRAMをline counterへ加算するため、playerは
+符号反転した値を書きます。両対ともscroll window外では0で、band DMAと同じ
+VBlank内でrepublishします。
+
+Mainはlogical gridをzero gap付き64-entry-pitch Main-RAM stageへ展開します。
+Cadence-final VBlank中に、gridのcentered top-left cellからfinal cellまでの連続bandを
+`movie NT`へDMAします。Transfer lengthは`(rows - 1) * 64 + cols`で、40x19は
+1,192 word、full-height 40x28 gridは1,768です。scroll window中は
+代わりに64列band全体をDMAします。horizontalは`rows * 64` word、verticalは
+32 plane行すべて（2,048 word）です。DEBUGは続いて
+先頭screen-width HUD rowをWindow tableへ、spillする3桁をspriteとして
+送ります。Generic / specialized playerは全cadenceで同じrouteを使います。
+
+## Multipart loaderの所有領域
+
+`MULTIPART`ビルドでは、通常は空いている次の領域をoverlayとして予約します。
+通常のmovie mapとPrgBuf/APPLYの容量は維持します。
+
+| Memory | Multipartでの用途 |
+|---|---|
+| Main `0xFF8880..0xFF98FF` | Copy/return stub。builderが実際のアセンブル済み長さを検証 |
+| Main `0xFF9900..0xFF990F` | 永続するmagic、part index、cycle、visit counter。BSSとPALTABの外側 |
+| Sub `0x07F20..0x07F3F` | Dispatcherと選択したHEADER/BODYのextent |
+| Sub `0x07F42..0x07F4D` | 選択したSPのextentと正確なbyte長 |
+| Sub `0x07F50..0x07F65` | 永続する20-byte bank-switch stubと2-byte BIOS interrupt/user return |
+| Sub `0x07F70..0x07F77`, `0x07F80..0x07F87` | Loaderのread引数とISO directory/volumeの境界 |
+| Sub `0x0D680..0x0D7FF` | EOF return routine。builderがアセンブル済み長さを384 bytes以内と検証 |
+| Sub `0x67000..0x76FFF` | Untimedなroot-directory scratch。後で正確なSP stagingに再利用 |
+| 各Word RAM bank、offset `0x00000..0x04FFF` | 一時的な20 KiB Main dispatcher |
+| 各Word RAM bank、offset `0x05000..0x09FFF` | 選択したMain moduleのstaging |
+| 各Word RAM bank、offset `0x1E000..0x1FFFF` | 一時的な8 KiB Sub dispatcher。`0xDE000`で実行 |
+
+BIOSは`0x6000`の小さなresident Sub bootstrapを起動します。bootstrapは永続stubを
+設置し、両方の物理Word RAM bankにSub dispatcherを置き、自身を上書きする前に
+BIOS interrupt/user callbackを付け替えます。bank swapはPRG RAMから実行します。
+swap後にMainから選択したMain imageが見えるようになり、Mainは最後のwordを
+コピーしてから応答します。Sub moduleは正確なbyte長で5 KiBのresident SP slotへ
+コピーするため、sector単位のISO readがADP-IDXを上書きすることはありません。
+
+両moduleの開始後は、通常のmovie bootがWord RAMを所有し、一時loader imageを
+WordBuf/output dataで置き換えます。EOFでSubはPCMを止め、永続return routineへ
+進みます。Mainはdispatcherを要求し、予約したstubからコピーを実行します。
+loaderを読み直してから次のpartを選び、最後からpart 1へ戻ります。各動画は自身のBSSを
+初期化し、自身のpaletteとpattern stateを復元します。読み込み待ちはありますが、
+メニューと単一動画の15秒tailはありません。各partでframe -1はuntimedとし、frame 0を
+表示してからtimed suffixを開始し、最初のframe-1 controlで配送を確認してからPCMを
+開始します。
+
+## StartupとframeごとのCPU sequence
+
+以下のsequenceは15、24、30 fpsで同一で、cadenceだけが異なります。
+
+### Startup
+
+1個の`CMD_STREAM` commandがstartup全体を通してassertされたままです。
+BOOT_STAGEのownership交換には引き続き`STAT_BOOT_STAGE`と`COMCMD1`を使います。
+Subが同じ物理bankを再利用する前に、Mainがpalette、切替表、dictionary、sidecar data
+をcopyする必要があるためです。frame-0/BODY-start専用の2個目のhandshakeは
+ありません。
+
+`STAT_READY`は完成したframe-0 bankを公開しますが、この時点ではtimed CD
+readerを停止したままにします。frame 0を実際にpublishした後で元のcommandを
+clearするとtimed BODY serviceを起動します。`ROM_READN` の起動中はPCMを停止したままにし、
+最初のframe-1 control sector到着時にPCMを開始します。Subはそのphysical slotを最後まで
+drainしてからclearをacknowledgeするため、slotの残り時間と次のVBlankが通常の
+frame-0-to-frame-1 intervalになります。したがってframe -1は計画外のPrgBuf先行量を
+作らず、CD起動待ちも音声を進めません。
+
+```mermaid
+sequenceDiagram
+    participant CD as CD / CDC
+    participant S as Sub CPU
+    participant W as Word RAM 1M/1M
+    participant M as Main CPU
+    participant V as VDP
+
+    M->>M: 内蔵PALTAB/PALIDXをMain RAMへcopy
+    M->>S: CMD_STREAMをassert
+    CD-->>S: static HEADER
+    S-->>M: STAT_BOOT_STAGE
+    M->>W: DicBufとsidecarをcopy
+    M->>S: COMCMD1 stage acknowledgement
+    CD-->>S: static HEADERの残り
+    CD-->>S: finite BODY arm（PCM + frame 0）
+    S->>S: arm readを停止しframe 0を展開
+    S->>W: completed frame-0 bankを交換
+    S-->>M: STAT_READY
+    Note over S,CD: timed suffixは停止したまま
+    M->>V: black frame -1を表示（DEBUG frame=FFFF）
+    M->>V: frame 0を構築・publish（frame=0000）
+    M->>S: 元のCMD_STREAMをclear
+    S->>CD: continuous timed suffixを起動
+    CD-->>S: 最初のframe-1 control sector
+    S->>S: PCMを開始
+    CD-->>S: frame-1 physical slotを完了
+    S-->>M: STAT_READYをclear
+    M->>S: frame 1のCMD_SWAP
+```
+
+frame -1はplayer/HUDだけのstateです。sim frame、control block、routing
+entry、HUD TSV rowは追加しません。
+
+### Timed playback
+
+すべてのgeneric / specialized pathで、Mainは最後のpattern readとstatus readを
+終えた時点で、消費済みWord RAM bankを返します。Frame `N`のname-table、
+HUD、CRAM、publication処理を終える前に、bank交換をblockingせず開始します。
+
+```mermaid
+sequenceDiagram
+    participant CD as CD / CDC
+    participant S as Sub CPU
+    participant W as Word RAM 1M/1M
+    participant M as Main CPU
+    participant V as VDP
+
+    par Subがframe N+1を準備
+        CD-->>S: BODY sector
+        S->>S: controlとPrg payloadをroute
+        S->>S: ADPCM decodeとRF5C164 write
+        S->>W: controlとO_LOADS v2 recordをexpand
+    and Mainがframe Nを消費
+        M->>W: O_LOADS v2をin-placeで読む
+        M->>M: bitmapまたはupdate listをapply
+        M->>M: inline fade CRAMがあればM-FCRAMへcopy
+        M->>V: 最後のcold runをtransferして先頭wordを補修
+    end
+
+    M->>S: prepared frame N+1のCMD_SWAPをassertし、待たない
+    S->>W: bank ownership交換
+    S-->>M: STAT_READY
+
+    par Subが返却bankを使う
+        S->>W: pending WordBuf dataをflush
+        CD-->>S: CMD_SWAP assert中にsectorをpump
+    and MainがWord RAMなしでframe Nを完了
+        M->>V: movie NTとHUDをDMA、CRAM update、cadence originをcommit
+    end
+
+    M->>S: 次のloop先頭で未完了のREADY tailだけを待つ
+    M->>S: CMD_SWAPをclear
+```
+
+残り待ちがゼロなら、Mainの残るdisplay work中にSubの交換が完了したという
+意味です。交換自体の所要時間がゼロという意味ではありません。Inline fade
+CRAMはrequest前に`M-FCRAM`へcopyするため、Mainは`CMD_SWAP` assert後、返却した
+bankへアクセスしません。Frame 0はpublicationまで
+startupの`CMD_STREAM` ownershipを保つため、frame 1は通常の同期requestで
+取得します。最終frameも対象外で、表示された後にだけMainが`STAT_END`を
+requestします。Non-specialized、periodic-cadence、feature-clear pathも、
+future frameが存在すれば同じearly handoffを使います。
+
+scroll buildでは、type 3 controlが専用のapply pathを通ります。item 0が絶対
+HScroll/VScroll対を供給し、残りのcompleted-list itemは常駐64x32 plane bandへ
+直接書き込みます。logical shadowには触れず、stage展開もskipします。flipは
+plane band全体と両scroll対をpublishします。直後の最初の非scroll frameで、
+playerはtile整列済みの最終viewportをlogical shadowへ圧縮複写し、両scrollを
+0へ戻して再armします。
+
+CAVC controlは`n_runs`の直後にcompactなsource-aware run descriptorを
+置きます。Subは既存のCDC polling cadenceを保ったままdescriptorを
+`O_LOADS v2`へ解決し、Mainがruntime残budgetに対して展開済みrecordをschedule
+します。Fixed Nはhealthyなfresh budget数で、N2は2本、N4は4本です。さらに
+budgetを開く処理はboundedのままですがHUD warningになります。軽いN4 frameは
+1〜2 budgetだけを開き、残るcadence windowを空きにできます。このcounterは
+explicitなbudget openingを記録します。
+
+Fixed-cadence再生では、1個のtransfer deadlineを最後のcold-run tailと
+display publicationで共有できます。Main CPUは各VBlankに、安全側の
+3,200 DMA-word相当budgetを使います。DMA wordは1 unitで、全pattern runがDMAを使います。
+Word-RAM DMAは必須のCPU先頭word補修に4 unitを追加します。新しいVBlankを待った
+直後、またはV counterが最初のblank line（`E0`）にある場合だけbudgetを与えます。
+すでに進行中のblankへそれより遅く入った場合はfull budgetを作らず、次のheadを
+待ちます。
+
+Budget 1からcurrent cadence targetの1つ前まではpatternに使えます。Pattern workが
+target budgetへ入る前に、Mainはdisplay work全体を先に取り置きします。内訳は
+exact movie band、128-unit timing guard、存在する場合の物理DEBUG HUD DMA、任意の
+CRAM replacementです。CRAMはCPU writeなので64 wordに256 unitを予約します。
+Full-height H40のreserveはreleaseで1,896 unit、DEBUGで1,948 unit、palette switch時は
+それぞれ2,152と2,204です。したがってN2 DEBUG full-height H40 frameはVBlank 1に
+3,200 unit、VBlank 2にpattern用1,252 unit、palette switch時は996 unitを持ちます。
+40x19 DEBUG frameのreserveは1,372 unit、palette switch時は1,628 unitだけです。
+scroll buildは固定のscroll項 — trim済みbandに対するfull bandの超過分と、CPU
+writeするHScroll/VScroll対の16 unit（full-height H40では計40 unit）— を加え、
+vertical windowはwrapするplane行の分としてさらに256 unitをruntimeで加えます。
+scroll frameはinline CRAM imageを運ばないため、palette switch変種は適用されません。
+
+DMA runが残budget境界を越える場合はrun長に関係なくそこで正確に分割し、次の
+fresh VBlank headから続きを行います。Pattern tail後に取り置いたreserveを戻し、
+同じVBlank内にまだいる場合だけname-table/HUD/CRAM publication shared pathを許可します。
+VBlank statusはV counterの前後で確認し、terminalの`FC..FF` lineは拒否します。
+どれかを満たさなければfresh VBlankを待ちます。
+
+multi-budget DEBUG pattern transferでは、Mainは最初のtransfer budget後、次のfresh
+VBlank待ちより前にstableなHUD fieldをformatします。最後のpattern word後は、
+transfer終了時に確定するfieldとpalette segmentだけを`dbg_row`へpatchします。
+Exact-band movie NT DMAとWindow/SAT HUD DMAは、同じadmitted VBlankの別々のmember
+として実行します。CPU VDP-portによるHUD republishは行いません。Runtime VBlank budget
+1〜4のexact logical pattern word counterはweighted capacity chargeと分離して保持し、
+`transfer_vblanks`が5本目以降のbudgetを可視化します。Admission checkは各display
+DMAの正確な物理word数をchargeします。
+
+Sub wait loopは、別のopportunistic sector pumpより先にpending `CMD_SWAP`を
+処理します。Mainが本当にidleな間はCD pumpを続けますが、将来payloadの処理が
+pending handoffを遅らせることはできません。
+
+## Map測定値の再現
+
+Managed Python環境と明示的なprofileを使います。
+
+```sh
+tools/python.sh tools/check_player_ring.py \
+  --constants out/PROFILE/player_constants.inc \
+  --extension tmp/PROFILE/build/movieplay_sp_ext.bin \
+  --extension-constants tmp/PROFILE/build/sp_extension.inc
+make movieplay CONFIG=profiles/PROFILE.toml \
+  DEBUG=1 MAIN_CODEGEN=1 PLAYER_SPECIALIZE=1
+
+~/toolchains/mars/m68k-elf/bin/m68k-elf-size -A \
+  tmp/PROFILE/build/movieplay_ip.o \
+  tmp/PROFILE/build/movieplay_sp.o
+```
+
+`SP-RES`のloaded sizeは`tmp/PROFILE/build/movieplay_sp.bin`のlinked size
+です。この文書のaddressやsizeを改訂する前に、rebuild、verify付きpack、
+DEBUG recording、HUD gateを完了します。

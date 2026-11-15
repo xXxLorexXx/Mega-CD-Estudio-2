@@ -1,0 +1,15 @@
+{
+  "disc_count": 2,
+  "fps": 24,
+  "frames": 192,
+  "all_payload_SHA256_verified": true,
+  "order_and_no_duplicate_frames": true,
+  "lossy_changed_block_reuse": false,
+  "test_capacity_bytes": 1300000,
+  "iso_bytes": [
+    1103872,
+    630784
+  ],
+  "gpu_encode_jobs": 4,
+  "jit_jobs": 4
+}

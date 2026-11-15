@@ -1,0 +1,2662 @@
+/*
+ * Phase B3: delta stream player - Main (IP) side (single name table)。
+ *
+ * タイルプールは単一の永続VRAM領域(B1のLRUで表示中slotは上書きされないことが
+ * 保証済み)。表示ネームテーブルはNT=0xE000の1枚。Main RAM に
+ * shadow[cell](cell->entry)を持ち:
+ *   1. n_load 個のタイルを slot へ書込(共有プール)
+ *   2. n_upd をシャドウに反映 shadow[cell]=entry
+ *   3. シャドウを64-pitchのMain-RAM stageへ展開
+ *   4. cadence-final VBlank内でstageを表示NTへDMA
+ * 書換え範囲はencoded gridの先頭cellから末尾cellまでの静的bandだけで、行間の
+ * 非表示cellはzero stageを運ぶ。NT DMA、DEBUG HUD、CRAMは同じblank予算内に収める。
+ */
+
+.equ STACK, 0x00FFFD00
+
+.equ BIOS_CLEAR_VRAM,            0x000002A0
+.equ BIOS_LOAD_DEFAULT_VDP_REGS, 0x000002AC
+.equ BIOS_VDP_DISP_ENABLE,       0x000002D8
+.equ BIOS_CLEAR_COMM,            0x00000340
+
+.equ VDP_DATA, 0x00C00000
+.equ VDP_CTRL, 0x00C00004
+.equ VDP_HV,   0x00C00008
+
+/* Genesis-side sound devices, silenced once at boot (init_sound_silence). */
+.equ Z80_RAM,    0x00A00000
+.equ Z80_BUSREQ, 0x00A11100
+.equ Z80_RESET,  0x00A11200
+.equ YM_ADDR0,   0x00A04000
+.equ YM_DATA0,   0x00A04001
+.equ YM_ADDR1,   0x00A04002
+.equ YM_DATA1,   0x00A04003
+.equ PSG_PORT,   0x00C00011
+
+.equ GA_COMCMD0, 0x00A12010
+.equ GA_COMCMD1, 0x00A12012
+.equ GA_COMSTAT0, 0x00A12020
+.equ GA_COMSTAT1, 0x00A12022
+.equ GA_COMSTAT2, 0x00A12024
+.equ GA_STOPWATCH, 0x00A1200C		/* 12-bit, 30.72 us/tick, Main read-only */
+
+.equ PROBE_BANK, 0x00200000
+.equ O_NRUN_OFF, 0x0000
+.equ O_LOADS_OFF, 0x0004
+
+.equ CMD_STREAM, 0x50
+.equ CMD_SWAP,   0x51
+.equ STAT_BOOT_STAGE, 0x8001		/* sidecar/Dic staging bank is available */
+.equ STAT_READY, 0x8003
+.equ STAT_END,   0x8004			/* SPからの映画終端通知(15秒待って再ループ) */
+
+.equ MOVIE_NT,        0xE000
+.equ HUD_WINDOW_NT,   0xF000
+/* DEBUG HUD hexadecimal font: 16 tiles packed directly under the sprite
+   table so the resident movie-pattern pool below stays one contiguous run.
+   Detailed usage notes live at the DBGFONT definitions further down. */
+.equ HUD_FONT_ADDR, 0xDA00
+.equ HUD_SPRITE_TABLE, 0xDC00
+.equ HUD_SPRITE_TABLE_BYTES, 80*8
+.equ HUD_SPRITE_REG, 0x8500 | (HUD_SPRITE_TABLE >> 9)
+
+/* The VDP ignores the low sprite-table base bit at H40, so the physical table
+   must be 0x400-aligned; 0xDC00 is the highest such base whose complete 80-record
+   hardware footprint still ends below the movie name table. It sits directly
+   above the HUD font so the resident pool below stays one contiguous run. In
+   particular, it must not alias the full-screen Window map at 0xF000 as the
+   old 0xF800 placement did. */
+.if (HUD_SPRITE_TABLE & 0x03FF)
+.error "HUD sprite table is not 0x400-aligned"
+.endif
+.if (HUD_SPRITE_TABLE < HUD_FONT_ADDR+0x200) || ((HUD_SPRITE_TABLE + HUD_SPRITE_TABLE_BYTES) > MOVIE_NT)
+.error "HUD sprite table is outside the free VRAM gap"
+.endif
+
+/* 0xFF2100..0xFF66FF is no longer a tile staging buffer: streamed pattern DMA
+   reads Word RAM directly and repairs the first destination word on the CPU.
+   Keep this range for boot-time Main-CPU code generation. O_LOADS v2 also
+   removes the former 0xFF8800 run table. Its first 128 bytes retain one
+   inline fade CRAM image across the early Word-RAM return. The
+   complete fixed Main-RAM map is:
+     M-CODE   0xFF0000..0xFF66FF  resident IP + generated bitmap handlers
+     M-STATE  0xFF6700..0xFF87FF  runtime .bss (8.25 KiB worst-case reserve)
+     M-FCRAM  0xFF8800..0xFF887F  current inline fade palette
+     free     0xFF8880..0xFF993F  4288 bytes
+     M-PALTAB 0xFF9940..0xFFB93F  64 x 128B palette segments
+     M-PALIDX 0xFFB940..0xFFBA3F  64 x 4B palette-switch entries
+     M-DIC    0xFFBA40..0xFFFA3F  512-pattern persistent dictionary
+     guard    0xFFFA40..0xFFFAFF  cushion below the stack
+     M-STACK  0xFFFB00..0xFFFCFF  / M-TOP 0xFFFD00.. BIOS reserve */
+.equ MAIN_CODEGEN_BASE,  0x00FF2100
+.equ MAIN_CODEGEN_LIMIT, 0x00FF6700	/* M-STATE base = end of M-CODE */
+.equ DIC_BUF,            0x00FFBA40	/* persistent dictionary; direct Main-RAM VDP DMA */
+.equ DIC_BUF_END,        0x00FFFA40
+.equ DIC_BUF_PATTERNS,   512
+.equ MAIN_CODEGEN_TABLE_BYTES, 0x0200	/* 256 signed word offsets */
+.equ MAIN_CODEGEN_HANDLER_MAX, 70	/* mask FF: guarded before writing */
+.equ MAIN_CODEGEN_EXPECTED_END, 0x00FF4A00
+.equ DIC_STAGE_OFF,      0x6000		/* copied before frame-0 output reuses this area */
+
+/* Exact 68000 words emitted by init_main_codegen. Validate emitter changes
+   against the built player and its generated Main-RAM handlers. */
+.equ CG_OP_MOVE_ENTRY_D3,      0x3618	/* move.w (a0)+,d3 */
+.equ CG_OP_STRIP_COLD_D6_D3,   0xC646	/* and.w d6,d3 */
+.equ CG_ENTRY_MASK_LONG,       0x67FF67FF
+.equ CG_OP_STORE_D3_A1,        0x3283	/* move.w d3,(a1) */
+.equ CG_OP_STORE_D3_D16_A1,    0x3343	/* move.w d3,disp(a1) */
+.equ CG_OP_ADVANCE_SHADOW,     0x43E9	/* lea 16(a1),a1 */
+.equ CG_SHADOW_BYTE_ADVANCE,   16
+.equ CG_OP_BRA_W,              0x6000
+/* DEBUG HUD: only hexadecimal glyphs. Fixed at VRAM 0xDA00 (tiles 1744..1759),
+   immediately above the contiguous movie-pattern pool. The single movie name
+   table starts at 0xE000. DEBUG and release, generic and specialized builds all
+   share this physical layout. HUD_FONT_ADDR itself is defined next to the
+   sprite table so the layout asserts can reference both. */
+.equ DBGFONT_N, 16
+.equ HUD_FONT_VTILE, HUD_FONT_ADDR/32	/* = 1744; name-table tile index (11-bit, fits) */
+/* リリースビルドが既定。make movieplay DEBUG=1 でオーバーレイ一式を有効化
+   (画面表示専用。ストリームにDEBUG専用データは持たない) */
+/* CRAM pre-load: 全区間パレット表(paltab.bin)と切替表(palidx.bin)はpackが書く
+   ビルド入力で、このIPイメージの一時.startup領域に内蔵する。ip_entry冒頭で
+   M-PALTAB/M-PALIDXへコピーし、以後codegenが.startupを上書きしても安全。
+   区間切替は内蔵PALIDX表(切替frame番号+区間番号)が起点で、ストリーム到着に
+   依存しない。容量はav_config.PALTAB_MAX_SEGと一致必須
+   (check_player_ring.pyがビルド時検証)。 */
+.equ PALTAB_MAX_SEG, 64			/* Main-RAM capacity: 64 * 128B = 8 KiB */
+.equ PALTAB_STAGE_BYTES, 0x6000
+.equ PALIDX_ENTRIES, 64			/* 63 switches + 0xFFFF frame sentinel */
+.equ PALIDX_RAM, 0x00FFB940		/* M-PALIDX 0xFFB940..0xFFBA3F */
+.equ BOOT_VRAM_DIR_OFF, 0x0FC0
+.equ BOOT_VRAM_MAGIC, 0x4256524D		/* "BVRM" */
+.equ FADE_CRAM_RAM, 0x00FF8800		/* 128B copy kept after early Word-RAM return */
+.equ PALTAB_RAM, 0x00FF9940		/* M-PALTAB 0xFF9940..0xFFB93F */
+.if PALTAB_RAM < FADE_CRAM_RAM+128
+	.error "PALTAB overlaps the inline fade CRAM image"
+.endif
+.if PALTAB_RAM+PALTAB_MAX_SEG*128 != PALIDX_RAM
+	.error "PALIDX must immediately follow PALTAB"
+.endif
+.if PALIDX_RAM+PALIDX_ENTRIES*4 != DIC_BUF
+	.error "DicBuf must immediately follow PALIDX"
+.endif
+/* 1VBLANKで安全に使えるDMA相当word budget。Word-RAM DMAの先頭word補修など、
+   CPUによるVDP word writeはDMAの4倍でchargeし、runは残budget境界で次VBLANKへ
+   分ける。 */
+.equ SCREEN_COLS, 40		/* H40 V28 NTSC: 40x28 cell aperture */
+.equ CPU_VDP_WORD_COST, 4	/* one CPU-written VDP word in DMA-word equivalents */
+.equ FEATURE_VBLANK_CADENCE_BIT, 1	/* header features bit 1 */
+.equ FEATURE_PATTERN_SUPPLY_BIT, 3
+.equ FEATURE_BOOT_VRAM_SIDECAR_BIT, 7
+.equ FEATURE_WORDBUF_RING_BIT, 8
+.equ SHADOW_UPDATE_LIST_BIT, 15
+.equ FRAME_TYPE_MASK, 0x6000
+.equ FRAME_TYPE_NORMAL, 0x0000
+.equ FRAME_TYPE_FADE_IN, 0x2000
+.equ FRAME_TYPE_FADE_OUT, 0x4000
+.equ FRAME_TYPE_SCROLL, 0x6000
+.equ SHADOW_UPDATE_COUNT_MASK, 0x1FFF
+.equ SHADOW_OFFSET_MASK, 0x0FFE	/* 4KB physical shadow, even word offsets */
+.ifdef ASTRA_PAL
+.equ PACE_VBLANK_TICKS, 655	/* 49.70 Hz, 30.72 us stopwatch */
+.else
+.equ PACE_VBLANK_TICKS, 543	/* one NTSC VBlank in 30.72us stopwatch ticks */
+.endif
+.equ PACE_ARM_BIAS_TICKS, 286	/* preserves the proven N2 arm point: 2*543-286=800 */
+
+.ifdef DEBUG
+.equ HUD_FLIP_FIELDS, 1
+.equ HUD_SUB_POLL_GAP, 1
+.equ HUD_COMBINED_WORDS, 43
+.ifdef PLAYER_SPECIALIZED
+.equ HUD_HEX_TABLE, 1
+.endif
+.endif
+
+	.include "player_constants.inc"
+.equ CTRL_SCR_OFF, PC_CTRL_SCR_OFFSET
+.equ STATUS_OFF, PC_STATUS_OFFSET
+.equ WR0_OFF, PC_WR0_OFFSET
+.equ WR0_END, PC_WR0_END
+.equ WR1_OFF, PC_WR1_OFFSET
+.equ WR1_END, PC_WR1_END
+.equ PACE_FIXED_ARM_TICKS, PC_VSYNC_N*PACE_VBLANK_TICKS-PACE_ARM_BIAS_TICKS
+.equ PACE_ALT_ARM_TICKS, PC_VSYNC_ALT*PACE_VBLANK_TICKS-PACE_ARM_BIAS_TICKS
+
+/* Generic builds must retain the runtime period-2 path. Specialized builds
+   omit its recovery helper completely unless this profile uses `(2, 3)`. */
+.ifndef PLAYER_SPECIALIZED
+.equ PERIODIC_CADENCE_RUNTIME, 1
+.elseif PC_CADENCE_PERIOD == 2
+.equ PERIODIC_CADENCE_RUNTIME, 1
+.else
+.equ PERIODIC_CADENCE_RUNTIME, 0
+.endif
+
+/* Every build stages one statically trimmed 64-pitch band and DMAs it directly
+   into the single displayed name table during the cadence-final VBlank. A
+   40x19 letterboxed grid therefore transfers 18*64+40 = 1192 words rather than
+   the complete 1792-word aperture. Generic builds derive the same values from
+   HEADER.DAT at startup. */
+.equ NT_STAGE_PITCH, 64
+.equ NT_STAGE_MAX_WORDS, (28-1)*NT_STAGE_PITCH+SCREEN_COLS
+.equ NT_FLIP_GUARD_WORDS, 128
+.ifdef PLAYER_SPECIALIZED
+.equ NT_STAGE_WORDS, (PC_TROWS-1)*NT_STAGE_PITCH+PC_TCOLS
+.equ NT_STAGE_ROW_SKIP, (NT_STAGE_PITCH-PC_TCOLS)*2
+.equ NT_STAGE_DST, MOVIE_NT+(PC_ROW0*NT_STAGE_PITCH+PC_COL0)*2
+.ifdef DEBUG
+.equ NT_FLIP_HUD_WORDS, PC_SCREEN_COLS+(HUD_COMBINED_WORDS-PC_SCREEN_COLS)*4
+.else
+.equ NT_FLIP_HUD_WORDS, 0
+.endif
+.if (PC_FEATURES & 0x0200)
+/* Rolling-plane horizontal scroll: nt_stage grows into the persistent 64x32
+   plane band, scroll controls stage the full 64-column band, and the flip
+   VBlank rewrites the Plane A/B HScroll pair at VRAM 0xFC00. HScroll shifts
+   every scanline, so the grid must span the full 40-column H40 width; a
+   letterboxed grid keeps its uniform border rows and DMAs the same
+   PC_ROW0-offset band. The packer only emits vertical windows on the
+   full-screen 28-row grid, because they roll all 32 plane rows. */
+.equ INCLUDE_SCROLL, 1
+.if (PC_TCOLS != 40) || (PC_COL0 != 0)
+.error "rolling-plane scroll requires the full-width 40-column H40 grid"
+.endif
+.equ NT_SCROLL_BAND_WORDS, PC_TROWS*NT_STAGE_PITCH
+.equ NT_SCROLL_VBAND_WORDS, 32*NT_STAGE_PITCH
+.equ NT_FLIP_SCROLL_WORDS, (NT_SCROLL_BAND_WORDS-NT_STAGE_WORDS)+4*CPU_VDP_WORD_COST
+.else
+.equ NT_FLIP_SCROLL_WORDS, 0
+.endif
+.equ NT_FLIP_RESERVE_WORDS, NT_STAGE_WORDS+NT_FLIP_HUD_WORDS+NT_FLIP_SCROLL_WORDS+NT_FLIP_GUARD_WORDS
+.endif
+
+.macro PC_MOVE_W runtime, constant, dest
+.ifdef PLAYER_SPECIALIZED
+	move.w	#\constant, \dest
+.else
+	move.w	\runtime, \dest
+.endif
+.endm
+
+.macro PC_MOVE_L runtime, constant, dest
+.ifdef PLAYER_SPECIALIZED
+	move.l	#\constant, \dest
+.else
+	move.l	\runtime, \dest
+.endif
+.endm
+
+.macro PC_CMP_L runtime, constant, dest
+.ifdef PLAYER_SPECIALIZED
+	cmpi.l	#\constant, \dest
+.else
+	cmp.l	\runtime, \dest
+.endif
+.endm
+
+.macro PAL_COMPARE
+	bsr	palette_next_frame
+	cmp.l	d2, d1
+.endm
+
+.macro PC_CMP_W runtime, constant, dest
+.ifdef PLAYER_SPECIALIZED
+	cmpi.w	#\constant, \dest
+.else
+	cmp.w	\runtime, \dest
+.endif
+.endm
+
+.macro PC_ADD_W runtime, constant, dest
+.ifdef PLAYER_SPECIALIZED
+	addi.w	#\constant, \dest
+.else
+	add.w	\runtime, \dest
+.endif
+.endm
+
+.macro PC_ADDA_W runtime, constant, dest
+.ifdef PLAYER_SPECIALIZED
+	adda.w	#\constant, \dest
+.else
+	adda.w	\runtime, \dest
+.endif
+.endm
+
+/* The specialized DEBUG player knows the HUD font tile base at assembly time.
+   Map one byte directly to its two name-table words, avoiding two nibble
+   conversions and all formatter calls in the per-frame deadline. */
+.macro DBG_PUT2
+.ifdef HUD_HEX_TABLE
+	andi.w	#0x00FF, d4
+	add.w	d4, d4			/* *4: two ADDs beat LSL.W #2 by 2 clocks */
+	add.w	d4, d4
+	move.l	(a1,d4.w), (a0)+
+.else
+	bsr	dbg_put2
+.endif
+.endm
+
+.macro DBG_PUT1
+.ifdef HUD_HEX_TABLE
+	andi.w	#0x000F, d4
+	addi.w	#HUD_FONT_VTILE, d4
+	move.w	d4, (a0)+
+.else
+	bsr	dbg_put1
+.endif
+.endm
+
+.macro DBG_PUT3
+.ifdef HUD_HEX_TABLE
+	bsr	dbg_fast_put3
+.else
+	bsr	dbg_put3
+.endif
+.endm
+
+.macro DBG_PUT4
+.ifdef HUD_HEX_TABLE
+	move.w	d4, d3
+	lsr.w	#8, d4
+	DBG_PUT2
+	move.w	d3, d4
+	DBG_PUT2
+.else
+	bsr	dbg_put4
+.endif
+.endm
+
+.text
+
+.ifdef MULTIPART
+	.include "multipart_player.inc"
+.endif
+
+	/* The BIOS enters the IP here, at the region's security code, and that
+	   code falls through to this branch.  Both the code and the offset the
+	   branch target is padded to belong to the region, because the three
+	   security codes are 342, 1390 and 1412 bytes long. */
+	.include "disc_region.inc"
+	.incbin "security.bin"
+
+	bra.w	ip_entry
+	.org	DISC_IP_ENTRY_OFFSET
+
+.global ip_entry
+ip_entry:
+	move.w	#0x2700, sr
+	lea	STACK, sp
+.ifdef MULTIPART
+	/* Later parts replace this image without a BIOS BSS clear. */
+	lea	0x00FF6700.l, a0
+	moveq	#0, d0
+	move.w	#(0x2100/4)-1, d1
+1:
+	move.l	d0, (a0)+
+	dbra	d1, 1b
+	lea	multipart_restore, a0
+	lea	0x00FF8880.l, a1
+	move.w	#((multipart_restore_end-multipart_restore)/2)-1, d0
+1:
+	move.w	(a0)+, (a1)+
+	dbra	d0, 1b
+.endif
+
+	/* Real hardware powers up the Z80, PSG and YM2612 undefined; an unheld
+	   Z80 executes garbage RAM and can drive constant noise over PCM
+	   playback. Emulators start them zeroed and hide this. Park everything
+	   in a known-silent state before any streaming begins. */
+	bsr	init_sound_silence
+
+	/* IPイメージ内蔵のパレット表(可変長 n_seg*128B)と切替表(256B)をM-RAMへ。
+	   格納元は一時.startup領域で、後段のcodegenが上書きするため最初に写す。
+	   以後の参照(初期CRAM・区間切替・ループ復帰)はすべてM-PALTAB/M-PALIDX。 */
+	lea	paltab_image, a0
+	lea	PALTAB_RAM, a1
+	move.w	#(paltab_image_end-paltab_image)/2-1, d0
+1:
+	move.w	(a0)+, (a1)+
+	dbra	d0, 1b
+	lea	palidx_image, a0
+	lea	PALIDX_RAM, a1
+	moveq	#PALIDX_ENTRIES-1, d0
+1:
+	move.l	(a0)+, (a1)+
+	dbra	d0, 1b
+	move.l	#PALIDX_RAM, palidx_ptr
+
+	jsr	BIOS_LOAD_DEFAULT_VDP_REGS
+	jsr	BIOS_CLEAR_VRAM
+	jsr	BIOS_CLEAR_COMM
+
+	/* VDP: H40, autoinc=2, plane 64x32, one movie NT and fixed DEBUG tables. */
+	move.w	#0x8C81, (VDP_CTRL).l		/* reg12 H40 */
+	move.w	#0x9001, (VDP_CTRL).l		/* reg16 plane 64x32 */
+	move.w	#0x8F02, (VDP_CTRL).l		/* reg15 autoinc 2 */
+	move.w	#0x8B00, (VDP_CTRL).l		/* reg11 scroll full-screen */
+	move.w	#0x8407, (VDP_CTRL).l		/* reg4  Plane B NT = movie NT 0xE000 */
+	move.w	#0x833C, (VDP_CTRL).l		/* reg3  Window NT = 0xF000 */
+	move.w	#HUD_SPRITE_REG, (VDP_CTRL).l	/* reg5  sprite table = 0xDC00 */
+	move.w	#0x8D3F, (VDP_CTRL).l		/* reg13 hscroll 0xFC00 */
+	move.w	#0x8238, (VDP_CTRL).l		/* reg2  Plane A = single movie NT 0xE000 */
+	move.l	#0x40000010, (VDP_CTRL).l	/* VSRAM=0 */
+	move.w	#0, (VDP_DATA).l
+	move.w	#0, (VDP_DATA).l
+	.ifdef DEBUG
+	/* reg18 alone makes lines 0..7 full-width Window. reg17 must stay 0: a
+	   right-side strip from x=0 would put the Window plane over every later
+	   line too, and Window row 24 col 0..1 (0xF000+24*128 = 0xFC00) is the
+	   HScroll table, so nonzero scroll values would render as NT entries at
+	   screen (24,0)-(24,1). */
+	move.w	#0x9100, (VDP_CTRL).l		/* no Window side strip */
+	move.w	#0x9201, (VDP_CTRL).l		/* Window above row 1: fixed top 8 pixels */
+	.else
+	move.w	#0x9100, (VDP_CTRL).l		/* no Window side strip */
+	move.w	#0x9200, (VDP_CTRL).l		/* no Window top strip */
+	.endif
+
+.ifdef PLAYER_SPECIALIZED
+	bsr	draw_startup
+.else
+	bsr	load_movie_palette
+.endif
+
+	jsr	BIOS_VDP_DISP_ENABLE
+	move.w	#0x8174, (VDP_CTRL).l		/* reg1: 表示on+vint+DMA許可(M1)+mode5 */
+
+	clr.w	dbg_seg
+
+	move.w	#CMD_STREAM, d0
+.ifdef PLAYER_SPECIALIZED
+	bsr	cmd_wait_startup
+	/* Sub has armed BODY and handed over frame 0 with the timed suffix stopped.
+	   Keep CMD_STREAM asserted until Main has built and flipped frame 0. */
+.else
+	bsr	cmd_wait_ready
+.endif
+
+	/* frame0準備完了=バンクにヘッダ写し(O_HDR)がある。tcols/trows/pool/base を読み
+	   実行時変数を確定する。表示modeはH40固定。 */
+	lea	(PROBE_BANK+STATUS_OFF+0x80), a0
+	.ifndef PLAYER_SPECIALIZED
+	moveq	#0, d0
+	move.b	37(a0), d0
+	swap	d0
+	move.w	4(a0), d0
+	subq.l	#1, d0
+	move.l	d0, md_final_frame
+	move.w	6(a0), md_tcols
+	move.w	8(a0), md_trows
+	move.w	10(a0), d0			/* cells; supported grids are multiples of 8 */
+	lsr.w	#3, d0
+	move.w	d0, md_bmbytes
+	/* HUD font is fixed at 0xDA00 (HUD_FONT_ADDR/HUD_FONT_VTILE); no runtime
+	   base+pool computation needed. */
+	/* The first cadence interval is stored at offset 50. CAVC derives any
+	   later interval from nominal fps, so 24fps becomes the periodic 2/3 path. */
+	move.w	50(a0), d0
+	bne	1f
+	moveq	#4, d0
+1:
+	clr.w	md_cadence_period
+	btst	#FEATURE_VBLANK_CADENCE_BIT, 61(a0)
+	beq	1f
+	move.w	#1, md_cadence_period
+	cmpi.w	#24, 54(a0)
+	bne.s	1f
+	move.w	#2, md_cadence_period
+1:
+	move.w	d0, md_vsync_n
+	mulu.w	#PACE_VBLANK_TICKS, d0
+	subi.w	#PACE_ARM_BIAS_TICKS, d0
+	move.w	d0, md_pace_arm_ticks
+	move.w	d0, md_pace_alt_arm_ticks
+	cmpi.w	#2, md_cadence_period
+	bne.s	1f
+	move.w	#3*PACE_VBLANK_TICKS-PACE_ARM_BIAS_TICKS, md_pace_alt_arm_ticks
+1:
+	move.w	#SCREEN_COLS, d2		/* screen_cols */
+	/* Use the same generated H40/V28 budget as the specialized path.
+	   Region changes affect cadence separately; both use the measured-safe baseline. */
+	move.w	#PC_VBUDGET, d3
+	move.w	d2, md_screen_cols
+	.endif
+	move.w	#0x8C81, (VDP_CTRL).l		/* reg12 H40 */
+.ifndef PLAYER_SPECIALIZED
+	move.w	d3, md_vbudget
+	sub.w	md_tcols, d2			/* col0 = (screen_cols-tcols)/2 */
+	lsr.w	#1, d2
+	move.w	d2, md_col0
+	move.w	#28, d2				/* screen_rows */
+	sub.w	md_trows, d2			/* row0 = (screen_rows-trows)/2 */
+	lsr.w	#1, d2
+	move.w	d2, md_row0
+	/* The staged band begins at the encoded grid's top-left cell and ends at
+	   its final cell. Interior pitch gaps stay zero after the one boot clear. */
+	move.w	md_trows, d0
+	subq.w	#1, d0
+	lsl.w	#6, d0
+	add.w	md_tcols, d0
+	move.w	d0, md_nt_stage_words
+	addi.w	#NT_FLIP_GUARD_WORDS, d0
+	.ifdef DEBUG
+	move.w	#HUD_COMBINED_WORDS, d1
+	sub.w	md_screen_cols, d1
+	lsl.w	#2, d1				/* four SAT words per spill digit */
+	add.w	md_screen_cols, d1		/* one Window word per top-row digit */
+	add.w	d1, d0
+	.endif
+	move.w	d0, md_nt_flip_reserve_words
+	moveq	#0, d0
+	move.w	md_row0, d0
+	lsl.w	#6, d0
+	add.w	md_col0, d0
+	add.w	d0, d0
+	addi.l	#MOVIE_NT, d0
+	move.l	d0, md_nt_stage_dst
+	/* Generic DEBUG builds need the same fps-scaled normal PrgBuf ceiling as
+	   generated players: (422-6-ceil(600/fps)) KiB, then KiB -> patterns. */
+	moveq	#0, d2
+	move.w	56(a0), d2			/* integer content fps */
+	bne.s	1f
+	moveq	#1, d2				/* corrupt-header divide-by-zero guard */
+1:
+	move.l	#600, d3
+	divu.w	d2, d3
+	swap	d3				/* remainder */
+	tst.w	d3
+	beq.s	2f
+	swap	d3
+	addq.w	#1, d3				/* ceil(600/fps) */
+	bra.s	3f
+2:
+	swap	d3				/* exact quotient */
+3:
+	move.w	#414, d2
+	sub.w	d3, d2
+	lsl.w	#5, d2				/* 1 KiB = 32 patterns */
+	move.w	d2, md_prg_buf_cap_patterns
+	.endif
+	bsr	clear_nt_stage
+.ifdef MAIN_CODEGEN
+	/* Generate once, before playback. A failed range/size proof leaves
+	   md_codegen=0 and the per-bit reference path remains active. */
+	bsr	init_main_codegen
+.endif
+	/* Generic DEBUG builds have no preload counter, so upload the shared font
+	   here. Specialized DEBUG/release builds already uploaded it at startup. */
+.ifdef DEBUG
+.ifndef PLAYER_SPECIALIZED
+	move.l	#HUD_FONT_ADDR, d0
+	bsr	set_vram_write
+	lea	dbgfont, a0
+	move.w	#DBGFONT_N*16-1, d1
+1:
+	move.w	(a0)+, d0			/* each nibble is 0 or 1 */
+	move.w	d0, d2
+	lsl.w	#1, d2
+	or.w	d2, d0
+	lsl.w	#1, d2
+	or.w	d2, d0
+	lsl.w	#1, d2
+	or.w	d2, d0			/* 1 -> 0xF independently in every nibble */
+	ori.w	#0x1111, d0			/* 0 -> 0x1; 0xF remains 0xF */
+	move.w	d0, (VDP_DATA).l
+	dbra	d1, 1b
+.endif
+.endif
+	/* Frame -1 is a player-only black state. DEBUG publishes frame=FFFF on it,
+	   so capture OCR can find the exact frame=0000 playback boundary. */
+	bsr	show_frame_minus_one
+	clr.l	frame_no
+	clr.w	started
+	clr.w	swap_request_pending		/* .bss is not cleared; no startup request is pending */
+	clr.w	vsync_acc			/* v4: ペーシングカウンタ初期化(.bssはMD上でクリアされない) */
+	move.l	#PALIDX_RAM, palidx_ptr		/* ip_entry冒頭でも設定済み(防御的) */
+	bsr	prime_fixed_cadence		/* frame0 has no preceding movie flip */
+.ifdef DEBUG
+	clr.w	sub_wait_lines
+	clr.w	dma_elapsed_ticks
+	clr.w	dma_start_tick
+.ifdef HUD_FLIP_FIELDS
+	clr.w	flip_hv_v
+	clr.w	pattern_vblank1_exit_v
+	clr.w	pass2_entry_q
+	clr.w	pattern_dma_ready_v
+	clr.w	nt_dma_ready_v
+.endif
+.endif
+play_loop:
+	/* Feature bit 1 pairs the Main VBlank cadence with the Sub's exact
+	   per-interval CD deadline schedule. */
+	tst.w	started
+	beq	1f
+	tst.w	swap_request_pending
+	bne.s	2f
+	bsr	swap_begin			/* frame 1 / final END retain synchronous request timing */
+2:
+	bsr	swap_finish_or_end		/* finish an early request, or block on the new one */
+	cmp.w	#STAT_END, d0
+	beq	movie_end_md
+1:
+	move.w	#1, started
+	bsr	build_frame
+	tst.l	frame_no			/* one CMD_STREAM edge starts video time + PCM */
+	bne.s	1f
+	bsr	start_playback
+1:
+
+	addq.l	#1, frame_no
+	bra	play_loop
+
+/* 映画終端: 最終フレームを表示したまま15秒(900vblank)待ち、先頭からループ再生 */
+movie_end_md:
+.ifdef MULTIPART
+	/* Execute outside the IP image which the loader will replace. */
+	jmp	0x00FF8880.l
+.endif
+	move.w	#900-1, d2
+1:
+	bsr	wait_vblank
+	dbra	d2, 1b
+	move.w	#CMD_STREAM, d0			/* SPを再ストリーム開始させる */
+	bsr	cmd_wait_ready			/* BODY arm + frame0 handoff完了まで待つ */
+	bsr	show_frame_minus_one
+	/* ループ再生: CRAMを区間0へ復帰(最終区間のパレットのままframe0を
+	   表示しない)。frame -1は黒画面なので新VBLANK頭で総入替すれば安全。 */
+	bsr	wait_vb_start
+	bsr	load_movie_palette
+	clr.l	frame_no
+	clr.w	started
+	clr.w	swap_request_pending
+	clr.w	dbg_seg
+	move.l	#PALIDX_RAM, palidx_ptr		/* ループ再生: 切替表を先頭へ巻き戻す */
+	bsr	clear_nt_stage
+	bsr	prime_fixed_cadence		/* 15s tail already satisfies frame0 cadence */
+	bra	play_loop
+
+/* Initial boot and replay start from the same blank plane. Fine scrolling
+   exposes columns outside the ordinary 40-column band; retaining those words
+   lets a previous loop's hidden tiles leak into the next loop's first pan. */
+clear_nt_stage:
+	lea	nt_stage, a0
+	moveq	#0, d0
+.ifdef INCLUDE_SCROLL
+	move.w	#NT_SCROLL_VBAND_WORDS, d1
+	clr.w	scroll_next_h
+	clr.w	scroll_next_v
+	move.w	#1, scroll_h_dirty		/* frame 0 also resets the VDP's old scroll */
+.else
+	PC_MOVE_W md_nt_stage_words, NT_STAGE_WORDS, d1
+.endif
+	subq.w	#1, d1
+1:
+	move.w	d0, (a0)+
+	dbra	d1, 1b
+	rts
+
+.ifdef MULTIPART
+/* Main owns only the handed-over bank, until its final copy ACK. */
+multipart_restore:
+	move.w	#1, (GA_COMCMD1).l
+1:
+	cmpi.w	#0x8006, (GA_COMSTAT0).l
+	bne.s	1b
+	lea	PROBE_BANK.l, a0
+	lea	0x00FF0000.l, a1
+	move.w	#(0x5000/2)-1, d0
+2:
+	move.w	(a0)+, (a1)+
+	dbra	d0, 2b
+	clr.w	(GA_COMCMD1).l
+	movea.l	#MULTIPART_RETURN_ENTRY, a0
+	jmp	(a0)
+multipart_restore_end:
+/* multipart_build.py checks the assembled stub against its resident region. */
+.endif
+
+.ifdef MAIN_CODEGEN
+/* Emit the 256 straight-line bitmap handlers once into Main RAM.
+   The table stores signed word offsets from MAIN_CODEGEN_BASE.  Every handler
+   reads only its set-bit entries, strips the cold flag, writes fixed shadow
+   displacements, advances a1 by one bitmap byte, and BRA.Ws to bf_cg_unext.
+   Nothing patches or rewrites this region after this routine returns. */
+init_main_codegen:
+	movem.l	d0-d7/a0-a2, -(sp)
+	clr.w	md_codegen
+	clr.l	md_codegen_end
+	lea	MAIN_CODEGEN_BASE, a1		/* jump table cursor */
+	lea	(MAIN_CODEGEN_BASE+MAIN_CODEGEN_TABLE_BYTES), a0 /* emitted code cursor */
+	moveq	#0, d7				/* mask 0..255 */
+1:
+	/* Refuse before writing this handler if even the largest template could
+	   cross the fixed M-CODE boundary. Partial generated data is harmless
+	   while the success flag remains clear. */
+	move.l	a0, d0
+	addi.l	#MAIN_CODEGEN_HANDLER_MAX, d0
+	cmpi.l	#MAIN_CODEGEN_LIMIT, d0
+	bhi	9f
+	move.l	a0, d0
+	subi.l	#MAIN_CODEGEN_BASE, d0
+	cmpi.l	#0x7FFF, d0			/* dispatch sign-extends d4.w */
+	bhi	9f
+	move.w	d0, (a1)+
+
+	moveq	#0, d5				/* source/shadow bit 0..7 */
+2:
+	btst	d5, d7
+	beq	4f
+	move.w	#CG_OP_MOVE_ENTRY_D3, (a0)+
+	move.w	#CG_OP_STRIP_COLD_D6_D3, (a0)+
+	tst.w	d5
+	bne	3f
+	move.w	#CG_OP_STORE_D3_A1, (a0)+
+	bra	4f
+3:
+	move.w	#CG_OP_STORE_D3_D16_A1, (a0)+
+	move.w	d5, d0
+	add.w	d0, d0
+	move.w	d0, (a0)+
+4:
+	addq.w	#1, d5
+	cmpi.w	#8, d5
+	blo	2b
+
+	move.w	#CG_OP_ADVANCE_SHADOW, (a0)+
+	move.w	#CG_SHADOW_BYTE_ADVANCE, (a0)+
+	move.w	#CG_OP_BRA_W, (a0)+
+	/* BRA.W displacement is relative to the PC after its extension word.
+	   a0 currently points at that extension word. */
+	move.l	#bf_cg_unext, d0
+	sub.l	a0, d0
+	subq.l	#2, d0
+	cmpi.l	#-32768, d0
+	blt	9f
+	cmpi.l	#32767, d0
+	bgt	9f
+	move.w	d0, (a0)+
+
+	addq.w	#1, d7
+	cmpi.w	#256, d7
+	blo	1b
+
+	move.l	a0, d0
+	cmpi.l	#MAIN_CODEGEN_EXPECTED_END, d0
+	bne	9f
+	cmpi.l	#MAIN_CODEGEN_LIMIT, d0
+	bhi	9f
+	move.l	d0, md_codegen_end
+	move.w	#1, md_codegen
+	bra	10f
+9:
+	move.l	a0, md_codegen_end		/* diagnostic only; fallback stays selected */
+10:
+	movem.l	(sp)+, d0-d7/a0-a2
+	rts
+.endif
+
+/* Build and flip one frame. The Sub has already expanded every physical run
+   into a VDP-ready 22-byte O_LOADS v2 record, so Main performs no staging pass.
+   The same Word-RAM cursor first drives name updates, then the VBlank DMA pass. */
+palette_next_frame:
+	moveq	#0, d2
+	move.w	(a0), d2
+	tst.w	2(a0)
+	beq.s	1f
+	btst	#7, 2(a0)
+	beq.s	2f
+	bset	#16, d2
+2:
+	rts
+1:
+	moveq	#-1, d2			/* unchanged (FFFF,0000) terminator */
+	rts
+
+build_frame:
+	movem.l	d0-d7/a0-a3, -(sp)
+.ifdef DEBUG
+	clr.w	vsync_acc			/* per-frame VBlank-start waits shown as Mxx */
+	clr.w	frame_vblank_waits
+	clr.w	dma_elapsed_ticks		/* H40 Uxxxx: Main pattern-transfer stopwatch ticks */
+.endif
+	move.w	(PROBE_BANK+O_NRUN_OFF).l, n_runs
+bf_upd:
+	/* Read bitmap+entries directly from the linear control block in the swapped
+	   Word-RAM bank.  The Sub already walks them to build cold runs; rewriting
+	   every (cell,entry) pair was duplicate work on the bottleneck CPU. */
+	lea	(PROBE_BANK+CTRL_SCR_OFF+4), a0	/* skip total_len + frame_seq */
+	move.w	(a0)+, d7			/* bit15=list, bits14..13=type, low13=n_upd */
+	move.w	d7, d6			/* preserve format tag */
+	andi.w	#FRAME_TYPE_MASK, d6
+	move.w	d6, frame_type
+	move.w	d7, d6			/* preserve list tag */
+.ifdef INCLUDE_SCROLL
+	/* Leaving a scroll window: copy the final tile-aligned viewport back to
+	   the logical shadow before this frame's ordinary updates apply. */
+	move.w	scroll_next_h, d0
+	or.w	scroll_next_v, d0
+	beq.s	3f
+	cmpi.w	#FRAME_TYPE_SCROLL, frame_type
+	beq.s	3f
+	bsr	bf_scroll_rebase
+3:
+	cmpi.w	#FRAME_TYPE_SCROLL, frame_type
+	beq	bf_scroll_control
+.endif
+	tst.w	frame_type
+	beq.s	1f
+	/* The single-NT path returns this bank before the final CRAM write. Preserve
+	   the complete inline image in Main RAM while the bank is still owned here. */
+	lea	FADE_CRAM_RAM, a1
+	moveq	#16-1, d0			/* 16 * two longs = 128 bytes */
+2:
+	move.l	(a0)+, (a1)+
+	move.l	(a0)+, (a1)+
+	dbra	d0, 2b
+	clr.w	d7				/* every special type is update-free */
+1:
+	andi.w	#SHADOW_UPDATE_COUNT_MASK, d7
+	beq	bf_stage_nt
+	btst	#SHADOW_UPDATE_LIST_BIT, d6
+	bne	bf_update_list
+	movea.l	a0, a2				/* bitmap */
+	PC_ADDA_W md_bmbytes, PC_BMBYTES, a0	/* entries */
+.ifdef PLAYER_SPECIALIZED
+.if (PC_BMBYTES & 1)
+	addq.l	#1, a0				/* v20 retains the aligned 16-bit entry array */
+.endif
+.else
+	move.w	md_bmbytes, d0
+	btst	#0, d0
+	beq.s	1f
+	addq.l	#1, a0
+1:
+.endif
+	lea	shadow, a1
+	PC_MOVE_W md_bmbytes, PC_BMBYTES, d5
+	subq.w	#1, d5
+.ifdef MAIN_CODEGEN
+	/* The fixed flag check is the only generated success-path overhead.  The
+	   fallback branches around the generated loop; the successful loop falls
+	   directly into bf_stage_nt. */
+	move.w	(md_codegen).l, d0
+	bne	bf_cg_start
+.endif
+bf_ubyte:
+	move.b	(a2)+, d0
+	beq	bf_uzero			/* no entries: advance eight shadow words at once */
+	cmpi.b	#0xFF, d0
+	beq	bf_ufull			/* all entries: straight pointer writes, no bit branches */
+	moveq	#7, d4
+bf_ubit:
+	lsr.b	#1, d0
+	bcc	1f
+	move.w	(a0)+, d3
+	andi.w	#0x67FF, d3			/* strip cold and Prg/Wr/Dic source bits */
+	move.w	d3, (a1)
+1:
+	addq.l	#2, a1
+	dbra	d4, bf_ubit
+	bra	bf_unext
+bf_uzero:
+	lea	16(a1), a1
+	bra	bf_unext
+bf_ufull:
+	.rept 8
+	move.w	(a0)+, d3
+	andi.w	#0x67FF, d3
+	move.w	d3, (a1)+
+	.endr
+bf_unext:
+	dbra	d5, bf_ubyte
+.ifdef MAIN_CODEGEN
+	bra	bf_stage_nt			/* failed generator: safe reference fallback */
+bf_cg_uzero:
+	lea	16(a1), a1
+	bra	bf_cg_unext
+bf_cg_ufull:
+	.rept 4
+	move.l	(a0)+, d3
+	and.l	d6, d3				/* strip two packed cold flags */
+	move.l	d3, (a1)+
+	.endr
+	bra	bf_cg_unext
+bf_cg_start:
+	lea	MAIN_CODEGEN_BASE, a3
+	move.l	#CG_ENTRY_MASK_LONG, d6		/* shared word/long cold-flag mask */
+bf_cg_ubyte:
+	move.b	(a2)+, d0
+	beq	bf_cg_uzero			/* exactly the reference zero-mask path */
+	cmpi.b	#0xFF, d0
+	beq	bf_cg_ufull
+	andi.w	#0x00FF, d0			/* MOVE.B leaves the upper byte unchanged */
+	add.w	d0, d0				/* signed-word table index */
+	move.w	(a3,d0.w), d4
+	jmp	(a3,d4.w)				/* prefetch starts generated handler */
+bf_cg_unext:
+	dbra	d5, bf_cg_ubyte
+.endif
+bf_stage_nt:
+	/* Expand the logical shadow into the zero-gapped 64-pitch Main-RAM band.
+	   The displayed VRAM table is untouched until the cadence-final VBlank. */
+	lea	shadow, a0
+	lea	nt_stage, a1
+	PC_MOVE_W md_trows, PC_TROWS, d0
+	subq.w	#1, d0
+bf_stage_row:
+	.ifdef PLAYER_SPECIALIZED
+	.rept PC_TCOLS/2
+	move.l	(a0)+, (a1)+
+	.endr
+	.if (PC_TCOLS & 1) != 0
+	move.w	(a0)+, (a1)+
+	.endif
+	lea	NT_STAGE_ROW_SKIP(a1), a1
+	.else
+	move.w	md_tcols, d2
+	move.w	d2, d1
+	lsr.w	#1, d1
+	beq.s	bf_stage_tail
+	subq.w	#1, d1
+bf_stage_longs:
+	move.l	(a0)+, (a1)+
+	dbra	d1, bf_stage_longs
+bf_stage_tail:
+	btst	#0, d2
+	beq.s	bf_stage_skip
+	move.w	(a0)+, (a1)+
+bf_stage_skip:
+	move.w	#NT_STAGE_PITCH, d1
+	sub.w	md_tcols, d1
+	add.w	d1, d1
+	adda.w	d1, a1
+	.endif
+	dbra	d0, bf_stage_row
+
+	/* CRAM総入替は flip と同一VBLANKで行う(bf_flip側)。ここで先に書くと、
+	   タイルDMAが複数vblankに渡る間「旧フレーム表示×新パレット」が見える
+	   (パレット区間切替の瞬間に実機側だけ明るいゴミタイルが出る実バグ)。 */
+bf_dma:
+	/* Pass2: 表を順に Word-RAM からVRAMへ転送。VBLANK予算(d7)でランをまたいで分割。
+	   長runのWord-RAM DMAは先頭1ワードが化ける(実測/Sega文書)ため、src+2/full lengthを
+	   dstへDMAした後、チャンク先頭の1ワードをCPUで上書き修復する。短runはCPU直書き。
+	   d7はDMA相当cost、DEBUGのa1はHUDへ出すlogical pattern word数。 */
+.ifdef HUD_FLIP_FIELDS
+	/* E: how late the pre-transfer Main work (swap wait, parse, bitmap, NT
+	   blit) reached this point, in 4-tick units since the previous flip.
+	   Captured before the blank wait, so it is the deadline-side phase the
+	   plain U (transfer interval) cannot show. */
+	move.w	(GA_STOPWATCH).l, d0
+	sub.w	pace_flip_tick, d0
+	andi.w	#0x0FFF, d0
+	lsr.w	#2, d0
+	cmpi.w	#0xFF, d0
+	bls.s	7f
+	move.w	#0xFF, d0
+7:
+	move.w	d0, pass2_entry_q
+.endif
+	/* Keep this clear before the n_runs load: MOVE supplies the Z flag consumed
+	   by the following BEQ. */
+.ifdef DEBUG
+	moveq	#0, d0
+	move.l	d0, pattern_vblank1_words
+	move.l	d0, pattern_vblank3_words
+	clr.w	pattern_exit_v
+	clr.w	pattern_vblank1_exit_v
+	clr.w	pattern_dma_ready_v
+	clr.w	nt_dma_ready_v
+	.endif
+	clr.w	pattern_transfer_vblanks
+	clr.w	vbudget_held_reserve
+	PC_MOVE_W md_nt_flip_reserve_words, NT_FLIP_RESERVE_WORDS, d0
+.ifdef INCLUDE_SCROLL
+	cmpi.w	#FRAME_TYPE_SCROLL, frame_type
+	bne.s	6f				/* scroll carries no CRAM image */
+	tst.w	scroll_next_v
+	beq.s	8f
+	addi.w	#NT_SCROLL_VBAND_WORDS-NT_SCROLL_BAND_WORDS, d0
+	bra.s	8f
+6:
+.endif
+	tst.w	frame_type
+	bne.s	7f
+	movea.l	palidx_ptr, a0
+	move.l	frame_no, d1
+	PAL_COMPARE
+	blo.s	8f
+7:
+	addi.w	#64*CPU_VDP_WORD_COST, d0
+8:
+	move.w	d0, pattern_final_reserve_words
+	clr.w	vbudget_from_head		/* no stale budget may authorize a shared flip */
+	move.w	n_runs, d4
+	beq	bf_flip
+	move.w	#1, pattern_transfer_vblanks
+	lea	(PROBE_BANK+O_LOADS_OFF), a2
+.ifdef DEBUG
+	moveq	#0, d0
+	movea.l	d0, a1				/* exact logical words in the current budget */
+	move.w	(VDP_HV).l, d0
+	lsr.w	#8, d0
+	move.w	d0, pattern_dma_ready_v		/* ready phase before waiting for a fresh blank head */
+.endif
+	bsr	bf_start_vbudget		/* full budget only from a proven blank head */
+.ifdef DEBUG
+	move.w	(GA_STOPWATCH).l, d0
+	move.w	d0, dma_start_tick		/* begin inside the first fresh VBlank budget */
+.endif
+bf_run_lp:
+	/* Pop the Sub-built record straight into the control port. Inline Prg
+	   payload follows its own record; Wr/Dic records are adjacent. */
+	move.w	(a2)+, d1			/* +0 len(語) */
+	move.w	d1, d6
+	addq.w	#CPU_VDP_WORD_COST, d6		/* full DMA + one CPU repair word */
+	cmp.w	d7, d6				/* whole run fits the remaining budget? */
+	bls.s	1f
+	bra	bf_split_run			/* fill this budget before continuing the run */
+1:
+	move.w	#0x8F02, (VDP_CTRL).l		/* autoinc=2 (reassert before every DMA) */
+	move.w	(a2)+, (VDP_CTRL).l		/* +2 reg93 */
+	move.w	(a2)+, (VDP_CTRL).l		/* +4 reg94 */
+	move.l	(a2)+, d0			/* +6 cmd */
+	addq.l	#2, a2				/* skip +10 dst */
+	move.w	(a2)+, (VDP_CTRL).l		/* +12 reg95 */
+	move.w	(a2)+, (VDP_CTRL).l		/* +14 reg96 */
+	move.w	(a2)+, (VDP_CTRL).l		/* +16 reg97 */
+	move.l	d0, d2
+	ori.w	#0x0080, d0			/* CD5 in the second control word */
+	move.l	d0, (VDP_CTRL).l		/* high word, then CD5 trigger word */
+	bsr	wait_dma_done
+	move.l	d2, (VDP_CTRL).l		/* restore ordinary destination */
+	movea.l	(a2)+, a3			/* +18 src */
+	cmpa.l	a2, a3				/* Prg raw source equals the inline payload cursor */
+	bne.s	1f
+	move.w	d1, d0
+	add.w	d0, d0				/* DMA words -> inline bytes */
+	adda.w	d0, a2
+1:
+	move.w	(a3), (VDP_DATA).l		/* repair dst[0] (redundant-correct for DicBuf) */
+.ifdef DEBUG
+	adda.w	d1, a1
+.endif
+	sub.w	d6, d7
+	bra	bf_run_done
+
+bf_split_run:
+	/* Walk the record's raw dst/len/src across one or more budget chunks. */
+	move.w	8(a2), d3			/* +10 dst (a2 is at +2) */
+	movea.l	16(a2), a3			/* +18 src */
+	adda.w	#20, a2				/* advance to the next record */
+	cmpa.l	a2, a3
+	bne.s	1f
+	move.w	d1, d0
+	add.w	d0, d0				/* skip this Prg run's inline payload */
+	adda.w	d0, a2
+1:
+bf_chunk:
+	tst.w	d7
+	ble	bf_chunk_refill
+	cmpa.l	#DIC_BUF, a3			/* Word-RAM chunk also needs one CPU repair */
+	bcc.s	1f
+	cmpi.w	#CPU_VDP_WORD_COST, d7
+	bls	bf_chunk_refill
+1:
+	move.w	d7, d6				/* data words fitting the remaining cost */
+	cmpa.l	#DIC_BUF, a3
+	bcc.s	2f
+	subq.w	#CPU_VDP_WORD_COST, d6
+2:
+	cmp.w	d1, d6
+	bls.s	3f
+	move.w	d1, d6
+3:
+	cmpa.l	#DIC_BUF, a3			/* DicBuf has normal DMA; Prg/Wr sources are Word RAM */
+	bcs.s	4f
+	bsr	dma_chunk
+	sub.w	d6, d7
+	bra.s	5f
+4:
+	bsr	dma_chunk_wr			/* Word-RAM DMA + first-word repair */
+	sub.w	d6, d7
+	subq.w	#CPU_VDP_WORD_COST, d7
+5:
+.ifdef DEBUG
+	adda.w	d6, a1
+.endif
+	sub.w	d6, d1				/* ラン残 -= chunk */
+	add.w	d6, d6				/* chunk*2 = バイト */
+	adda.w	d6, a3				/* src += バイト */
+	add.w	d6, d3				/* dst += バイト */
+	tst.w	d1
+	bne	bf_chunk
+	bra	bf_run_done
+bf_chunk_refill:
+	bsr	bf_next_vbudget
+	bra	bf_chunk
+
+bf_run_done:
+	subq.w	#1, d4
+	bne	bf_run_lp
+bf_flip:
+	/* The cadence-final budget withheld this capacity from patterns. Restore it
+	   for the shared NT/HUD/CRAM/flip admission check. */
+	move.w	vbudget_held_reserve, d0
+	beq.s	8f
+	add.w	d0, d7
+	clr.w	vbudget_held_reserve
+8:
+	.ifdef DEBUG
+	tst.w	n_runs
+	beq.s	1f
+	bsr	bf_debug_snapshot_vbudget
+	move.w	(VDP_HV).l, d0
+	lsr.w	#8, d0
+	move.w	d0, pattern_exit_v
+	move.w	(GA_STOPWATCH).l, d0
+	sub.w	dma_start_tick, d0
+	andi.w	#0x0FFF, d0			/* stopwatch wraps naturally after 4096 ticks */
+	move.w	d0, dma_elapsed_ticks
+1:
+	move.w	vsync_acc, frame_vblank_waits	/* exclude display pacing from vblank_spill */
+	tst.l	frame_no			/* frame 0 is an untimed boot construction */
+	bne.s	1f
+	clr.w	frame_vblank_waits		/* its VBlank count is not playback load */
+1:
+	/* A two-VBlank transfer formatted the static HUD after its first budget.
+	   One-/zero-VBlank frames still have the whole inter-flip active interval
+	   available here. Patch only transfer-final fields on the deadline path. */
+	cmpi.w	#2, pattern_transfer_vblanks
+	bhs.s	2f
+	bsr	prepare_dbg
+2:
+	.endif
+	/* The final pattern DMA/repair and every Word-RAM HUD/status read are now
+	   complete. Return the consumed bank without waiting, overlapping Sub's
+	   exchange/pump work with Main's NT-DMA setup, cadence wait, CRAM and flip.
+	   Frame 0 still owns CMD_STREAM until its flip; the final frame must request
+	   STAT_END only after it has become visible. */
+.ifndef DEBUG
+	move.w	(PROBE_BANK+STATUS_OFF+0x00).l, release_slip_count
+	.endif
+	tst.l	frame_no
+	beq.s	9f
+	move.l	frame_no, d0
+	PC_CMP_L md_final_frame, PC_FRAMES-1, d0
+	bhs.s	9f
+	bsr	swap_begin
+9:
+	/* パレット区間切替: NT DMA、DEBUG HUD、CRAM総入替を同じVBlank内で完結する。
+	   DEBUGフォントはP0/index15固定なので切替時作業はない。
+	   トリガはplayer内蔵のM-PALIDX表: next_switch <= frame_no の間advance
+	   (等値比較にしない=heldフレームで切替frameを跨いでも失われない)。最後に
+	   跨いだentryの区間を採用=絶対値の自己修復性を維持。表は63切替+0xFFFF番兵
+	   で必ず終端されるためadvanceは有界。CRAM本体はboot時に積んだMain-RAMの
+	   PALTAB表から引く(ストリーム到着タイミング非依存)。 */
+	clr.l	cram_source
+.ifdef INCLUDE_SCROLL
+	cmpi.w	#FRAME_TYPE_SCROLL, frame_type
+	beq.s	7f				/* scroll follows the ordinary PALIDX walk */
+.endif
+	tst.w	frame_type
+	bne	bf_inline_cram
+7:
+	movea.l	palidx_ptr, a0
+	move.l	frame_no, d1
+	PAL_COMPARE
+	blo	bf_publish_frame			/* next_switch > frame_no: 切替なし */
+1:
+	move.w	2(a0), d0			/* PALTAB segment; bit 15 is frame bit 16 */
+	andi.w	#63, d0
+	addq.l	#4, a0
+	PAL_COMPARE
+	bhs.s	1b				/* 複数跨ぎは最後のentryを採用 */
+	move.l	a0, palidx_ptr
+	move.w	d0, dbg_seg			/* 絶対値で更新(増分でなく自己修復) */
+	lsl.w	#7, d0				/* *128B */
+	lea	PALTAB_RAM, a0
+	adda.w	d0, a0				/* src = table[segment]; max 63*128=8064 fits signed word */
+	bra.s	bf_cram_source_ready
+bf_inline_cram:
+	lea	FADE_CRAM_RAM, a0		/* safe copy after early Word-RAM bank return */
+bf_cram_source_ready:
+	move.l	a0, cram_source			/* NT/HUD staging may reuse a0 before the blank */
+bf_publish_frame:
+	/* Admit every display write against the same conservative word budget. The
+	   generic player derives the grid-band size at startup; specialized builds
+	   use the matching assembler constant. */
+	PC_MOVE_W md_nt_flip_reserve_words, NT_FLIP_RESERVE_WORDS, d6
+	tst.l	cram_source
+	beq.s	1f
+	addi.w	#64*CPU_VDP_WORD_COST, d6
+1:
+.ifdef INCLUDE_SCROLL
+	tst.w	scroll_next_v
+	beq.s	2f
+	addi.w	#NT_SCROLL_VBAND_WORDS-NT_SCROLL_BAND_WORDS, d6
+2:
+.endif
+	.ifdef DEBUG
+	move.w	(VDP_HV).l, d0
+	lsr.w	#8, d0
+	move.w	d0, nt_dma_ready_v		/* ready phase before cadence-final wait */
+	.endif
+	.ifdef PLAYER_SPECIALIZED
+	.if (PC_FEATURES & 0x0002) != 0
+	bsr	bf_wait_fixed_flip_vblank	/* share the budgeted deadline blank when safe */
+	.else
+	bsr	wait_vb_start
+	.endif
+	.else
+	tst.w	md_cadence_period
+	beq.s	1f
+	bsr	bf_wait_fixed_flip_vblank
+	bra.s	2f
+1:
+	bsr	wait_vb_start
+2:
+	.endif
+	.ifdef DEBUG
+	bsr	bf_patch_dbg_row			/* final counters feed this frame's HUD DMAs */
+	.endif
+	bsr	nt_dma_flip			/* static grid band into the displayed NT */
+.ifdef INCLUDE_SCROLL
+	/* Publish the Plane A/B HScroll pair in the same blank as the band DMA
+	   so fine position and tile content stay atomic. dma_chunk has already
+	   polled DMA completion and left autoincrement at 2. */
+	tst.w	scroll_h_dirty
+	beq.s	9f
+	clr.w	scroll_h_dirty
+	move.l	#0x7C000003, (VDP_CTRL).l	/* VRAM write 0xFC00 */
+	move.w	scroll_next_h, d0
+	move.w	d0, (VDP_DATA).l		/* Plane A */
+	move.w	d0, (VDP_DATA).l		/* Plane B */
+	move.l	#0x40000010, (VDP_CTRL).l	/* VSRAM write 0 */
+	move.w	scroll_next_v, d0
+	neg.w	d0				/* stream: screen=plane[y-v]; VSRAM adds */
+	move.w	d0, (VDP_DATA).l		/* Plane A */
+	move.w	d0, (VDP_DATA).l		/* Plane B */
+9:
+.endif
+	.ifdef DEBUG
+	bsr	hud_dma_flip			/* Window row plus spill-digit SAT */
+	.endif
+	tst.l	cram_source
+	beq.s	bf_commit_frame
+	movea.l	cram_source, a0			/* recover embedded-table or inline CRAM source */
+	move.l	#0xC0000000, (VDP_CTRL).l	/* CRAM addr 0 */
+	move.w	#64-1, d1
+1:
+	move.w	(a0)+, (VDP_DATA).l
+	dbra	d1, 1b
+bf_commit_frame:
+	bsr	commit_frame			/* cadence origin after all blanking writes */
+bf_after_flip:
+	.ifndef DEBUG
+	/* Release build has no Sxx HUD, so retain the existing red slip indicator. */
+	move.w	release_slip_count, d0
+	beq	1f
+	move.l	#0xC0000000, (VDP_CTRL).l
+	move.w	#0x000E, (VDP_DATA).l
+1:
+.endif
+	movem.l	(sp)+, d0-d7/a0-a3
+	rts
+
+bf_update_list:
+	/* Completed (shadow byte offset, final name-table entry) pairs.  Masking
+	   every untrusted offset into the expanded 4KB shadow allocation is cheaper
+	   and safer than a taken/not-taken range branch per item.  This out-of-line
+	   walker keeps the successful generated-bitmap path's fall-through intact. */
+	lea	shadow, a1
+	subq.w	#1, d7
+1:
+	move.w	(a0)+, d0
+	andi.w	#SHADOW_OFFSET_MASK, d0
+	move.w	(a0)+, (a1,d0.w)
+	dbra	d7, 1b
+	bra	bf_stage_nt
+
+.ifdef INCLUDE_SCROLL
+bf_scroll_control:
+	/* Item 0 carries the absolute Plane A/B HScroll and VScroll pair; the
+	   adopted window moves on exactly one axis.  The remaining completed
+	   items address the physical 64x32 plane directly; the 4KB nt_stage
+	   allocation bounds every masked offset.  The logical shadow stays
+	   untouched, so the stage expansion is skipped and the persistent plane
+	   band goes to VRAM as-is. */
+	move.w	(a0)+, scroll_next_h
+	move.w	(a0)+, scroll_next_v
+	move.w	#1, scroll_h_dirty
+	andi.w	#SHADOW_UPDATE_COUNT_MASK, d7
+	subq.w	#1, d7				/* the position item is counted */
+	beq	bf_dma
+	lea	nt_stage, a1
+	subq.w	#1, d7
+1:
+	move.w	(a0)+, d0
+	andi.w	#SHADOW_OFFSET_MASK, d0
+	move.w	(a0)+, (a1,d0.w)
+	dbra	d7, 1b
+	bra	bf_dma
+
+bf_scroll_rebase:
+	/* The adopted window ends on a tile boundary.  Compact the 40x28
+	   viewport out of the 64-pitch plane band into the logical shadow and
+	   rearm both scrolls at zero for this frame's flip.  Preserves a0/d6/d7
+	   for the caller's control-parse state. */
+	tst.w	scroll_next_v
+	bne	bf_scroll_rebase_vertical
+	movem.l	d1-d5/a1-a3, -(sp)
+	move.w	scroll_next_h, d0
+	neg.w	d0
+	asr.w	#3, d0
+	andi.w	#NT_STAGE_PITCH-1, d0		/* first plane column of the viewport */
+	moveq	#NT_STAGE_PITCH, d1
+	sub.w	d0, d1				/* columns before the plane wraps */
+	cmpi.w	#PC_TCOLS, d1
+	bls.s	1f
+	move.w	#PC_TCOLS, d1
+1:
+	move.w	#PC_TCOLS, d2
+	sub.w	d1, d2				/* wrapped columns */
+	add.w	d0, d0				/* byte offset of the first column */
+	lea	shadow, a1
+	lea	nt_stage, a2
+	move.w	#PC_TROWS-1, d5
+2:
+	lea	(a2,d0.w), a3
+	move.w	d1, d3
+	subq.w	#1, d3
+3:
+	move.w	(a3)+, (a1)+
+	dbra	d3, 3b
+	move.w	d2, d3
+	beq.s	5f
+	movea.l	a2, a3
+	subq.w	#1, d3
+4:
+	move.w	(a3)+, (a1)+
+	dbra	d3, 4b
+5:
+	lea	NT_STAGE_PITCH*2(a2), a2
+	dbra	d5, 2b
+	clr.w	scroll_next_h
+	clr.w	scroll_next_v
+	move.w	#1, scroll_h_dirty		/* publish both scroll zeros at this flip */
+	movem.l	(sp)+, d1-d5/a1-a3
+	rts
+
+bf_scroll_rebase_vertical:
+	/* Vertical windows roll through all 32 plane rows.  Copy the 28-row
+	   viewport out of the ring, wrapping the plane-row offset at 4KB. */
+	movem.l	d3/d5/a1-a3, -(sp)
+	move.w	scroll_next_v, d0
+	neg.w	d0
+	asr.w	#3, d0
+	andi.w	#31, d0				/* first plane row of the viewport */
+	lsl.w	#7, d0				/* *128 bytes per plane row */
+	lea	shadow, a1
+	lea	nt_stage, a2
+	move.w	#PC_TROWS-1, d5
+1:
+	lea	(a2,d0.w), a3
+	move.w	#PC_TCOLS/2-1, d3
+2:
+	move.l	(a3)+, (a1)+
+	dbra	d3, 2b
+	addi.w	#NT_STAGE_PITCH*2, d0
+	andi.w	#NT_SCROLL_VBAND_WORDS*2-1, d0	/* wrap at plane row 32 */
+	dbra	d5, 1b
+	clr.w	scroll_next_h
+	clr.w	scroll_next_v
+	move.w	#1, scroll_h_dirty		/* publish both scroll zeros at this flip */
+	movem.l	(sp)+, d3/d5/a1-a3
+	rts
+.endif
+
+/* Start Pass2 with one honest VBlank word budget.  An already-active display
+   waits for the next blank.  An already-entered blank may keep the full budget
+   only on its first V-counter line; later entry waits for the following head
+   instead of pretending all md_vbudget words remain.  d7 returns the full
+   budget and vbudget_from_head records that its time origin is trustworthy.
+   Trashes d0. */
+bf_start_vbudget:
+	move.w	(VDP_CTRL).l, d0
+	btst	#3, d0
+	beq	bf_refill_vbudget
+	move.w	(VDP_HV).l, d0
+	lsr.w	#8, d0
+	cmpi.w	#0x00E0, d0
+	bne	bf_refill_vbudget
+	move.w	#1, vbudget_from_head
+	PC_MOVE_W md_vbudget, PC_VBUDGET, d7
+	rts
+
+bf_refill_vbudget:
+	bsr	wait_vb_start
+	move.w	#1, vbudget_from_head
+	PC_MOVE_W md_vbudget, PC_VBUDGET, d7
+	/* Pattern budget N is also the fixed-cadence display deadline. Withhold
+	   its final display work before issuing any pattern transfer. */
+	clr.w	vbudget_held_reserve
+	.ifdef PLAYER_SPECIALIZED
+	.if (PC_FEATURES & 0x0002) == 0
+	bra.s	1f
+	.endif
+	.else
+	tst.w	md_cadence_period
+	beq.s	1f
+	.endif
+	move.w	pattern_transfer_vblanks, d0
+	cmp.w	pace_target_vblanks, d0
+	bne.s	1f
+	move.w	pattern_final_reserve_words, d0
+	sub.w	d0, d7
+	move.w	d0, vbudget_held_reserve
+1:
+	rts
+
+.ifdef DEBUG
+/* Snapshot exact logical pattern words issued in the current VBlank budget.
+   They intentionally differ from d7's DMA-equivalent cost when CPU writes run.
+   Four counters cover every fixed cadence supported by av_config. T may still
+   exceed four and makes a physically overloaded fifth transfer blank visible.
+   Trashes d0/d6/a0. */
+bf_debug_snapshot_vbudget:
+	move.l	a1, d0
+	move.w	pattern_transfer_vblanks, d6
+	cmpi.w	#4, d6
+	bhi.s	2f
+	subq.w	#1, d6
+	add.w	d6, d6
+	lea	pattern_vblank1_words, a0
+	move.w	d0, (a0,d6.w)
+	cmpi.w	#1, pattern_transfer_vblanks
+	bne.s	2f
+	move.w	(VDP_HV).l, d0
+	lsr.w	#8, d0
+	move.w	d0, pattern_vblank1_exit_v
+2:
+	rts
+
+/* Finish the current budget snapshot before waiting for the next fresh head. */
+bf_next_vbudget:
+	bsr	bf_debug_snapshot_vbudget
+	/* On the first split only, spend the active-display gap before VBlank 2
+	   formatting every HUD field that is already known. Transfer-final fields
+	   are patched after the last pattern word. */
+	cmpi.w	#1, pattern_transfer_vblanks
+	bne.s	1f
+	bsr	prepare_dbg
+1:
+	suba.l	a1, a1				/* exact logical-word counter for the next budget */
+	addq.w	#1, pattern_transfer_vblanks
+	bra	bf_refill_vbudget
+.else
+bf_next_vbudget:
+	addq.w	#1, pattern_transfer_vblanks
+	bra	bf_refill_vbudget
+.endif
+
+	/* d6 is the word reserve for NT/HUD/optional CRAM/guard.
+	   If Pass2 ended inside a VBlank whose budget began at its head, and the
+	   residual word budget covers all flip work, keep that exact cadence VBlank.
+	   Otherwise take a fresh target VBlank. The target blank is display
+	   pacing as well as the final pattern chunk, so DEBUG M excludes that shared
+	   wait and continues to count only intervening pattern-work blanks.
+   Trashes d0. */
+bf_wait_fixed_flip_vblank:
+	bsr	wait_fixed_flip
+	tst.w	vbudget_from_head
+	beq.s	2f
+	cmp.w	d6, d7
+	blo.s	2f
+	move.w	(VDP_CTRL).l, d0
+	btst	#3, d0
+	beq.s	2f
+	move.w	(VDP_HV).l, d0
+	cmpi.w	#0xFC00, d0
+	bhs.s	2f
+	move.w	(VDP_CTRL).l, d0
+	btst	#3, d0
+	beq.s	2f
+.ifdef DEBUG
+	/* Only remove a wait when pattern work itself occupied the cadence's
+	   display-deadline VBlank. If it finished earlier (common at N=4), every
+	   counted wait belongs to an earlier opened VBlank budget. */
+	move.w	pattern_transfer_vblanks, d0
+	cmp.w	pace_target_vblanks, d0
+	blo.s	1f
+	tst.w	frame_vblank_waits
+	beq.s	1f
+	subq.w	#1, frame_vblank_waits
+1:
+.endif
+	rts
+2:
+	bsr	wait_vb_start
+	rts
+
+.ifdef DEBUG
+	/* Refresh fields whose final values are not available when a split frame
+	   preformats its HUD between opened VBlank budgets. The fixed Window/SAT DMA
+	   consumes dbg_row after this patch. Trashes d0/d3/d4/a0. */
+bf_patch_dbg_row:
+	.ifdef HUD_HEX_TABLE
+	lea	dbg_hex_pairs, a1
+	.endif
+	lea	dbg_row+4*2, a0		/* final palette segment */
+	move.w	dbg_seg, d4
+	DBG_PUT1
+	lea	dbg_row+15*2, a0		/* spill nibble + transfer ticks */
+	move.w	dma_elapsed_ticks, d4
+	andi.w	#0x0FFF, d4
+	move.w	frame_vblank_waits, d0
+	andi.w	#0x000F, d0
+	ror.w	#4, d0
+	or.w	d0, d4
+	DBG_PUT4
+	lea	dbg_row+36*2, a0		/* transfer VBlanks/end V-counter */
+	move.w	pattern_transfer_vblanks, d4
+	DBG_PUT1
+	move.w	pattern_exit_v, d4
+	DBG_PUT2
+	move.w	pattern_dma_ready_v, d4
+	DBG_PUT2
+	move.w	nt_dma_ready_v, d4
+	DBG_PUT2
+	rts
+	.endif
+
+/* vblankに入るまで待つ(既に中なら即戻る)。trashes d0 */
+wait_vb_in:
+1:
+	move.w	(VDP_CTRL).l, d0
+	btst	#3, d0
+	beq	1b
+	rts
+
+/* 次のvblank開始まで待つ(vblank中なら一度activeを抜けてから)。予算補充用。trashes d0 */
+wait_vb_start:
+1:
+	move.w	(VDP_CTRL).l, d0
+	btst	#3, d0
+	bne	1b				/* active(非vblank)になるまで */
+2:
+	move.w	(VDP_CTRL).l, d0
+	btst	#3, d0
+	beq	2b				/* vblankに入るまで */
+	addq.w	#1, vsync_acc			/* v4: 1コマのVBLANK数を計上(表示ペーシング用) */
+	rts
+
+/* Make frame 0 immediately eligible: its synthetic preceding flip is one
+   first cadence interval in the past. The next real interval starts with the
+   short two-VBlank step for a periodic 24fps stream. Trashes d0. */
+prime_fixed_cadence:
+	.ifdef PLAYER_SPECIALIZED
+	.if (PC_FEATURES & 0x0002) != 0
+	move.w	#PC_VSYNC_N, pace_target_vblanks
+	.if PC_CADENCE_PERIOD == 2
+	clr.w	pace_phase
+	clr.w	pace_cadence_debt
+	move.w	#PACE_FIXED_ARM_TICKS, pace_periodic_arm_ticks
+.endif
+	move.w	(GA_STOPWATCH).l, d0
+.if PC_CADENCE_PERIOD == 2
+	sub.w	pace_periodic_arm_ticks, d0
+.else
+	sub.w	#PACE_FIXED_ARM_TICKS, d0
+.endif
+	andi.w	#0x0FFF, d0
+	move.w	d0, pace_flip_tick
+.endif
+.else
+	tst.w	md_cadence_period
+	beq.s	1f
+	move.w	md_vsync_n, pace_target_vblanks
+	clr.w	pace_phase
+	cmpi.w	#2, md_cadence_period
+	bne.s	2f
+	clr.w	pace_cadence_debt
+	move.w	md_vsync_n, d0
+	mulu.w	#PACE_VBLANK_TICKS, d0
+	subi.w	#PACE_ARM_BIAS_TICKS, d0
+	move.w	d0, md_pace_arm_ticks
+2:
+	move.w	(GA_STOPWATCH).l, d0
+	sub.w	md_pace_arm_ticks, d0
+	andi.w	#0x0FFF, d0
+	move.w	d0, pace_flip_tick
+1:
+.endif
+	rts
+
+	/* The stopwatch arm point is safely after VBlank N-1 ends and before VBlank N
+	   begins. The caller then admits the NT/HUD/CRAM bundle against the remaining
+	   blank budget before starting the first visible-table write. */
+wait_fixed_flip:
+1:
+	move.w	(GA_STOPWATCH).l, d0
+	sub.w	pace_flip_tick, d0
+	andi.w	#0x0FFF, d0
+.ifdef PLAYER_SPECIALIZED
+.if PC_CADENCE_PERIOD == 2
+	cmp.w	pace_periodic_arm_ticks, d0
+.else
+	cmpi.w	#PACE_FIXED_ARM_TICKS, d0
+.endif
+.else
+	PC_CMP_W md_pace_arm_ticks, PACE_FIXED_ARM_TICKS, d0
+.endif
+	bcc.s	2f
+	bra.s	1b
+2:
+	rts
+
+	/* All visible-table, DEBUG HUD and optional CRAM writes have completed inside
+	   the admitted VBlank. Record this single-NT publication as the next cadence
+	   origin; there is no Plane A reg2 switch. */
+commit_frame:
+	.ifdef DEBUG
+	move.w	d1, -(sp)
+	move.w	(VDP_HV).l, d1
+	lsr.w	#8, d1
+	move.w	d1, flip_hv_v
+	move.w	(sp)+, d1
+	.endif
+	.ifdef PLAYER_SPECIALIZED
+	.if (PC_FEATURES & 0x0002) != 0
+	.if PC_CADENCE_PERIOD == 2
+	bsr	pace_periodic_commit
+	.else
+	move.w	(GA_STOPWATCH).l, pace_flip_tick	/* exact flip-to-flip deadline */
+	.endif
+.endif
+.else
+	tst.w	md_cadence_period
+	beq.s	1f
+	cmpi.w	#2, md_cadence_period
+	bne.s	2f
+	bsr	pace_periodic_commit
+	bra.s	1f
+2:
+	move.w	(GA_STOPWATCH).l, pace_flip_tick	/* exact flip-to-flip deadline */
+1:
+.endif
+	rts
+
+.if PERIODIC_CADENCE_RUNTIME
+/* Keep the 24fps display clock phase-locked when one frame misses its target.
+   A late flip creates whole-VBlank debt. The next nominal three-VBlank step
+   repays one debt unit by using two VBlanks; a nominal two-VBlank step is
+   never shortened. Thus isolated Main/Sub stalls cannot accumulate permanent
+   reader lead and eventually fill APPLY while ordinary `(2, 3)` frames keep
+   their exact phase. Frame 0 only establishes the real stopwatch origin.
+   Trashes d0-d2. */
+pace_periodic_commit:
+	move.w	(GA_STOPWATCH).l, d0
+	tst.l	frame_no
+	beq.s	4f
+	moveq	#0, d1
+	move.w	d0, d1
+	sub.w	pace_flip_tick, d1
+	andi.l	#0x00000FFF, d1
+	addi.l	#PACE_VBLANK_TICKS/2, d1
+	divu.w	#PACE_VBLANK_TICKS, d1	/* rounded whole VBlanks since prior flip */
+	moveq	#2, d2
+.ifdef PLAYER_SPECIALIZED
+	cmpi.w	#PACE_ALT_ARM_TICKS, pace_periodic_arm_ticks
+	bne.s	1f
+.else
+	move.w	md_pace_arm_ticks, d2
+	cmp.w	md_pace_alt_arm_ticks, d2
+	moveq	#2, d2
+	bne.s	1f
+.endif
+	moveq	#3, d2
+1:
+	sub.w	d2, d1
+	ble.s	4f
+	add.w	d1, pace_cadence_debt
+	cmpi.w	#0x00FF, pace_cadence_debt
+	bls.s	4f
+	move.w	#0x00FF, pace_cadence_debt
+4:
+	move.w	d0, pace_flip_tick
+	tst.l	frame_no
+	beq.s	9f				/* frame0 -> frame1 remains the short step */
+	eori.w	#1, pace_phase
+	tst.w	pace_phase
+	beq.s	7f
+	tst.w	pace_cadence_debt
+	beq.s	8f
+	subq.w	#1, pace_cadence_debt	/* repay only from a nominal long step */
+7:
+	.ifdef PLAYER_SPECIALIZED
+	move.w	#PACE_FIXED_ARM_TICKS, pace_periodic_arm_ticks
+	move.w	#PC_VSYNC_N, pace_target_vblanks
+	.else
+	move.w	md_vsync_n, d2
+	move.w	d2, pace_target_vblanks
+	mulu.w	#PACE_VBLANK_TICKS, d2
+	subi.w	#PACE_ARM_BIAS_TICKS, d2
+	move.w	d2, md_pace_arm_ticks
+.endif
+	bra.s	9f
+8:
+	.ifdef PLAYER_SPECIALIZED
+	move.w	#PACE_ALT_ARM_TICKS, pace_periodic_arm_ticks
+	move.w	#PC_VSYNC_ALT, pace_target_vblanks
+	.else
+	move.w	md_pace_alt_arm_ticks, md_pace_arm_ticks
+	move.w	#3, pace_target_vblanks
+.endif
+9:
+	rts
+.endif
+
+/* d6語を Word-RAM(a3) → VRAM(d3) へDMA。完了待ち。trashes d0,d2
+   Word-RAM源はフェッチが1ワード遅延するため、src+2/full lengthを通常dstへDMAし、
+   DMAが書かないdst先頭をCPUでa3の先頭ワードから修復する。 */
+dma_chunk_wr:
+	move.w	#0x8F02, (VDP_CTRL).l		/* autoinc=2 */
+	move.w	d6, d2				/* 長さ = chunk 語 */
+	move.w	#0x9300, d0
+	or.b	d2, d0
+	move.w	d0, (VDP_CTRL).l
+	lsr.w	#8, d2
+	move.w	#0x9400, d0
+	or.b	d2, d0
+	move.w	d0, (VDP_CTRL).l
+	move.l	a3, d2				/* 源 = (src+2)/2 : 1ワード遅延の補正 */
+	addq.l	#2, d2
+	lsr.l	#1, d2
+	move.w	#0x9500, d0
+	or.b	d2, d0
+	move.w	d0, (VDP_CTRL).l
+	lsr.l	#8, d2
+	move.w	#0x9600, d0
+	or.b	d2, d0
+	move.w	d0, (VDP_CTRL).l
+	lsr.l	#8, d2
+	move.w	#0x9700, d0
+	or.b	d2, d0
+	move.w	d0, (VDP_CTRL).l
+	/* Build the normal VRAM-write command once.  CD5 in its low word starts
+	   DMA; the preserved command then restores the same destination for the
+	   one-word CPU repair without recomputing set_vram_write. */
+	move.l	d3, d0
+	andi.l	#0x0000FFFF, d0
+	move.l	d0, d2
+	andi.l	#0x00003FFF, d0
+	swap	d0
+	ori.l	#0x40000000, d0
+	lsr.w	#7, d2
+	lsr.w	#7, d2
+	andi.w	#0x0003, d2
+	or.w	d2, d0				/* d0 = ordinary VRAM-write command */
+	move.l	d0, d2				/* preserved across wait_dma_done */
+	ori.w	#0x0080, d0			/* CD5: memory-to-VRAM DMA */
+	move.l	d0, (VDP_CTRL).l		/* high control word, then CD5 trigger word */
+	bsr	wait_dma_done
+	/* 先頭1ワードはDMA開始ラッチの古い値(ゴミ)が書かれるため、CPUで上書き修復。
+	   (src+2補正で2ワード目以降は正しい。ゴミはチャンク先頭の1ワードのみ) */
+	move.l	d2, (VDP_CTRL).l
+	move.w	(a3), (VDP_DATA).l
+	rts
+
+/* d6語を Main-RAM(a3) → VRAM(d3=バイトアドレス) へDMA。完了待ち。trashes d0,d2 */
+dma_chunk:
+	move.w	#0x8F02, (VDP_CTRL).l		/* autoinc=2 */
+	move.w	d6, d2				/* 長さ 0x93/94 */
+	move.w	#0x9300, d0
+	or.b	d2, d0
+	move.w	d0, (VDP_CTRL).l
+	lsr.w	#8, d2
+	move.w	#0x9400, d0
+	or.b	d2, d0
+	move.w	d0, (VDP_CTRL).l
+	move.l	a3, d2				/* 源 = a3/2 (Main-RAM) */
+	lsr.l	#1, d2
+	move.w	#0x9500, d0
+	or.b	d2, d0
+	move.w	d0, (VDP_CTRL).l
+	lsr.l	#8, d2
+	move.w	#0x9600, d0
+	or.b	d2, d0
+	move.w	d0, (VDP_CTRL).l
+	lsr.l	#8, d2
+	move.w	#0x9700, d0
+	or.b	d2, d0
+	move.w	d0, (VDP_CTRL).l
+	move.l	d3, d0				/* dst=d3 コマンド(VRAM書込+CD5起動) */
+	and.l	#0x0000FFFF, d0
+	move.l	d0, d2
+	andi.w	#0x3FFF, d2
+	ori.w	#0x4000, d2
+	move.w	d2, (VDP_CTRL).l
+	move.l	d0, d2
+	lsr.l	#8, d2
+	lsr.l	#6, d2
+	andi.w	#0x0003, d2
+	ori.w	#0x0080, d2
+	move.w	d2, (VDP_CTRL).l
+	bsr	wait_dma_done
+	rts
+
+/* DMA完了待ち(status bit1)。trashes d0 */
+wait_dma_done:
+1:
+	move.w	(VDP_CTRL).l, d0
+	btst	#1, d0
+	bne	1b
+	rts
+
+	/* Copy the statically trimmed 64-pitch grid band into the single displayed
+	   movie name table with one ordinary Main-RAM DMA. */
+nt_dma_flip:
+	lea	nt_stage, a3
+	PC_MOVE_L md_nt_stage_dst, NT_STAGE_DST, d3
+	PC_MOVE_W md_nt_stage_words, NT_STAGE_WORDS, d6
+.ifdef INCLUDE_SCROLL
+	move.w	scroll_next_h, d0
+	or.w	scroll_next_v, d0
+	beq.s	1f
+	move.w	#NT_SCROLL_BAND_WORDS, d6	/* full 64-column band while scrolled */
+	tst.w	scroll_next_v
+	beq.s	1f
+	move.w	#NT_SCROLL_VBAND_WORDS, d6	/* vertical rolls the wrapped rows too */
+1:
+.endif
+	bra	dma_chunk
+
+	.ifdef DEBUG
+	/* Publish the first screen-width HUD cells through the fixed top Window row
+	   and the remaining cells as one-tile high-priority sprites on row 1: 40
+	   Window words plus three SAT records. */
+hud_dma_flip:
+	movem.l	d0-d7/a0-a3, -(sp)
+	PC_MOVE_W md_screen_cols, PC_SCREEN_COLS, d5
+	lea	dbg_row, a0
+	move.w	d5, d0
+	add.w	d0, d0
+	adda.w	d0, a0			/* first spill digit */
+	lea	hud_sprites, a1
+	move.w	#HUD_COMBINED_WORDS, d7
+	sub.w	d5, d7			/* spill sprite count */
+	subq.w	#1, d7			/* DBRA count */
+	moveq	#0, d1			/* sprite index / x-cell */
+1:
+	move.w	#0x0088, (a1)+		/* y = 8 + sprite bias 128 */
+	moveq	#0, d0
+	tst.w	d7
+	beq.s	2f
+	move.w	d1, d0
+	addq.w	#1, d0			/* link to the next SAT record */
+2:
+	move.w	d0, (a1)+			/* 1x1 size, zero link on the last record */
+	move.w	(a0)+, d0
+	ori.w	#0x8000, d0			/* high priority, palette 0 */
+	move.w	d0, (a1)+
+	move.w	d1, d0
+	lsl.w	#3, d0
+	addi.w	#0x0080, d0		/* x = cell*8 + sprite bias 128 */
+	move.w	d0, (a1)+
+	addq.w	#1, d1
+	dbra	d7, 1b
+	lea	dbg_row, a3
+	moveq	#0, d3
+	move.w	#HUD_WINDOW_NT, d3
+	move.w	d5, d6
+	bsr	dma_chunk
+	lea	hud_sprites, a3
+	moveq	#0, d3
+	move.w	#HUD_SPRITE_TABLE, d3
+	move.w	#HUD_COMBINED_WORDS, d6
+	sub.w	d5, d6
+	lsl.w	#2, d6			/* four words per SAT record */
+	bsr	dma_chunk
+	movem.l	(sp)+, d0-d7/a0-a3
+	rts
+	.endif
+
+/* d0 = VRAM addr(<=0xFFFF) -> VDP_CTRL に write コマンド。trashes d0,d2 */
+set_vram_write:
+	move.l	d0, d2
+	andi.l	#0x3FFF, d0
+	swap	d0
+	ori.l	#0x40000000, d0
+	lsr.w	#7, d2
+	lsr.w	#7, d2
+	andi.w	#3, d2
+	or.w	d2, d0
+	move.l	d0, (VDP_CTRL).l
+	rts
+
+/* 初期CRAM = M-PALTAB[0](区間0)。ip_entry冒頭のコピー後ならいつでも呼べる。 */
+load_movie_palette:
+	move.l	#0xC0000000, (VDP_CTRL).l
+	lea	PALTAB_RAM, a0
+	move.w	#64-1, d0
+1:
+	move.w	(a0)+, (VDP_DATA).l
+	dbra	d0, 1b
+	rts
+
+.ifdef PLAYER_SPECIALIZED
+	/* Minimal preload display. The same 16 hexadecimal glyphs are permanently
+	   reserved immediately above the resident pool in DEBUG and release builds. */
+draw_startup:
+	movem.l	d0-d2/a0, -(sp)
+	bsr	load_movie_palette
+	move.l	#HUD_FONT_ADDR, d0
+	bsr	set_vram_write
+	lea	dbgfont, a0
+	move.w	#DBGFONT_N*16-1, d1
+1:
+	move.w	(a0)+, d0			/* each nibble is 0 or 1 */
+	move.w	d0, d2
+	lsl.w	#1, d2
+	or.w	d2, d0
+	lsl.w	#1, d2
+	or.w	d2, d0
+	lsl.w	#1, d2
+	or.w	d2, d0			/* 1 -> 0xF independently in every nibble */
+	ori.w	#0x1111, d0			/* 0 -> 0x1; 0xF remains 0xF */
+	move.w	d0, (VDP_DATA).l
+	dbra	d1, 1b
+	moveq	#0, d0
+	bsr	startup_write_hex
+	movem.l	(sp)+, d0-d2/a0
+	rts
+
+/* d0.w = remaining 2-KiB PrgBuf preload sectors. Display loaded KiB. */
+startup_update_prg:
+	move.w	#PC_PREBUF_SEC, d4
+	sub.w	d0, d4
+	add.w	d4, d4			/* 2-KiB sectors -> KiB */
+	move.w	d4, d0
+	bra	startup_write_hex
+
+	/* d0.w = four hexadecimal preload digits. DEBUG uses the top Window row;
+	   release writes the single movie NT directly while playback is stopped. */
+startup_write_hex:
+	movem.l	d0-d2/d4, -(sp)
+	move.w	d0, d4
+	.ifdef DEBUG
+	move.l	#HUD_WINDOW_NT, d0
+	.else
+	move.l	#MOVIE_NT, d0
+	.endif
+	bsr	set_vram_write
+	move.w	d4, d0
+	rol.w	#4, d0
+	andi.w	#0x000F, d0
+	addi.w	#HUD_FONT_VTILE, d0
+	move.w	d0, (VDP_DATA).l
+	move.w	d4, d0
+	lsr.w	#8, d0
+	andi.w	#0x000F, d0
+	addi.w	#HUD_FONT_VTILE, d0
+	move.w	d0, (VDP_DATA).l
+	move.w	d4, d0
+	lsr.w	#4, d0
+	andi.w	#0x000F, d0
+	addi.w	#HUD_FONT_VTILE, d0
+	move.w	d0, (VDP_DATA).l
+	andi.w	#0x000F, d4
+	addi.w	#HUD_FONT_VTILE, d4
+	move.w	d4, (VDP_DATA).l
+	movem.l	(sp)+, d0-d2/d4
+	rts
+
+/* Initial-stream wait with live PrgBuf preload progress. COMSTAT1 is otherwise
+   still free for boot errors and later desync diagnostics. */
+cmd_wait_startup:
+	move.w	d0, (GA_COMCMD0).l
+	move.w	#0xFFFF, d5			/* last displayed remaining count */
+1:
+	move.w	(GA_COMSTAT0).l, d0
+	cmp.w	#STAT_BOOT_STAGE, d0
+	beq.s	6f
+	cmp.w	#STAT_READY, d0
+	beq.s	3f
+	move.w	(GA_COMSTAT1).l, d0
+	tst.w	d0				/* zero is shown only after STAT_READY */
+	beq.s	7f
+	cmp.w	d5, d0
+	beq.s	7f
+	move.w	d0, d5
+	tst.w	d0				/* negative 0xBADx is directly displayable */
+	bmi.s	5f
+	bsr	startup_update_prg
+	bra.s	7f
+5:
+	bsr	startup_write_hex
+7:
+	/* The counter is frame-paced: sample Sub once per VBlank instead of
+	   hammering the gate-array registers in an unbounded Main-CPU loop. */
+	bsr	wait_vblank
+	bra	1b
+6:
+	bsr	consume_boot_stage
+	move.w	#1, (GA_COMCMD1).l
+6:
+	tst.w	(GA_COMSTAT0).l
+	bne.s	6b
+	clr.w	(GA_COMCMD1).l
+	bra	1b
+3:
+	moveq	#0, d0
+	bsr	startup_update_prg
+	rts					/* keep CMD_STREAM asserted through frame-0 flip */
+.endif
+
+consume_boot_stage:
+	movem.l	d0-d7/a0-a6, -(sp)
+	/* パレット表と切替表はIPイメージ内蔵(ip_entry冒頭でM-RAMへコピー済み)。
+	   stageに残る内容はDic stagingとBVRM sidecarのみ。 */
+.ifdef PLAYER_SPECIALIZED
+.if (PC_FEATURES & 0x0008)
+.if PC_DIC_PATTERNS > 0
+	lea	(PROBE_BANK+DIC_STAGE_OFF).l, a1
+	lea	DIC_BUF, a2
+	move.w	#PC_DIC_PATTERNS*8-1, d1
+1:
+	move.l	(a1)+, (a2)+
+	dbra	d1, 1b
+.endif
+.endif
+.endif
+	bsr	load_boot_vram_sidecar
+	movem.l	(sp)+, d0-d7/a0-a6
+	rts
+
+cmd_wait_ready:
+	move.w	d0, (GA_COMCMD0).l
+1:
+	move.w	(GA_COMSTAT0).l, d0
+	cmp.w	#STAT_BOOT_STAGE, d0
+	beq.s	4f
+	cmp.w	#STAT_READY, d0
+	bne	1b
+	rts					/* one CMD_STREAM edge remains pending */
+4:
+	bsr	consume_boot_stage
+	move.w	#1, (GA_COMCMD1).l
+4:
+	tst.w	(GA_COMSTAT0).l
+	bne.s	4b
+	clr.w	(GA_COMCMD1).l
+	bra	1b
+
+/* Frame 0 is already visible when this clears the sole startup command.
+   Sub starts PCM and the continuous timed suffix on this edge, clears READY,
+   then prepares frame 1 behind the ordinary CMD_SWAP wait. */
+start_playback:
+	move.w	#0, (GA_COMCMD0).l
+1:
+	tst.w	(GA_COMSTAT0).l
+	bne.s	1b
+	rts
+/* Boot-stage directory at stage+0x0FC0:
+     "BVRM", count_A.w, count_B.w, count_C.w
+   Records are [zero-based physical_slot.w, packed_pattern[32]] in three fixed
+   holes around the directory: +0000..0F00, +1000..3000, and +5000..6000. */
+load_boot_vram_sidecar:
+	movem.l	d0-d7/a0-a2, -(sp)
+	lea	(PROBE_BANK+STATUS_OFF+0x80).l, a0
+	/* CAVC keeps the features word at header offset 60; its low byte (61)
+	   carries bit 7. The former TTRC offsets (features 62/63, pool 14,
+	   base 16) sat two bytes later and silently skipped this loader after
+	   the version word was removed (issue #112). */
+	btst	#FEATURE_BOOT_VRAM_SIDECAR_BIT, 61(a0)
+	beq	9f
+	lea	(PROBE_BANK+BOOT_VRAM_DIR_OFF).l, a2
+	cmpi.l	#BOOT_VRAM_MAGIC, (a2)
+	bne	9f
+	move.w	4(a2), d7
+	cmpi.w	#0x0F00/34, d7
+	bls.s	1f
+	move.w	#0x0F00/34, d7
+1:
+	lea	(PROBE_BANK).l, a1
+	bsr	load_boot_vram_records
+
+	move.w	6(a2), d7
+	cmpi.w	#0x2000/34, d7
+	bls.s	2f
+	move.w	#0x2000/34, d7
+2:
+	lea	(PROBE_BANK+0x1000).l, a1
+	bsr	load_boot_vram_records
+	move.w	8(a2), d7
+	cmpi.w	#0x1000/34, d7
+	bls.s	3f
+	move.w	#0x1000/34, d7
+3:
+	lea	(PROBE_BANK+0x5000).l, a1
+	bsr	load_boot_vram_records
+9:
+	movem.l	(sp)+, d0-d7/a0-a2
+	rts
+
+/* a1=record cursor, d7=count, a0=O_HDR. */
+load_boot_vram_records:
+	tst.w	d7
+	beq.s	8f
+	subq.w	#1, d7
+4:
+	moveq	#0, d0
+	move.w	(a1)+, d0			/* zero-based physical slot */
+	cmp.w	12(a0), d0			/* CAVC pool size at header offset 12 */
+	bhs.s	6f
+	add.w	14(a0), d0			/* + resident pool base (offset 14) */
+	lsl.l	#5, d0
+	bsr	set_vram_write
+	moveq	#8-1, d1
+5:
+	move.l	(a1)+, (VDP_DATA).l
+	dbra	d1, 5b
+	bra.s	7f
+6:
+	adda.w	#32, a1
+7:
+	dbra	d7, 4b
+8:
+	rts
+
+/* Start one bank exchange without waiting. The caller has finished every
+   reference into the currently mapped Word-RAM bank. */
+swap_begin:
+	move.w	#1, swap_request_pending
+	move.w	#CMD_SWAP, (GA_COMCMD0).l
+	rts
+
+/* Finish an already-started exchange. d0=STAT_READY or STAT_END.
+   DEBUG measures only the blocking tail from this call until the response;
+   an exchange completed behind NT/CRAM/flip therefore reports zero lines. */
+swap_finish_or_end:
+.ifdef DEBUG
+	move.w	(VDP_HV).l, d1
+	lsr.w	#8, d1				/* V-counter when Main begins blocking */
+.endif
+1:
+	move.w	(GA_COMSTAT0).l, d0
+	cmp.w	#STAT_READY, d0
+	beq	2f
+	cmp.w	#STAT_END, d0
+	bne	1b
+2:
+	move.w	d0, d3				/* preserve READY/END across cadence polling */
+.ifdef DEBUG
+	move.w	(VDP_HV).l, d2
+	lsr.w	#8, d2
+	sub.w	d1, d2
+	andi.w	#0x00FF, d2			/* approximate elapsed scanlines */
+	move.w	d2, sub_wait_lines
+.endif
+	move.w	#0, (GA_COMCMD0).l
+3:
+	tst.w	(GA_COMSTAT0).l
+	bne	3b
+	clr.w	swap_request_pending
+	move.w	d3, d0				/* swap_finish_or_end return contract */
+	rts
+
+	/* Display the player-only frame -1 while frame 0 is built. Clear the single
+	   movie table with display disabled; DEBUG publishes frame=FFFF through the
+	   fixed Window/SAT HUD. */
+show_frame_minus_one:
+	movem.l	d0-d2, -(sp)
+	move.w	#0x8134, (VDP_CTRL).l		/* display off; keep VInt, DMA and mode 5 */
+	move.l	#MOVIE_NT, d0
+	bsr	set_vram_write
+	moveq	#0, d0
+	move.w	#64*32-1, d1
+1:
+	move.w	d0, (VDP_DATA).l
+	dbra	d1, 1b
+	.ifdef DEBUG
+	move.l	#-1, frame_no
+	bsr	prepare_dbg
+	bsr	hud_dma_flip
+	.endif
+	move.w	#0x8174, (VDP_CTRL).l		/* display on + VInt + DMA + mode 5 */
+	bsr	wait_vblank			/* make FFFF visible in at least one capture field */
+	movem.l	(sp)+, d0-d2
+	rts
+
+wait_vblank:
+	move.w	d1, -(sp)
+1:
+	move.w	(VDP_CTRL).l, d1
+	btst	#3, d1
+	beq	1b
+2:
+	move.w	(VDP_CTRL).l, d1
+	btst	#3, d1
+	bne	2b
+	move.w	(sp)+, d1
+	rts
+
+	/* Build the values-only HUD rows in Main RAM before the display deadline.
+	   The cadence-final blank DMAs them into the fixed Window row and sprite table.
+   Category glyphs are omitted to reserve cells for future supply metrics.
+   The 43-word layout uses four frame digits; one digit each for palette,
+   slip, desync, resync and CD wait; two for audio lead, Sub wait and ADPCM;
+   four for packed VBlank-spill/transfer ticks; two for runs and PrgBuf jitter;
+   then flip/share/delay, packed pump-gap/back-pressure, one-digit MSF gap,
+   packed reader lead/slot, transfer-VBlank count, transfer-end V-counter,
+   pattern-DMA start V-counter and name-table-DMA start V-counter.
+   The row wraps after 40 words, the H40 screen width. */
+prepare_dbg:
+.ifdef HUD_HEX_TABLE
+	movem.l	d0-d4/a0-a1, -(sp)
+	lea	dbg_hex_pairs, a1
+.else
+	movem.l	d0-d4/a0, -(sp)
+.endif
+	lea	dbg_row, a0
+	/* frame number, 4 digits */
+	move.w	frame_no+2, d4
+	DBG_PUT4
+	/* palette segment, low nibble */
+	move.w	dbg_seg, d4
+	DBG_PUT1
+	/* slip/reseek count, low nibble */
+	move.w	(PROBE_BANK+STATUS_OFF+0x00).l, d4
+	DBG_PUT1
+	/* desync count, low nibble */
+	move.w	(PROBE_BANK+STATUS_OFF+0x7E).l, d4
+	DBG_PUT1
+	/* audio re-sync count, low nibble */
+	move.w	(PROBE_BANK+STATUS_OFF+0x20).l, d4
+	DBG_PUT1
+	/* current audio lead high byte (256-byte units) */
+	move.w	(PROBE_BANK+STATUS_OFF+0x22).l, d4
+	lsr.w	#8, d4
+	DBG_PUT2
+	/* total blocking CD pumps (current control + older BODY slot) */
+	move.w	(PROBE_BANK+STATUS_OFF+0x18).l, d4
+	add.w	(PROBE_BANK+STATUS_OFF+0x1A).l, d4
+	DBG_PUT1
+	/* Main's CMD_SWAP wait for Sub completion, in approximate scanlines */
+	move.w	sub_wait_lines, d4
+	DBG_PUT2
+	/* Sub ADPCM decode time in 4*30.72us units (zero for PCM builds). */
+	move.w	(PROBE_BANK+STATUS_OFF+0x1C).l, d4
+	lsr.w	#2, d4
+	DBG_PUT2
+	/* Pack the one-digit Main VBlank spill into the unused high nibble of
+	   the 12-bit pattern-transfer stopwatch. */
+	move.w	dma_elapsed_ticks, d4
+	andi.w	#0x0FFF, d4
+	move.w	frame_vblank_waits, d0
+	andi.w	#0x000F, d0
+	ror.w	#4, d0
+	or.w	d0, d4
+	DBG_PUT4
+	move.w	n_runs, d4
+	DBG_PUT2
+	/* COMSTAT2 holds Sub's exact sticky high-water occupancy in patterns.
+	   Convert only the excess above the fps-specific normal PrgBuf cap, rounding
+	   upward so any use of the physical jitter reserve displays J>=01. */
+	move.w	(GA_COMSTAT2).l, d4
+.ifdef PLAYER_SPECIALIZED
+	cmp.w	#PC_PRG_BUF_CAP_PATTERNS, d4
+	bls.s	1f
+	sub.w	#PC_PRG_BUF_CAP_PATTERNS, d4
+.else
+	cmp.w	md_prg_buf_cap_patterns, d4
+	bls.s	1f
+	sub.w	md_prg_buf_cap_patterns, d4
+.endif
+	add.w	#31, d4
+	lsr.w	#5, d4				/* 32 patterns = 1 KiB */
+	bra.s	2f
+1:
+	moveq	#0, d4
+2:
+	DBG_PUT2
+.ifdef HUD_FLIP_FIELDS
+	/* V: V-counter at the previous accepted flip (this row is built before
+	   its own frame's flip, so the freshest sample is one frame old). */
+	move.w	flip_hv_v, d4
+	DBG_PUT2
+	/* O: V-counter immediately after VBlank budget 1's pattern work. */
+	move.w	pattern_vblank1_exit_v, d4
+	DBG_PUT2
+	/* E: this frame's Pass2 entry delay since the previous flip, ticks/4 */
+	move.w	pass2_entry_q, d4
+	DBG_PUT2
+.ifdef HUD_SUB_POLL_GAP
+	/* G: maximum time spent outside the Sub CDC pump between service
+	   opportunities during this frame, in 30.72 us stopwatch ticks. Bit 15
+	   carries B when APPLY back-pressure rejected a control-sector pump.
+	   Sub stores B in CTRLWAIT's unused high-byte sign bit so it cannot
+	   interfere with the running G maximum. */
+	move.w	(PROBE_BANK+STATUS_OFF+0x26).l, d4
+	tst.b	(PROBE_BANK+STATUS_OFF+0x18).l
+	bpl.s	9f
+	ori.w	#0x8000, d4
+9:
+	DBG_PUT4
+	/* Cumulative MSF sequence-gap recoveries, low nibble. */
+	move.w	(PROBE_BANK+STATUS_OFF+0x00).l, d4
+	lsr.w	#8, d4
+	DBG_PUT1
+	/* CD reader lead: one nibble of complete frame slots followed by one
+	   nibble of sector position inside the current physical slot. */
+	move.w	(PROBE_BANK+STATUS_OFF+0x2A).l, d4
+	move.w	d4, d3
+	lsr.w	#8, d4
+	DBG_PUT1
+	move.w	d3, d4
+	DBG_PUT1
+	/* Number of fresh VBlank budgets opened and V-counter when Pass2
+	   pattern transfer ended, before HUD/NT/CRAM/flip work. */
+	move.w	pattern_transfer_vblanks, d4
+	DBG_PUT1
+	move.w	pattern_exit_v, d4
+	DBG_PUT2
+	/* Raw V-counters when the first pattern run is ready before its fresh-blank
+	   wait, and when the name-table path is ready before its cadence-final
+	   VBlank wait. A frame with no pattern run retains zero
+	   for that field. */
+	move.w	pattern_dma_ready_v, d4
+	DBG_PUT2
+	move.w	nt_dma_ready_v, d4
+	DBG_PUT2
+.endif
+.endif
+.ifdef HUD_HEX_TABLE
+	movem.l	(sp)+, d0-d4/a0-a1
+.else
+	movem.l	(sp)+, d0-d4/a0
+.endif
+	rts
+
+/* Append four value digits to the prebuilt row.  Reuse the straight byte-pair
+   formatter instead of walking four nibbles through a DBRA loop. */
+dbg_put4:
+	move.w	d4, d3
+	lsr.w	#8, d4
+	bsr	dbg_put2
+	move.w	d3, d4
+	bra	dbg_put2
+
+/* Append three/one hexadecimal digits for the exact split counters. */
+dbg_put3:
+	move.w	d4, d3
+	lsr.w	#8, d4
+	bsr	dbg_put1
+	move.w	d3, d4
+	bra	dbg_put2
+
+.ifdef HUD_HEX_TABLE
+/* Compact specialized three-digit formatter shared by prepare_dbg and the
+   final staged-HUD patch. a1 is the 256-entry byte-pair table. */
+dbg_fast_put3:
+	move.w	d4, d3
+	lsr.w	#8, d4
+	bsr	dbg_put1
+	move.w	d3, d4
+	andi.w	#0x00FF, d4
+	add.w	d4, d4
+	add.w	d4, d4
+	move.l	(a1,d4.w), (a0)+
+	rts
+.endif
+
+dbg_put1:
+	andi.w	#0xF, d4
+	addi.w	#HUD_FONT_VTILE, d4
+	move.w	d4, (a0)+
+	rts
+
+/* Append the low byte as two digits.  Calculate both name-table words directly;
+   this is the hot DEBUG formatter and avoids a per-nibble loop and DBRA. */
+dbg_put2:
+	move.w	d4, d0
+	andi.w	#0xF, d0
+	addi.w	#HUD_FONT_VTILE, d0
+	move.w	d0, 2(a0)			/* low nibble */
+	lsr.w	#4, d4
+	andi.w	#0xF, d4
+	addi.w	#HUD_FONT_VTILE, d4
+	move.w	d4, (a0)			/* high nibble */
+	addq.l	#4, a0
+	rts
+
+/* パレット表(全区間)と切替表はboot時にM-RAMへ写すだけの一時データなので、
+   codegenが上書きする.startup領域に置いて恒久.dataの8KiB枠を消費しない。 */
+	.section .startup, "a", @progbits
+
+/* Boot-only sound silencing, called first from ip_entry. Take the Z80 bus,
+   park the Z80 on di+halt so it cannot execute undefined RAM, mute all four
+   PSG channels, pulse the Z80 reset line (which also resets the YM2612 core),
+   then force the YM2612 registers silent explicitly. Runs long before codegen
+   overwrites this transient section, and touches no Word-RAM or CD state. */
+	.align 2
+init_sound_silence:
+	move.w	#0x0100, (Z80_BUSREQ).l		/* request the Z80 bus */
+	move.w	#0x0100, (Z80_RESET).l		/* release reset for RAM access */
+1:
+	btst	#0, (Z80_BUSREQ).l
+	bne.s	1b
+	move.b	#0xF3, (Z80_RAM).l		/* di */
+	move.b	#0x76, (Z80_RAM+1).l		/* halt */
+	/* PSG: all four channels to maximum attenuation (silent) */
+	move.b	#0x9F, (PSG_PORT).l
+	move.b	#0xBF, (PSG_PORT).l
+	move.b	#0xDF, (PSG_PORT).l
+	move.b	#0xFF, (PSG_PORT).l
+	/* Pulse the Z80 reset low; the same line resets the YM2612 core */
+	move.w	#0x0000, (Z80_RESET).l
+	move.w	#191, d0
+1:
+	dbra	d0, 1b
+	move.w	#0x0100, (Z80_RESET).l
+	/* Explicit YM2612 silence on top of the reset: LFO off, timers and
+	   ch3 special mode off, DAC off, TL max on every slot, all keys off */
+	move.w	#0x22, d1
+	moveq	#0, d2
+	bsr	ym_write0
+	move.w	#0x27, d1
+	bsr	ym_write0
+	move.w	#0x2B, d1
+	bsr	ym_write0
+	move.w	#0x40, d1
+	move.w	#0x7F, d2
+1:
+	bsr	ym_write0
+	bsr	ym_write1
+	addq.w	#1, d1
+	cmpi.w	#0x50, d1
+	blo.s	1b
+	move.w	#0x28, d1
+	moveq	#0, d2
+	bsr	ym_write0
+	moveq	#1, d2
+	bsr	ym_write0
+	moveq	#2, d2
+	bsr	ym_write0
+	moveq	#4, d2
+	bsr	ym_write0
+	moveq	#5, d2
+	bsr	ym_write0
+	moveq	#6, d2
+	bsr	ym_write0
+	move.w	#0x0000, (Z80_BUSREQ).l		/* release: Z80 runs di+halt */
+	rts
+
+/* d1 = register, d2 = data. The busy flag (bit 7) reads at YM_ADDR0 for both
+   register parts; the Z80 bus stays held for the whole init. */
+ym_write0:
+1:
+	tst.b	(YM_ADDR0).l
+	bmi.s	1b
+	move.b	d1, (YM_ADDR0).l
+	nop
+	move.b	d2, (YM_DATA0).l
+	rts
+ym_write1:
+1:
+	tst.b	(YM_ADDR0).l
+	bmi.s	1b
+	move.b	d1, (YM_ADDR1).l
+	nop
+	move.b	d2, (YM_DATA1).l
+	rts
+
+	.align 2
+paltab_image:
+	.incbin "paltab.bin"
+paltab_image_end:
+.if (paltab_image_end-paltab_image) % 128
+	.error "paltab.bin must be n_seg*128 bytes"
+.endif
+.if (paltab_image_end-paltab_image) > PALTAB_MAX_SEG*128
+	.error "paltab.bin exceeds the fixed M-PALTAB capacity"
+.endif
+palidx_image:
+	.incbin "palidx.bin"
+.if .-palidx_image != PALIDX_ENTRIES*4
+	.error "palidx.bin must be PALIDX_ENTRIES entries of 4 bytes"
+.endif
+
+	.data
+	.align 2
+dbgfont:
+	.incbin "dbgfont.bin"
+.ifdef HUD_HEX_TABLE
+/* Longword order matches two consecutive VDP name-table writes.  This table
+   remains in the permanent IP image; it does not consume DicBuf capacity. */
+	.align 2
+dbg_hex_pairs:
+	.set dbg_hex_byte, 0
+	.rept 256
+	.word HUD_FONT_VTILE + ((dbg_hex_byte >> 4) & 0x0F)
+	.word HUD_FONT_VTILE + (dbg_hex_byte & 0x0F)
+	.set dbg_hex_byte, dbg_hex_byte + 1
+	.endr
+.endif
+	/* The pool ends at 0xD9FF; keep the font below the single 0xE000 movie NT. */
+	.if HUD_FONT_ADDR != 0xDA00 || (HUD_FONT_VTILE + DBGFONT_N > MOVIE_NT/32)
+	.error "hexadecimal font must start at 0xDA00 and fit below the movie NT"
+.endif
+
+	.bss
+	.align 2
+shadow:
+	.space 0x1000				/* logical H40=2240B; padded for bounded list offsets */
+dbg_row:
+.ifdef HUD_SUB_POLL_GAP
+	.space HUD_COMBINED_WORDS*2		/* 43 logical digits before wrapping */
+.else
+	.space SCREEN_COLS*2			/* prebuilt values-only row; DEBUG fills all 40 cells */
+.endif
+nt_stage:
+.ifdef INCLUDE_SCROLL
+	.space NT_STAGE_PITCH*32*2		/* persistent 64x32 plane band; 4KB bounds masked offsets */
+.else
+.ifdef PLAYER_SPECIALIZED
+	.space NT_STAGE_WORDS*2			/* exact static grid band */
+.else
+	.space NT_STAGE_MAX_WORDS*2		/* runtime full-aperture maximum */
+.endif
+.endif
+.ifdef DEBUG
+hud_sprites:
+	.space (HUD_COMBINED_WORDS-SCREEN_COLS)*4*2	/* three 4-word SAT records */
+.endif
+.ifndef PLAYER_SPECIALIZED
+md_final_frame:
+	.space 4
+md_vsync_n:
+	.space 2				/* v4: 1コマの表示VBLANK数(15fps=4, 30fps=2) */
+md_cadence_period:
+	.space 2				/* feature bit 1: 1=fixed N, 2=24fps two/three */
+md_pace_arm_ticks:
+	.space 2				/* current stopwatch arm point before the target VBlank */
+md_pace_alt_arm_ticks:
+	.space 2				/* periodic cadence's alternate arm point */
+md_screen_cols:
+	.space 2
+md_nt_stage_words:
+	.space 2
+md_nt_flip_reserve_words:
+	.space 2
+md_nt_stage_dst:
+	.space 4
+.endif
+vsync_acc:
+	.space 2				/* v4: 現コマで消費したVBLANK数(ペーシング用) */
+pace_flip_tick:
+	.space 2				/* GA stopwatch tick at preceding cadence-controlled flip */
+pace_target_vblanks:
+	.space 2				/* current fixed or periodic display-deadline budget index */
+.ifndef PLAYER_SPECIALIZED
+md_tcols:
+	.space 2
+md_trows:
+	.space 2
+md_bmbytes:
+	.space 2				/* ceil(cells/8); supported grids divide exactly */
+md_row0:
+	.space 2
+md_col0:
+	.space 2
+md_vbudget:
+	.space 2
+md_prg_buf_cap_patterns:
+	.space 2				/* fps-scaled normal PrgBuf ceiling for DEBUG J */
+	.endif
+frame_no:
+	.space 4
+started:
+	.space 2
+swap_request_pending:
+	.space 2				/* CMD_SWAP is asserted; finish it at the next loop head */
+n_runs:
+	.space 2
+frame_type:
+	.space 2				/* masked bits14..13 from the current control */
+.ifdef INCLUDE_SCROLL
+scroll_next_h:
+	.space 2				/* absolute Plane A/B HScroll for the next flip */
+scroll_next_v:
+	.space 2				/* absolute Plane A/B VScroll for the next flip */
+scroll_h_dirty:
+	.space 2				/* rewrite both scroll pairs at the next flip */
+.endif
+dbg_seg:
+	.space 2
+cram_source:
+	.space 4				/* PALTAB entry or inline CRAM source for atomic flip */
+palidx_ptr:
+	.space 4				/* next unconsumed M-PALIDX switch entry */
+sub_wait_lines:
+	.space 2				/* DEBUG residual blocking swap wait in scanlines */
+release_slip_count:
+	.space 2				/* release snapshot before early bank exchange */
+frame_vblank_waits:
+	.space 2				/* DEBUG vblank_spill snapshot before display pacing */
+dma_elapsed_ticks:
+	.space 2				/* DEBUG Uxxxx: 30.72 us stopwatch ticks */
+dma_start_tick:
+	.space 2				/* DEBUG stopwatch sample at first pattern transfer */
+vbudget_from_head:
+	.space 2				/* current d7 began at a proven VBlank head */
+pattern_final_reserve_words:
+	.space 2				/* cadence-final NT/HUD/CRAM/flip DMA-equivalent cost */
+vbudget_held_reserve:
+	.space 2				/* final capacity withheld from the current pattern d7 */
+flip_hv_v:
+	.space 2				/* DEBUG flip_vcounter */
+pattern_vblank1_exit_v:
+	.space 2				/* DEBUG first_share_exit_vcounter */
+pass2_entry_q:
+	.space 2				/* DEBUG pass2_delay_q4 */
+pattern_vblank1_words:
+	.space 2				/* internal pattern words in budget 1 */
+pattern_vblank2_words:
+	.space 2				/* internal pattern words in budget 2 */
+pattern_vblank3_words:
+	.space 2				/* internal pattern words in budget 3 */
+pattern_vblank4_words:
+	.space 2				/* internal pattern words in budget 4 */
+pattern_transfer_vblanks:
+	.space 2				/* runtime budget index; DEBUG transfer_vblanks */
+pattern_exit_v:
+	.space 2				/* DEBUG transfer_end_vcounter */
+pattern_dma_ready_v:
+	.space 2				/* DEBUG pattern_dma_ready_vcounter */
+nt_dma_ready_v:
+	.space 2				/* DEBUG name_table_dma_ready_vcounter */
+	.ifdef MAIN_CODEGEN
+md_codegen:
+	.space 2				/* 1 only after the complete runtime proof succeeds */
+md_codegen_end:
+	.space 4				/* generated end address, including failed attempts */
+.endif
+.ifndef PLAYER_SPECIALIZED
+pace_periodic_arm_ticks:
+	.space 2				/* specialized period-2 current arm threshold */
+pace_phase:
+	.space 2				/* next periodic interval: 0=first, 1=alternate */
+pace_cadence_debt:
+	.space 2				/* late VBlanks awaiting long-step recovery */
+.elseif PC_CADENCE_PERIOD == 2
+pace_periodic_arm_ticks:
+	.space 2				/* specialized period-2 current arm threshold */
+pace_phase:
+	.space 2				/* next periodic interval: 0=first, 1=alternate */
+pace_cadence_debt:
+	.space 2				/* late VBlanks awaiting long-step recovery */
+.endif
+player_bss_end:

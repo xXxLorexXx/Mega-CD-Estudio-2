@@ -1,0 +1,445 @@
+#!/usr/bin/env python3
+"""Regression tests for the shared physical payload-RING schedule."""
+from __future__ import annotations
+
+import unittest
+import tempfile
+from pathlib import Path
+from unittest.mock import patch
+
+import numpy as np
+
+import pack_stream as pack
+import shadow_updates
+import stream_schedule as schedule
+import cavc_routing
+
+
+class ControlLengthTests(unittest.TestCase):
+    def test_player_cold_run_path_matches_rate_and_pattern_supply(self) -> None:
+        self.assertFalse(cavc_routing.player_uses_packed_cold_runs(15, 0))
+        self.assertFalse(cavc_routing.player_uses_packed_cold_runs(20, 0))
+        self.assertTrue(cavc_routing.player_uses_packed_cold_runs(24, 0))
+        self.assertTrue(cavc_routing.player_uses_packed_cold_runs(30, 0))
+        self.assertTrue(cavc_routing.player_uses_packed_cold_runs(
+            15, cavc_routing.FEATURE_PATTERN_SUPPLY))
+
+    def test_lengths_mix_bitmap_and_shadow_lists(self) -> None:
+        lengths = schedule.control_block_lengths(
+            np.array([3, 3]), np.array([0, 0]), cells=1120,
+            audio_frame_bytes=372,
+            update_lists=np.array([False, True]))
+        # The list replaces a 140-byte bitmap plus six entry bytes with 12B.
+        self.assertEqual(int(lengths[0] - lengths[1]), 134)
+
+    def test_shadow_list_selection_preserves_schedule_margins(self) -> None:
+        cells = [[], [0], list(range(64)), [1119], list(range(256))]
+        plan = schedule.select_shadow_update_lists(
+            cells, np.zeros(5, np.int64), np.zeros(5, np.int64),
+            cells=1120, fps=30, ring_capacity_patterns=64,
+            frame_sectors=3, audio_frame_bytes=16, fill=True)
+        self.assertFalse(bool(plan["selected"][0]))
+        self.assertGreaterEqual(
+            int(plan["schedule"]["ring_min"]),
+            int(plan["baseline_schedule"]["ring_min"]))
+        self.assertGreaterEqual(
+            int(plan["schedule"]["ready_min"]),
+            int(plan["baseline_schedule"]["ready_min"]))
+        self.assertFalse(plan["control_growth_enabled"])
+        self.assertTrue(all(
+            cost.added_bytes <= 0
+            for cost, selected in zip(plan["costs"], plan["selected"], strict=True)
+            if selected))
+
+    def test_shadow_list_selection_rolls_back_unsafe_byte_shrink(self) -> None:
+        cells = [[], [0], [1]]
+        updates = np.array([len(frame) for frame in cells], np.int64)
+        runs = np.zeros(3, np.int64)
+        legacy = schedule.control_block_lengths(
+            updates, runs, cells=1120, audio_frame_bytes=16)
+
+        def fake_schedule(_loads, lengths, **_kwargs):
+            if int(np.asarray(lengths, np.int64).sum()) < int(legacy.sum()):
+                raise schedule.ScheduleError(
+                    "shorter control route moved a required payload sector")
+            return {"feasible": True, "ring_min": 64, "ready_min": 64}
+
+        with patch.object(
+                schedule, "schedule_payload_ring",
+                side_effect=fake_schedule):
+            plan = schedule.select_shadow_update_lists(
+                cells, runs, np.zeros(3, np.int64),
+                cells=1120, fps=15, ring_capacity_patterns=128,
+                prebuffer_capacity_patterns=64,
+                frame_sectors=5, audio_frame_bytes=16, fill=True)
+
+        self.assertEqual(plan["selected"].tolist(), [False, False, False])
+        self.assertEqual(plan["safety_rejected_frames"], (1, 2))
+        self.assertEqual(
+            plan["block_lengths"].tolist(),
+            plan["legacy_block_lengths"].tolist())
+
+    def test_fade_control_replaces_updates_with_inline_cram(self) -> None:
+        lengths = schedule.control_block_lengths(
+            [0, 0, 0], [0, 2, 0], cells=760,
+            audio_frame_bytes=1472,
+            frame_types=[
+                shadow_updates.FRAME_NORMAL,
+                shadow_updates.FRAME_FADE_IN,
+                shadow_updates.FRAME_FADE_OUT,
+            ],
+        )
+        # Normal zero-update H40/760 carries a 96-byte aligned bitmap.  A fade
+        # omits it, adds the complete 128-byte CRAM image, and retains runs.
+        self.assertEqual(lengths.tolist(), [1576, 1616, 1608])
+        with self.assertRaisesRegex(ValueError, "carries shadow updates"):
+            schedule.control_block_lengths(
+                [1], [0], cells=760, audio_frame_bytes=1472,
+                frame_types=[shadow_updates.FRAME_FADE_IN],
+            )
+
+    def test_scroll_control_adds_absolute_position_and_requires_list(self) -> None:
+        lengths = schedule.control_block_lengths(
+            [3], [2], cells=1120, audio_frame_bytes=372,
+            update_lists=[True],
+            frame_types=[shadow_updates.FRAME_SCROLL],
+        )
+        # total_len + frame_seq/type + H/V position + three 4-byte pairs +
+        # audio + n_runs/two descriptors.
+        self.assertEqual(lengths.tolist(), [404])
+        with self.assertRaisesRegex(ValueError, "requires"):
+            schedule.control_block_lengths(
+                [3], [2], cells=1120, audio_frame_bytes=372,
+                update_lists=[False],
+                frame_types=[shadow_updates.FRAME_SCROLL],
+            )
+
+    def test_shadow_selection_forces_scroll_lists_and_uses_plane_cells(self) -> None:
+        plan = schedule.select_shadow_update_lists(
+            [[], [1200], []],
+            np.zeros(3, np.int64),
+            np.zeros(3, np.int64),
+            cells=1120,
+            fps=15,
+            ring_capacity_patterns=128,
+            prebuffer_capacity_patterns=64,
+            frame_sectors=5,
+            audio_frame_bytes=16,
+            frame_types=[
+                shadow_updates.FRAME_NORMAL,
+                shadow_updates.FRAME_SCROLL,
+                shadow_updates.FRAME_NORMAL,
+            ],
+        )
+        self.assertTrue(bool(plan["selected"][1]))
+        self.assertEqual(
+            plan["block_lengths"].tolist(),
+            schedule.control_block_lengths(
+                [0, 1, 0], [0, 0, 0], cells=1120,
+                audio_frame_bytes=16,
+                update_lists=[False, True, False],
+                frame_types=[
+                    shadow_updates.FRAME_NORMAL,
+                    shadow_updates.FRAME_SCROLL,
+                    shadow_updates.FRAME_NORMAL,
+                ],
+            ).tolist(),
+        )
+
+    def test_body_supply_reserves_fixed_control_before_variable_work(self) -> None:
+        supply = schedule.body_fresh_byte_supply(
+            5, 30,
+            cells=1120,
+            audio_frame_bytes=736,
+        )
+        self.assertEqual(supply["gross"].tolist(), [0, 4096, 6144, 4096, 6144])
+        self.assertEqual(supply["fixed_control"].tolist(), [0, 884, 884, 884, 884])
+        self.assertEqual(supply["variable"].tolist(), [0, 3212, 5260, 3212, 5260])
+
+
+class BodyDeliveryRateTests(unittest.TestCase):
+    def test_24fps_follows_each_two_three_vblank_deadline(self) -> None:
+        deltas = schedule.rate_deltas(11, 24)[1:]
+        self.assertEqual(deltas.tolist(), [2, 4, 2, 4, 3, 3, 3, 4, 2, 4])
+        self.assertEqual(int(deltas.sum()), 31)
+
+    def test_15fps_fixed_n4_includes_one_six_sector_slot_per_cycle(self) -> None:
+        deltas = schedule.rate_deltas(201, 15)[1:]
+        self.assertEqual(int(deltas.sum()), 1001)
+        self.assertEqual(int(np.count_nonzero(deltas == 5)), 199)
+        self.assertEqual(int(np.count_nonzero(deltas == 6)), 1)
+
+    def test_rate_uses_each_slots_physical_cd_time(self) -> None:
+        rate = schedule.body_delivery_rate_bps(
+            [0, 2048, 1024, 3072], [0, 2048, 2048, 4096])
+        self.assertEqual(rate.tolist(), [0, 153600, 76800, 115200])
+        self.assertLessEqual(int(rate.max()), schedule.CD_BYTES_PER_SECOND)
+
+    def test_average_is_weighted_by_total_physical_read_time(self) -> None:
+        average = schedule.average_body_delivery_rate_bps(
+            [2048, 2048], [2048, 6144])
+        self.assertEqual(average, 76800.0)
+
+    def test_useful_bytes_cannot_exceed_physical_bytes(self) -> None:
+        with self.assertRaisesRegex(ValueError, "within physical"):
+            schedule.body_delivery_rate_bps([2049], [2048])
+
+    def test_payload_class_split_skips_prebuffer_and_preserves_delivery(self) -> None:
+        raw, prg = schedule.split_body_payload_classes(
+            [True, False, True, False, True],
+            [64, 64],
+            prebuffer_patterns=1,
+        )
+        self.assertEqual(raw.tolist(), [32, 32])
+        self.assertEqual(prg.tolist(), [32, 32])
+        np.testing.assert_array_equal(raw + prg, [64, 64])
+
+
+class PayloadRingScheduleTests(unittest.TestCase):
+    def test_repaid_rate_debt_is_not_a_feasible_fixed_cadence_route(
+            self) -> None:
+        for materialize in (False, True):
+            with self.subTest(materialize=materialize):
+                result = schedule.schedule_payload_ring(
+                    [0, 0, 0, 0],
+                    [0, 5000, 0, 0],
+                    fps=30,
+                    ring_capacity_patterns=64,
+                    prebuffer_capacity_patterns=64,
+                    frame_sectors=5,
+                    fill=True,
+                    materialize=materialize,
+                )
+                self.assertEqual(result["rate_lead_peak"], 1)
+                self.assertEqual(result["rate_lead_end"], 0)
+                self.assertFalse(result["feasible"])
+
+    def test_useful_body_trace_excludes_header_and_all_padding(self) -> None:
+        result = schedule.schedule_payload_ring(
+            [64, 64, 64, 1],
+            [100, 2050, 10, 0],
+            fps=15,
+            ring_capacity_patterns=128,
+            prebuffer_capacity_patterns=64,
+            frame_sectors=5,
+            fill=True,
+        )
+        useful_control = result["body_useful_control_bytes"]
+        useful_payload = result["body_useful_payload_bytes"]
+        pad = result["body_pad_bytes"]
+        physical = result["body_physical_bytes"]
+        self.assertEqual(int(useful_control[0]), 0)
+        self.assertEqual(int(useful_payload[0]), 0)
+        self.assertEqual(int(useful_control.sum()), 2060)
+        self.assertEqual(int(useful_payload.sum()), 65 * 32)
+        np.testing.assert_array_equal(
+            useful_control + useful_payload + pad, physical)
+        loads = np.asarray([64, 64, 64, 1], np.int64)
+        np.testing.assert_array_equal(
+            result["ring_occupancy_before_consume"],
+            result["ring_occupancy"]
+            + np.asarray([0, *loads[1:]], np.int64),
+        )
+        self.assertEqual(
+            result["ring_peak"],
+            int(result["ring_occupancy_before_consume"].max()),
+        )
+
+    def test_continuous_control_bytes_are_counted_in_delivery_slot(self) -> None:
+        trace = schedule.useful_body_delivery_trace(
+            [0, 0, 0], [0, 1, 1], [0, 5, 5],
+            body_payload_bytes=0,
+            body_control_bytes=2050,
+        )
+        self.assertEqual(
+            trace["body_useful_control_bytes"].tolist(), [0, 2048, 2])
+        with self.assertRaisesRegex(schedule.ScheduleError, "omitted 2"):
+            schedule.useful_body_delivery_trace(
+                [0, 0, 0], [0, 1, 0], [0, 5, 5],
+                body_payload_bytes=0,
+                body_control_bytes=2050,
+            )
+
+    def test_terminal_frames_do_not_refill_after_payload_exhaustion(self) -> None:
+        result = schedule.schedule_payload_ring(
+            [0, 64, 64, 0, 0],
+            [0, 0, 0, 0, 0],
+            fps=15,
+            ring_capacity_patterns=128,
+            frame_sectors=5,
+            fill=True,
+        )
+        self.assertEqual(result["ring_occupancy"].tolist(), [128, 64, 0, 0, 0])
+        self.assertEqual(result["n_pay_sec"].tolist(), [0, 0, 0, 0, 0])
+        self.assertTrue(result["feasible"])
+
+    def test_terminal_drain_is_excluded_only_from_comparison_minimum(self) -> None:
+        result = schedule.schedule_payload_ring(
+            [0, 96, 96, 96, 96, 96, 96, 96, 96, 0, 0],
+            [0] * 11,
+            fps=30,
+            ring_capacity_patterns=256,
+            frame_sectors=3,
+            fill=True,
+        )
+        end = int(result["evaluation_end_frame"])
+        self.assertLess(end, len(result["ring_occupancy"]))
+        self.assertEqual(
+            int(result["ring_min_evaluation"]),
+            int(result["ring_occupancy"][1:end].min()))
+        self.assertLessEqual(
+            int(result["ring_min"]), int(result["ring_min_evaluation"]))
+
+    def test_last_sector_padding_is_real_ring_occupancy(self) -> None:
+        result = schedule.schedule_payload_ring(
+            [0, 10, 0],
+            [0, 0, 0],
+            fps=15,
+            ring_capacity_patterns=128,
+            frame_sectors=5,
+            fill=True,
+        )
+        self.assertEqual(result["ring_occupancy"].tolist(), [64, 54, 54])
+
+    def test_runtime_delivery_may_use_reserved_jitter_above_prebuffer(self) -> None:
+        result = schedule.schedule_payload_ring(
+            [0, 32, 64, 64, 64, 64, 64, 64, 0],
+            [0] * 9,
+            fps=15,
+            ring_capacity_patterns=160,
+            prebuffer_capacity_patterns=128,
+            frame_sectors=5,
+            fill=True,
+        )
+        self.assertTrue(result["feasible"])
+        self.assertEqual(result["prebuf_pat"], 128)
+        self.assertEqual(result["ring_peak"], 160)
+        self.assertEqual(result["ring_jitter_peak"], 32)
+        self.assertEqual(result["prebuffer_capacity_patterns"], 128)
+        self.assertEqual(result["ring_capacity_patterns"], 160)
+
+    def test_payload_failure_identifies_the_causal_deadline(self) -> None:
+        with self.assertRaises(schedule.ScheduleError) as caught:
+            schedule.schedule_payload_ring(
+                [0, 112, 112, 112],
+                [0, 0, 0, 0],
+                fps=15,
+                ring_capacity_patterns=128,
+                frame_sectors=5,
+                fill=True,
+            )
+        self.assertEqual(caught.exception.kind, "payload_capacity")
+        self.assertEqual(caught.exception.details["failure_frame"], 1)
+        self.assertEqual(caught.exception.details["origin_frame"], 2)
+        self.assertEqual(caught.exception.details["patterns_to_remove"], 96)
+
+    def test_pack_rejects_a_frozen_ring_trace_mismatch(self) -> None:
+        packed = {
+            "blk_len": np.array([10, 12]),
+            "ring_occupancy": np.array([64, 32]),
+            "ring_occupancy_before_consume": np.array([64, 64]),
+            "n_pay_sec": np.array([0, 1]),
+            "n_ctrl_sec": np.array([0, 1]),
+            "body_useful_payload_bytes": np.array([0, 32]),
+            "body_useful_control_bytes": np.array([0, 12]),
+            "body_pad_bytes": np.array([0, 4052]),
+            "body_physical_bytes": np.array([0, 4096]),
+        }
+        frozen = {
+            "stream_schedule": {
+                "schema_version": schedule.STREAM_SCHEDULE_SCHEMA_VERSION,
+                "block_lengths": np.array([10, 12]),
+                "ring_occupancy": np.array([64, 31]),
+                "ring_occupancy_before_consume": np.array([64, 64]),
+                "payload_sectors": np.array([0, 1]),
+                "control_sectors": np.array([0, 1]),
+                "body_useful_payload_bytes": np.array([0, 32]),
+                "body_useful_control_bytes": np.array([0, 12]),
+                "body_pad_bytes": np.array([0, 4052]),
+                "body_physical_bytes": np.array([0, 4096]),
+            }
+        }
+        with self.assertRaisesRegex(SystemExit, "ring_occupancy mismatch at frame 1"):
+            pack.verify_sim_stream_schedule(frozen, packed)
+
+    def test_pack_accepts_an_exact_frozen_ring_trace(self) -> None:
+        packed = {
+            "blk_len": np.array([10, 12]),
+            "ring_occupancy": np.array([64, 32]),
+            "ring_occupancy_before_consume": np.array([64, 64]),
+            "n_pay_sec": np.array([0, 1]),
+            "n_ctrl_sec": np.array([0, 1]),
+            "body_useful_payload_bytes": np.array([0, 32]),
+            "body_useful_control_bytes": np.array([0, 12]),
+            "body_pad_bytes": np.array([0, 4052]),
+            "body_physical_bytes": np.array([0, 4096]),
+        }
+        frozen = {
+            "stream_schedule": {
+                "schema_version": schedule.STREAM_SCHEDULE_SCHEMA_VERSION,
+                "block_lengths": np.array([10, 12]),
+                "ring_occupancy": np.array([64, 32]),
+                "ring_occupancy_before_consume": np.array([64, 64]),
+                "payload_sectors": np.array([0, 1]),
+                "control_sectors": np.array([0, 1]),
+                "body_useful_payload_bytes": np.array([0, 32]),
+                "body_useful_control_bytes": np.array([0, 12]),
+                "body_pad_bytes": np.array([0, 4052]),
+                "body_physical_bytes": np.array([0, 4096]),
+            }
+        }
+        self.assertTrue(pack.verify_sim_stream_schedule(frozen, packed))
+
+    def test_pack_requires_the_current_body_trace_schema(self) -> None:
+        with self.assertRaisesRegex(SystemExit, "re-run sim"):
+            pack.verify_sim_stream_schedule(
+                {"stream_schedule": {"schema_version": 1}}, {})
+
+    def test_packer_verifies_written_body_slots_and_padding(self) -> None:
+        packed = {
+            "n_pay_sec": np.array([0, 1]),
+            "n_ctrl_sec": np.array([0, 1]),
+            "fsec": np.array([0, 3]),
+            "body_useful_payload_bytes": np.array([0, 32]),
+            "body_useful_control_bytes": np.array([0, 3]),
+            "body_pad_bytes": np.array([0, 3 * 2048 - 35]),
+        }
+        control = b"abc"
+        payload = b"p" * 32
+        slot = (
+            control.ljust(2048, b"\0")
+            + payload.ljust(2048, b"\0")
+            + bytes(2048)
+        )
+        arm = b"a" * 2048
+        with tempfile.TemporaryDirectory() as tmp:
+            body = Path(tmp) / "BODY.DAT"
+            body.write_bytes(arm + slot)
+            pack.verify_body_delivery_file(
+                body, arm, control, payload, packed, prebuf_patterns=0)
+            body.write_bytes(arm + slot[:-1] + b"x")
+            with self.assertRaisesRegex(AssertionError, "rate-match pad"):
+                pack.verify_body_delivery_file(
+                    body, arm, control, payload, packed, prebuf_patterns=0)
+
+    def test_packer_requires_frame1_control_sector_for_pcm_anchor(self) -> None:
+        packed = {
+            "n_pay_sec": np.array([0, 0]),
+            "n_ctrl_sec": np.array([0, 0]),
+            "fsec": np.array([0, 2]),
+            "body_useful_payload_bytes": np.array([0, 0]),
+            "body_useful_control_bytes": np.array([0, 0]),
+            "body_pad_bytes": np.array([0, 2 * 2048]),
+        }
+        arm = b"a" * 2048
+        with tempfile.TemporaryDirectory() as tmp:
+            body = Path(tmp) / "BODY.DAT"
+            body.write_bytes(arm + bytes(2 * 2048))
+            with self.assertRaisesRegex(
+                    AssertionError, "anchor PCM start"):
+                pack.verify_body_delivery_file(
+                    body, arm, b"", b"", packed, prebuf_patterns=0)
+
+
+if __name__ == "__main__":
+    unittest.main()

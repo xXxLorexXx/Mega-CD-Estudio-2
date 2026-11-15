@@ -1,0 +1,71 @@
+from __future__ import annotations
+
+from pathlib import Path
+import tempfile
+import unittest
+
+import parallel_run
+from encode_config import load_profile
+
+
+def write_profile(path: Path, *, source: str, width: int = 320) -> None:
+    path.write_text(f"""\
+schema_version = 5
+
+[source]
+path = "{source}"
+fps = "30"
+duration = "8"
+
+[video]
+width = {width}
+height = 224
+fit = "pad"
+
+[output]
+directory = "tmpfs/{Path(source).stem}_H40_{width}x224_adpcm22/sim"
+emit_decisions = true
+
+[encoder]
+cold_cap = 200
+
+[palette]
+algorithm = "mosaic-gm"
+""", encoding="utf-8")
+
+
+class ParallelRunTests(unittest.TestCase):
+    def test_rejects_duplicate_video_stems(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            first = root / "first.toml"
+            second = root / "second.toml"
+            write_profile(first, source="assets/same.mp4")
+            write_profile(second, source="assets/same.mp4")
+            with self.assertRaises(parallel_run.ParallelRunError):
+                parallel_run.validate_distinct_stems([
+                    load_profile(first), load_profile(second)])
+
+    def test_stage_commands_stop_at_requested_boundary(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            profile_path = Path(tmp) / "movie.toml"
+            write_profile(profile_path, source="assets/movie.mp4")
+            profile = load_profile(profile_path)
+            commands = parallel_run.stage_commands(
+                profile,
+                through="record",
+                use_gpu=False,
+                record_seconds=41,
+            )
+            self.assertEqual(
+                [stage for stage, _command in commands],
+                ["sim", "disc", "record"],
+            )
+            record = commands[-1][1]
+            self.assertIn("320x224", record)
+            self.assertIn("41", record)
+            self.assertNotIn("--gpu", commands[0][1])
+
+
+if __name__ == "__main__":
+    unittest.main()

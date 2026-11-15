@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+*.nbi
+*.nbc
+.venv*/
+compilacion/
+*.exe
+*.dll
+*.iso
+*.cue
+*.brm
+*.gs*
+*.log
+Discos_convertidos/
+cavc/tmp/
+cavc/out/
+cavc/logs/

@@ -1,0 +1,6472 @@
+#!/usr/bin/env python3
+"""SEGA-CD向け差分圧縮 + タイル重複排除のオフライン検証。
+
+方針(2026-07 更新):
+- 前処理でディザ除去: 元動画は低解像度+ディザなので、`video_geometry.py` が
+  H40のHARに合わせて全画素を保持したpad変換を行い、一度拡大してフルカラー化、
+  hqdn3d+gblur後に出力ラスタへ縮小する。
+- 表示アスペクト: H40のHARは32:35で、224ラインでは64:49の可視比になる。
+  `CBRSIM_GEOMETRY_FIT=crop`を明示した場合だけその比率へcropし、既定では
+  黒帯が最小になるpadで情報を落とさない。
+- パレット: 4本×15色をパレットセグメント単位で学習し、セグメント内では固定・共有
+  (per-frameではない)。セグメント境界でCRAMを切り替える。
+- 分散が非常に低い(=ほぼ単色)タイルだけ平均色へ均して単純化(FLATTEN_STD)。
+  ディザ除去済みなので閾値は低めでよい。
+- 出力量子化ではprofileで選んだ位置固定Bayerディザを使う。通常のBayerと、
+  強い3x3輝度境界の近くだけディザ量を連続的に絞る境界減衰型を選べる。
+  同じframe内容と画面座標には同じ結果を返すため、静止タイルの差分は増やさない。
+- **タイル重複排除(dedup)**: MDのネームテーブルは各セル→(パターンslot, パレット)。
+  パターン(8x8 idx配列)はパレット非依存なので、同じidxパターンは VRAM に1つ
+  だけ置き、複数セル(パレット違いも可)で使い回す。パターン転送32Bを共有でき、
+  各セルはネームテーブル2Bのみ。フレーム内・フレーム跨ぎ両方で効く(VRAMを
+  LRUキャッシュとしてモデル化, 容量 VRAM_TILES)。
+- BODYの物理2/3セクタ配送を先に置き、固定controlを差し引いた残りを更新entry、
+  run descriptor、Prg pattern payloadで共有する。軽いフレームの余りは有限の
+  全編画質予算へ残し、重いフレームへ回す。
+- ゴースト対策(距離加重エージング): Miss/Flbk のまま残るタイルは、
+  target と現在表示のRGB平均誤差に応じた age_press を累積して優先度を上げる。
+  Near/正確表示になれば圧力は0に戻る。整数 wait はTSVのMiss継続観測だけに使う。
+- 音声: 22.05kHz mono IMA ADPCM。Plane B オーバーレイは無し。
+"""
+import json
+import os
+import sys
+import time
+import math
+import dataclasses
+from collections import defaultdict
+from contextlib import contextmanager
+from pathlib import Path
+
+import numpy as np
+from PIL import Image
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from encode_config import consume_config_arg, profile_identity  # noqa: E402
+
+# Apply a per-source TOML profile before any CBRSIM-backed module constants are
+# evaluated.  The internal environment remains compatible with older scripts,
+# but TOML values always win over an inherited shell environment.
+CONFIG_PROFILE = consume_config_arg(
+    sys.argv, required=__name__ == "__main__")
+import av_config  # noqa: E402
+import astra_extract  # noqa: E402
+from astra_progress import emit  # noqa: E402
+from fast_kernels import (  # noqa: E402
+    HAS_NUMBA,
+    best_resident_metrics,
+    cell_f3_score_lut,
+    f3_mask_eval_numba,
+    flatten_low_detail_numba,
+    frame_metrics_numba,
+    score_match_motion_numba,
+    score_smooth_fallback_numba,
+    tile_edge_error_numba,
+)
+import fade_frames  # noqa: E402
+import ima_adpcm  # noqa: E402
+import palette_segments  # noqa: E402
+import pattern_supply  # noqa: E402
+import physical_budget  # noqa: E402
+import raw_prefetch  # noqa: E402
+import adaptive_motion  # noqa: E402
+import r2v_model  # noqa: E402
+import resource_tokens  # noqa: E402
+import scroll_frames  # noqa: E402
+import scroll_plan  # noqa: E402
+import scroll_runtime  # noqa: E402
+import stream_schedule  # noqa: E402
+import shadow_updates  # noqa: E402
+import cavc_routing  # noqa: E402
+import wordbuf_ring  # noqa: E402
+import sim_artifact_cache  # noqa: E402
+import source_range  # noqa: E402
+import tmpfs_workspace  # noqa: E402
+import upgrade_planner  # noqa: E402
+from array_storage import ArrayStorage  # noqa: E402
+
+from quantize_md_video import (  # noqa: E402
+    rgb333_to_rgb888, run, prepare_dir, MD_LEVELS,
+)
+from quantize_global4_tiles import (  # noqa: E402
+    tile_blocks, build_palettes, edge_strengths, pals_to_bytes, palette_lut,
+    rgb333_keys, TILE,
+)
+from palette_algorithms import (  # noqa: E402
+    MOSAIC_GM, STL4, PaletteEvaluator, build_mosaic_palettes,
+    coherent_assign_idx, normalize_palette_algo, refine_one_line_palette,
+    score_palettes,
+)
+import auto_range  # noqa: E402
+import output_dither  # noqa: E402
+from cbr_paths import sim_work_dir  # noqa: E402
+from video_geometry import (  # noqa: E402
+    endpoint_snap_filter, probe_source, parse_ratio, source_filter, raw_filter,
+)
+
+# 対象動画・寸法・fps は env で差し替え可(既定はサンプル動画)。
+# Profile実行ではcbr_pathsがdeterministicなtmpfs実体pathを返す。
+SRC = os.environ.get("CBRSIM_SRC", "movies/disc1/061.mp4")
+MODE = av_config.DISPLAY_MODE
+# Keep the historical 144-line codec height on the H40 native raster.
+W = int(os.environ.get("CBRSIM_W", str(av_config.SCREEN_WIDTH)))
+H = int(os.environ.get("CBRSIM_H", "144"))
+GEOMETRY_FIT = os.environ.get("CBRSIM_GEOMETRY_FIT", "pad").lower()
+RESIZE_FILTER = os.environ.get("CBRSIM_RESIZE_FILTER", "lanczos").lower()
+MASTER_DENOISE = os.environ.get("CBRSIM_MASTER_DENOISE", "1") != "0"
+SOURCE_SAR_OVERRIDE = os.environ.get("CBRSIM_SOURCE_SAR")
+_MASTER_VF_OVERRIDE = os.environ.get("CBRSIM_MASTER_VF")
+_RAW_VF_OVERRIDE = os.environ.get("CBRSIM_RAW_VF")
+# Import-only users need not have the default sample video installed.  Resolve
+# the source geometry at run time in main() when no explicit filter was given.
+DEDITHER_VF = _MASTER_VF_OVERRIDE or ""
+RAW_VF = _RAW_VF_OVERRIDE or ""
+TCOLS, TROWS = W // TILE, H // TILE     # 既定 32 x 18 = 576 cells
+C_CELLS = TCOLS * TROWS
+ACTIVE_TILES = int(os.environ.get("CBRSIM_ACTIVE_TILES", str(C_CELLS)))
+if not 1 <= ACTIVE_TILES <= C_CELLS:
+    raise SystemExit(
+        f"CBRSIM_ACTIVE_TILES must be within 1..{C_CELLS}, got {ACTIVE_TILES}")
+# CBRSIM_FPS は整数 "15" でも分数 "30000/1001"(=59.94/2=29.97, NTSCソース準拠) でも受ける。
+# FPS_STR は ffmpeg にそのまま渡す(分数を厳密に間引く)。FPS は計算用の float。
+FPS_STR = os.environ.get("CBRSIM_FPS", "15").strip()
+FPS = (float(FPS_STR.split("/")[0]) / float(FPS_STR.split("/")[1])) if "/" in FPS_STR else float(FPS_STR)
+DURATION = os.environ.get("CBRSIM_DURATION", "152.866667")
+SOURCE_RANGE = source_range.frame_range({
+    key: int(os.environ[env]) for key, env in (
+        ("start_frame", "CBRSIM_START_FRAME"), ("end_frame", "CBRSIM_END_FRAME"))
+    if env in os.environ
+})
+
+# Qualified rates use their exact NTSC cadence (N4=14.985, 2/3=23.976,
+# N2=29.97). Other rates keep their requested long-term rate.
+VSYNC_N = av_config.vsync_n_for_fps(FPS)
+PLAYBACK_FPS = av_config.playback_fps_for_content(FPS)
+CD_RATE = av_config.CD_BYTES_PER_SECOND
+# Audio is always 22.05 kHz mono ADPCM. The source WAV is signed 16-bit;
+# controls carry checkpointed 4-bit IMA and the Sub CPU reconstructs RF5C164
+# samples.
+AUDIO_FFCODEC = "pcm_s16le"
+# Optional profile-supplied ffmpeg -af chain applied while extracting the
+# source audio (e.g. loudnorm to match loud masters). Empty means as-is.
+AUDIO_AF = os.environ.get("CBRSIM_AUDIO_AF", "").strip()
+# The packer shares these timing values through av_config.
+AUDIO_RATE, AUDIO_PCM_BYTES, AUDIO_CONTROL_BYTES = av_config.audio_frame_layout(
+    FPS, int(os.environ.get("CBRSIM_AUDIO_RATE", "22050")))
+AUDIO_LABEL = f"{AUDIO_RATE} Hz mono IMA ADPCM"
+# Retain cache filenames for the existing replay and artifact validators.
+AUDIO_FILE = "audio_22k05_s16_mono.wav"
+AUDIO_PLAYBACK_FILE = "audio_playback_adpcm22_rf5c.wav"
+AUDIO_PLAYBACK_RATE = int(round(AUDIO_PCM_BYTES * PLAYBACK_FPS))
+DISPLAY_CATEGORY_MASK_ORDER = (
+    "Raw", "Near", "Flbk", "Prg", "Wr0", "Wr1", "Dic", "Miss", "Scrl",
+)
+STAT_COLUMNS = (
+    "frame", "ffix", "want", "updated", "miss", "delta", "dedup", "tx",
+    "carry", "age", "want_frac", "near", "flbk", "buf", "prg", "wr0",
+    "wr1", "dic", "same", "same_u", "near_u", "flbk_u", "dma_tiles",
+    "dma_runs", "prefetch", "scrl",
+)
+STAT_COLUMN_INDEX = {
+    name: index for index, name in enumerate(STAT_COLUMNS)
+}
+PATTERN_BYTES = 32              # 4bpp 8x8 パターン
+NAME_BYTES = 2                  # ネームテーブル1エントリ(tile index + palette + priority)
+VRAM_TILES = av_config.VRAM_PATTERN_POOL_TILES
+FLATTEN_STD = 0.12              # rgb333(0-7)タイル内std平均。ディザ除去済みなので低め
+DETAIL_ALPHA = float(os.environ.get("CBRSIM_DETAIL_ALPHA", "0.0"))
+BORDER_TILES = 2
+BORDER_WEIGHT = 0.4
+# Miss/Flbk にだけ、targetと現在表示の距離に応じた圧力を積む。
+# RGB平均誤差 AGING_DIST_REF で1.0/frame、急変時の単フレーム加算はSTEP_CAPまで。
+AGING_ALPHA = 0.6
+WAIT_CAP = 10.0
+AGING_DIST_REF = float(os.environ.get("CBRSIM_AGING_DIST_REF", "24"))
+AGING_STEP_CAP = float(os.environ.get("CBRSIM_AGING_STEP_CAP", "2.0"))
+if AGING_DIST_REF <= 0:
+    raise SystemExit("CBRSIM_AGING_DIST_REF must be greater than zero")
+if AGING_STEP_CAP < 0:
+    raise SystemExit("CBRSIM_AGING_STEP_CAP must be zero or greater")
+
+
+def distance_aging_step(diff, dist_ref=AGING_DIST_REF,
+                        step_cap=AGING_STEP_CAP):
+    """Return one frame's age pressure from per-tile summed RGB error."""
+    mean_rgb_error = np.asarray(diff, dtype=np.float64) / (TILE * TILE * 3)
+    return np.minimum(mean_rgb_error / float(dist_ref), float(step_cap))
+
+
+def tile_edge_error(displayed, target):
+    """Score how much displayed tiles disagree across their shared edges."""
+    if HAS_NUMBA:
+        return tile_edge_error_numba(displayed, target, TROWS, TCOLS)
+    residual = np.subtract(displayed, target, dtype=np.int16).reshape(
+        TROWS, TCOLS, TILE, TILE, 3)
+    horizontal = np.abs(
+        residual[:, 1:, :, 0] - residual[:, :-1, :, -1]).sum(axis=(2, 3))
+    vertical = np.abs(
+        residual[1:, :, 0] - residual[:-1, :, -1]).sum(axis=(2, 3))
+    score = np.zeros((TROWS, TCOLS), dtype=np.float64)
+    score[:, 1:] += horizontal
+    score[:, :-1] += horizontal
+    score[1:] += vertical
+    score[:-1] += vertical
+    return score.ravel()
+
+
+def priority_aging(age_press):
+    """Convert accumulated age pressure to the bounded priority multiplier."""
+    return 1.0 + AGING_ALPHA * np.minimum(age_press, WAIT_CAP)
+
+
+def update_age_pressure(age_press, cell_tier, diff):
+    """Accumulate pressure for Miss/Flbk and reset Near/exact cells."""
+    return np.where(
+        np.asarray(cell_tier) < 2,
+        np.asarray(age_press, dtype=np.float64) + distance_aging_step(diff),
+        0.0,
+    )
+
+
+# Resident candidate search narrows by rendered mean colour before the full
+# F3 comparison. This is search acceleration only; it does not accept a quality
+# tier by itself.
+RESIDENT_K = int(os.environ.get("CBRSIM_RESIDENT_K", "24"))
+RESIDENT_BW = 24
+RESIDENT_NEIGHBOURS = tuple(sorted(
+    ((r, g, b) for r in (-1, 0, 1) for g in (-1, 0, 1)
+     for b in (-1, 0, 1) if (r, g, b) != (0, 0, 0)),
+    key=lambda offset: (sum(map(abs, offset)), offset),
+))
+# Near(F3): 変化タイルのうち「表示中(old)とtarget(real)が見た目ほぼ同じ」を更新省略。
+# 常に old(表示中) vs target を比較するのでドリフトはF3の距離で頭打ち。env CBRSIM_NEAR=1 で有効。
+NEAR_ON = True
+NEAR_F3 = dict(Ym=float(os.environ.get("CBRSIM_NEAR_YM", "10")),   # 画素輝度差の平均しきい(厳格化)
+               Yp=float(os.environ.get("CBRSIM_NEAR_YP", "28")),   # 画素輝度差の最大しきい(形は軽く効く)
+               C=float(os.environ.get("CBRSIM_NEAR_C", "24")))     # 画素色差の平均しきい
+_LWv = np.array([.299, .587, .114]); _CBv = np.array([-.169, -.331, .5]); _CRv = np.array([.5, -.419, -.081])
+_SC1 = (.01 * 255) ** 2; _SC2 = (.03 * 255) ** 2
+
+# Every rendered codec pixel is one of the 512 RGB333 colours.  Cache the F3
+# per-pixel distances once so the resident search does not repeat matrix
+# products and square roots for millions of tiny candidate arrays.
+_MD_LEVEL_INDEX = np.zeros(256, dtype=np.uint16)
+_MD_LEVEL_INDEX[MD_LEVELS] = np.arange(8, dtype=np.uint16)
+_MD_RGB333 = np.column_stack((
+    (np.arange(512, dtype=np.uint16) >> 6) & 7,
+    (np.arange(512, dtype=np.uint16) >> 3) & 7,
+    np.arange(512, dtype=np.uint16) & 7,
+))
+_MD_RGB888 = MD_LEVELS[_MD_RGB333].astype(np.float64)
+_MD_LUM = _MD_RGB888 @ _LWv
+_MD_CB = _MD_RGB888 @ _CBv
+_MD_CR = _MD_RGB888 @ _CRv
+_F3_DY_LUT = np.abs(_MD_LUM[:, None] - _MD_LUM[None, :])
+_F3_DC_LUT = np.sqrt(
+    (_MD_CB[:, None] - _MD_CB[None, :]) ** 2
+    + (_MD_CR[:, None] - _MD_CR[None, :]) ** 2)
+
+
+def rendered_color_keys(rgb):
+    """Pack codec-rendered MD_LEVELS RGB into 9-bit colour keys."""
+    levels = _MD_LEVEL_INDEX[np.asarray(rgb, dtype=np.uint8)]
+    return ((levels[..., 0] << 6) | (levels[..., 1] << 3) | levels[..., 2])
+
+# --- 統合探索(Same/Near/Flbk/Miss) + 中央tie-break ---
+CENTERTIE_ON = os.environ.get("CBRSIM_CENTERTIE", "1") != "0"   # 既定ON。同点は画面中央に近いセルを優先
+MIDFAR_ON = os.environ.get("CBRSIM_MIDFAR", "1") != "0"    # 既定ON。Near/Flbk を1つのVRAM最良一致探索に統合
+# Flbk 判定モード。既定ON=「改善モード」: 絶対しきい(flbk tier)でなく「現在表示より
+# 少しでも target に近づく(=改善する)候補なら採る」。どの動画でもFlbkが反応しやすい。
+# CBRSIM_FLBK_IMPROVE_ONLY=0 で旧・絶対しきいモード(flbk tier内の候補のみ)。
+FLBK_IMPROVE_ONLY = os.environ.get("CBRSIM_FLBK_IMPROVE_ONLY", "1") != "0"
+# 改善モードで要求する最小改善量(score差)。既定0=「ちょっとでも改善するなら採る」。
+FLBK_MIN_IMPROVE = float(os.environ.get("CBRSIM_FLBK_MIN_IMPROVE", "0"))
+# 段階しきい(F3: Ym=画素輝度差平均, Yp=画素輝度差最大, C=画素色差平均)。tight→loose。
+# 探索は2×2低周波でバケツ前絞り→最良候補を採り、その候補を下記F3で分類。
+# Flbk = Miss のフォールバック。旧Mid/Farを統合し、しきいを広くして「Missを出すくらいなら荒くても穴埋め」。
+MIDFAR_TIERS = [
+    ("near", NEAR_F3['Ym'], NEAR_F3['Yp'], NEAR_F3['C']),
+    ("flbk", float(os.environ.get("CBRSIM_TFLBK_YM", "120")), float(os.environ.get("CBRSIM_TFLBK_YP", "252")), float(os.environ.get("CBRSIM_TFLBK_C", "200"))),
+]
+
+
+def f3_mask_eval(cur, plain, changed, thresholds):
+    """Return changed cells within mean/max luma and mean chroma bounds."""
+    t = thresholds
+    if HAS_NUMBA:
+        return f3_mask_eval_numba(
+            cur, plain, changed, _LWv, _CBv, _CRv,
+            float(t['Ym']), float(t['Yp']), float(t['C']))
+    if not np.any(changed):
+        return np.zeros(len(changed), dtype=bool)
+    mask = np.zeros(len(changed), dtype=bool)
+    idx = np.flatnonzero(changed)
+    o = cur[idx].astype(np.float64); r = plain[idx].astype(np.float64)
+    dY = np.abs(o @ _LWv - r @ _LWv)
+    dYm = dY.mean(axis=(1, 2)); dYp = dY.max(axis=(1, 2))
+    dCm = np.sqrt((o @ _CBv - r @ _CBv) ** 2 + (o @ _CRv - r @ _CRv) ** 2).mean(axis=(1, 2))
+    mask[idx] = (dYm <= t['Ym']) & (dYp <= t['Yp']) & (dCm <= t['C'])
+    return mask
+
+
+def near_mask_eval(cur, plain, changed):
+    """Return changed cells whose displayed error already fits Near."""
+    return f3_mask_eval(cur, plain, changed, NEAR_F3)
+# L3(PRG-RAM victim cache): VRAMから追い出したパターンを捨てずRAMに退避しておき、
+# 再登場したらCDから読み直さずRAM→VRAM DMAで復帰させる(CDバイト0)。CDが唯一の
+# ボトルネックなのでDMAは実質フリー扱い。0=無効(既定)。512KB/32B=16384枚。
+L3_TILES = int(os.environ.get("CBRSIM_L3", "0"))
+# PRG-RAM先読みバッファ: 再生前にPRGへ載せた静的タイル集合(pickle set of pattern keys)。
+# ここにあるパターンは再生中いつでもCD 0バイト(RAM→VRAM DMAのみ)で出せる=Fill扱い。
+PRG_PRELOAD_PATH = os.environ.get("CBRSIM_PRG_PRELOAD", "")
+# Whole-movie quality budget: easy frames retain virtual bytes and demanding
+# frames spend them.  This is encoder accounting, not a fifth physical buffer.
+# Its ceiling matches the normal fps-specific PrgBuf capacity. The exact
+# physical delivery proof uses that same scheduled ceiling; the interval above
+# it is reserved for live sector-arrival variation and is not encoder Supply.
+QUALITY_BUDGET_ON = True
+PRG_BUF_CAP_KB = av_config.prg_buf_cap_kb(FPS)
+PRG_DELIVERY_CAP_KB = av_config.scheduled_delivery_cap_kb(FPS)
+PRG_JITTER_HEADROOM_KB = av_config.ring_jitter_headroom_kb(FPS)
+QUALITY_BUDGET_KB = av_config.quality_budget_kb(FPS)
+QUALITY_BUDGET_BYTES = QUALITY_BUDGET_KB * 1024
+CRAM_QUALITY_PRIORITY_SEARCH_FRAMES = int(os.environ.get(
+    "CBRSIM_CRAM_QUALITY_PRIORITY_SEARCH_FRAMES",
+    str(av_config.CRAM_QUALITY_PRIORITY_SEARCH_FRAMES),
+))
+if CRAM_QUALITY_PRIORITY_SEARCH_FRAMES < 0:
+    raise SystemExit(
+        "CBRSIM_CRAM_QUALITY_PRIORITY_SEARCH_FRAMES must be non-negative")
+# 格上げパス(既定ON): 当該フレームの余り + 画質予算で、近似(Near/Flbk)や持ち越しをRaw/Bufに格上げ。
+# 0で無効(=従来の帯域余し挙動に戻せる, 比較用)。
+UPGRADE_ON = os.environ.get("CBRSIM_UPGRADE", "1") != "0"
+# cold(=新規パターン転送: Raw+Buf)の1コマ上限。実機MDの実時間デコード天井対策
+# (BUDGETS.md 'Encoder cap')。超過セルは Flbk近似 or Miss繰越。
+# Executable encodes always receive the explicit profile value. Import-only
+# utility callers use the full grid because they do not produce an artifact.
+# frame0 は下の frame_max_cold で別途免除。
+_COLD_CAP_REQUEST = (
+    C_CELLS if CONFIG_PROFILE is None
+    and not os.environ.get("CBRSIM_COLD_CAP", "").strip()
+    else None
+)
+MAX_COLD = av_config.cold_cap(_COLD_CAP_REQUEST)
+# Canonical spec string ("225" or "2:170,3:250"). A per-interval spec gives
+# each frame the cap of its own VBlank slot; MAX_COLD stays the reservation
+# ceiling for layout/envelope sizing.
+COLD_CAP_SPEC = av_config.cold_cap_spec(_COLD_CAP_REQUEST)
+MAX_RUN_CONTROL_BYTES = stream_schedule.max_run_control_reservation(
+    MAX_COLD, ACTIVE_TILES)
+# Boot VRAM prefetch uses otherwise-unused frame-0 HEADER/staging capacity and
+# free resident slots.  It is default-on because it adds no timed BODY work.
+# Runtime prefetch is default-on and profile-overridable: only spare cold/BODY
+# capacity may move next-frame work earlier, and visible work always wins.
+# The boot-VRAM override is a diagnostic isolation knob only.
+BOOT_VRAM_PREFETCH_ON = os.environ.get(
+    "CBRSIM_BOOT_VRAM_PREFETCH", "1") != "0"
+RAW_PREFETCH_ON = os.environ.get("CBRSIM_RAW_PREFETCH", "1") != "0"
+RAW_PREFETCH_LOOKAHEAD = 1
+RAW_PREFETCH_MAX_REQUESTS_PER_FRAME = 32
+RAW_PREFETCH_MIN_BATCH = 4
+RAW_PREFETCH_BUDGET_FLOOR_PATTERNS = 256
+# PrgBuf, both parity-specific WordBuf banks, and DicBuf are the single
+# physical pattern-supply algorithm at every supported cadence.
+PATTERN_SUPPLY_ON = True
+# The specialized Sub-CPU player consumes the packed cold-run suffix at 24fps
+# and above, or whenever the multi-source pattern-supply path requires it.
+# Lower-rate plain-Prg streams deliberately retain the legacy 64-entry polling
+# walker.  That walker reconstructs runs in cell/update order, so applying a
+# permutation optimized for the suffix's physical-slot-sorted order can turn a
+# few long runs into hundreds of one-tile runs.  The contiguous logical
+# allocator already emits the legacy order correctly; keep its identity map.
+PACKED_COLD_RUN_EXECUTION = cavc_routing.player_uses_packed_cold_runs(
+    FPS,
+    cavc_routing.FEATURE_PATTERN_SUPPLY if PATTERN_SUPPLY_ON else 0,
+)
+# 近似流用(Near/Flbk)が「この秒数」以上そのまま居座ったら、格上げ優先度を Miss級(sev=0)へ
+# 昇格させる。一過性の近似は目に見えないが、居座った近似は静的なゴースト=視線が固定される。時間で切る
+# のは知覚(何秒出続けたか)がfps非依存だから(重み付けaging=予算コンテストのフレーム数とは別軸)。0で無効。
+def ghost_escalate_frames(seconds, fps):
+    return max(1, math.floor(seconds * fps)) if seconds > 0 else 0
+
+
+GHOST_ESCALATE_SEC = float(os.environ.get("CBRSIM_GHOST_ESCALATE_SEC", "0.2"))
+GHOST_ESCALATE_N = ghost_escalate_frames(GHOST_ESCALATE_SEC, FPS)
+# issue #10: near_keep(現在表示がほぼ同一なら0Bで維持)を「現在表示が正確(cell_tier==9)」なセルに限定。
+# 近似表示(Flbk)を入力に Near 判定すると近似が居座る(ゴースト)ため。0で旧挙動(近似表示も維持可)。
+NEAR_KEEP_ACCURATE_ONLY = os.environ.get("CBRSIM_NEAR_ACCURATE_ONLY", "1") != "0"
+
+# Output quantization uses a profile-selected, position-fixed Bayer 8x8 mode.
+# Both modes depend only on the frame and screen position, so static tiles
+# remain byte-identical across frames. Edge attenuation is opt-in.
+OUTPUT_DITHER = output_dither.normalize_mode(os.environ.get(
+    "CBRSIM_OUTPUT_DITHER", output_dither.BAYER))
+# A palette line only lends its deep-black entries to colour reproduction
+# when the segment's source demonstrably contains such darkness. Demand is the
+# fraction of the segment's Bayer-view pixels that are exactly (0,0,0).
+DEEP_BLACK_DEMAND_MIN = float(os.environ.get(
+    "CBRSIM_DEEP_BLACK_DEMAND_MIN", "0.03"))
+# Optional source preprocessing, applied before both the master and raw paths.
+# Out-of-range defaults disable it for profiles without endpoint_snap.
+PREPROCESS_BLACK_MAX = int(os.environ.get(
+    "CBRSIM_PREPROCESS_ENDPOINT_SNAP_BLACK_MAX", "-1"))
+PREPROCESS_WHITE_MIN = int(os.environ.get(
+    "CBRSIM_PREPROCESS_ENDPOINT_SNAP_WHITE_MIN", "256"))
+SOURCE_PREPROCESS_VF = endpoint_snap_filter(
+    PREPROCESS_BLACK_MAX, PREPROCESS_WHITE_MIN)
+# Whole-movie automatic black/white range expansion (issue #105). Runs after
+# extraction: one combined histogram over every master frame decides the
+# stretch, then master and raw are rewritten through one shared LUT.
+PREPROCESS_AUTO_RANGE = os.environ.get(
+    "CBRSIM_PREPROCESS_AUTO_RANGE", "0") != "0"
+# 深い暗転で区切り、暗転の瞬間に区間別60色パレットへ差し替える(CRAM総入替)。
+SEGPAL_ON = True
+PAL_ALGO = normalize_palette_algo()                          # stl4 (legacy) / mosaic-gm (opt-in while tuning)
+PAL_SEAM_WEIGHT = av_config.PALETTE_SEAM_WEIGHT
+PAL_SEAM_ITERATIONS = av_config.PALETTE_SEAM_ITERATIONS
+PAL_WRITE_BYTES = 0             # CRAM pre-load(PALTAB): 全区間パレットはヘッダ直後のPALTAB領域で
+                                # 一括配送しMain-RAM表から引くので、切替フレームの予算控除は無し
+                                # (ストリームには1Bの区間参照だけ。旧: in-stream 128B/切替)
+def to_rgb333(img888):
+    """Convert RGB888 with the profile-selected deterministic dither."""
+    return output_dither.quantize_rgb333(img888, OUTPUT_DITHER)
+
+
+def detect_palette_segments(frames, metrics=None):
+    """Return the legacy dark/uniform candidate ranges without training them."""
+    n = len(frames)
+    LWv = np.array([.299, .587, .114])
+    SEG_GAP = int(os.environ.get("CBRSIM_SEG_GAP", "24"))
+    SEG_MIN = int(os.environ.get("CBRSIM_SEG_MIN", "2"))
+    DARK_THR = float(os.environ.get("CBRSIM_SEG_DARK", "0.90"))
+    UNI_THR = float(os.environ.get("CBRSIM_SEG_UNIFORM", "0.88"))
+    UNI_TOL = float(os.environ.get("CBRSIM_SEG_UNIFORM_TOL", "24"))
+    UNI_NEAR = int(os.environ.get("CBRSIM_SEG_UNIFORM_NEAR", "8"))
+    if metrics is None:
+        dark = np.zeros(n)
+        uniform = np.zeros(n)
+        for i in range(n):
+            image = np.asarray(Image.open(frames[i]).convert("RGB")).astype(float)
+            dark[i] = ((image @ LWv) < 32).mean()
+            distance = np.sqrt(((image - image.reshape(-1, 3).mean(0)) ** 2).sum(2))
+            uniform[i] = (distance < UNI_TOL).mean()
+    else:
+        dark, uniform = metrics
+        dark = np.asarray(dark, dtype=np.float64).reshape(n)
+        uniform = np.asarray(uniform, dtype=np.float64).reshape(n)
+
+    return palette_segments.segment_ranges(
+        dark,
+        uniform,
+        gap=SEG_GAP,
+        min_frames=SEG_MIN,
+        dark_threshold=DARK_THR,
+        uniform_threshold=UNI_THR,
+        uniform_near=UNI_NEAR,
+        max_segments=av_config.PALTAB_MAX_SEG,
+    )
+
+
+def segment_and_train(frames, frame_cache=None):
+    """Train STL4 unchanged or select MOSAIC-GM lines and useful CRAM segments."""
+    n = len(frames)
+
+    def load_tiles(indices, flattened=False):
+        if frame_cache is not None:
+            return frame_cache.load_tiles(indices, flattened=flattened)
+        return np.concatenate([
+            tile_blocks(to_rgb333(np.asarray(Image.open(frames[int(index)]).convert("RGB"))))
+            for index in indices
+        ], axis=0)
+
+    def train_mosaic(indices):
+        if frame_cache is None:
+            return build_mosaic_palettes(
+                load_tiles(indices), n_pal=4, return_stats=True)
+        training, strengths = frame_cache.load_training(indices)
+        return build_mosaic_palettes(
+            training, n_pal=4, return_stats=True,
+            train_strengths=strengths)
+
+    def sample_indices(start, end, count, half_step=False):
+        length = end - start
+        count = min(length, max(1, int(count)))
+        if count == length:
+            return np.arange(start, end, dtype=np.int64)
+        offset = 0.5 if half_step else 0.0
+        return np.unique(np.clip(
+            start + ((np.arange(count) + offset) * length / count).astype(np.int64),
+            start, end - 1,
+        ))
+
+    if PAL_ALGO == STL4:
+        def train_stl4(indices):
+            return np.stack(build_palettes(load_tiles(indices), n_pal=4)).astype(np.uint8)
+
+        pals_arr = train_stl4(range(0, n, 6))
+        frame_seg = np.zeros(n, np.int32)
+        seg_pals = [pals_arr]
+        seg_bounds = []
+        if SEGPAL_ON:
+            segments = detect_palette_segments(
+                frames, None if frame_cache is None else frame_cache.segment_metrics)
+            seg_pals = [
+                train_stl4(range(start, end, max(1, (end - start) // 60)))
+                for start, end in segments
+            ]
+            frame_seg[:] = -1
+            for segment, (start, end) in enumerate(segments):
+                frame_seg[start:end] = segment
+            current = 0
+            for frame in range(n):
+                if frame_seg[frame] < 0:
+                    frame_seg[frame] = current
+                else:
+                    current = int(frame_seg[frame])
+            seg_bounds = [
+                frame for frame in range(1, n)
+                if frame_seg[frame] != frame_seg[frame - 1]
+            ]
+        stats = {
+            "algo": STL4,
+            "global": {"active_lines": 4, "training_stride": 6},
+            "candidate_segments": len(seg_pals),
+            "selected_segments": len(seg_pals),
+        }
+        return pals_arr, seg_pals, frame_seg, seg_bounds, stats
+
+    sample_counts = av_config.PALETTE_SAMPLE_COUNTS
+    validation_count = av_config.PALETTE_VALIDATE_FRAMES
+    validation_indices = sample_indices(0, n, validation_count, half_step=True)
+    if frame_cache is None:
+        validation_tiles = load_tiles(validation_indices)
+        validation_flat, _detail = flatten_low_detail(validation_tiles)
+    else:
+        validation_flat = load_tiles(validation_indices, flattened=True)
+    validation_evaluator = PaletteEvaluator(validation_flat)
+    candidates = []
+    seen_counts = set()
+    for requested in sample_counts:
+        indices = sample_indices(0, n, requested)
+        if len(indices) in seen_counts:
+            continue
+        seen_counts.add(len(indices))
+        palettes, train_stats = train_mosaic(indices)
+        active = int(train_stats["active_lines"])
+        validation = score_palettes(
+            validation_flat, palettes[:active], evaluator=validation_evaluator,
+            core_colors=int(train_stats["core_colors"]),
+        )
+        record = {
+            **train_stats,
+            "training_frames": len(indices),
+            "validation_frames": len(validation_indices),
+            "validation": validation.summary(),
+            "validation_score": validation.score,
+        }
+        candidates.append((validation.score, active, len(indices), np.stack(palettes), record))
+        print(
+            f"[MOSAIC-GM] global sample={len(indices)} validation="
+            f"{validation.summary()['score_per_pixel']:.6f} active={active}"
+        )
+    _score, _active, _count, pals_arr, global_stats = min(
+        candidates, key=lambda item: (item[0], item[1], item[2]))
+    pals_arr = np.asarray(pals_arr, dtype=np.uint8)
+    global_active = int(global_stats["active_lines"])
+
+    frame_seg = np.zeros(n, np.int32)
+    if not SEGPAL_ON:
+        stats = {
+            "algo": MOSAIC_GM,
+            "global": global_stats,
+            "global_candidates": [record for *_head, record in candidates],
+            "candidate_segments": 1,
+            "selected_segments": 1,
+        }
+        return pals_arr, [pals_arr], frame_seg, [], stats
+
+    # A one-line candidate receives an exact all-frame histogram and local slot
+    # refinement. This is a rendered-error optimization, not a colour-count
+    # shortcut; sources over 15 colours use the same decreasing-error swaps.
+    exact_global = False
+    if global_active == 1:
+        full_histogram = np.zeros(512, dtype=np.int64)
+        if frame_cache is None:
+            for path in frames:
+                tiles = tile_blocks(to_rgb333(np.asarray(Image.open(path).convert("RGB"))))
+                flat, _detail = flatten_low_detail(tiles)
+                full_histogram += np.bincount(
+                    rgb333_keys(flat).reshape(-1), minlength=512)
+        else:
+            for start in range(0, n, 64):
+                flat = frame_cache.load_tiles(
+                    range(start, min(n, start + 64)), flattened=True)
+                full_histogram += np.bincount(
+                    rgb333_keys(flat).reshape(-1), minlength=512)
+        refined, refinement_stats = refine_one_line_palette(
+            pals_arr[0], full_histogram)
+        pals_arr = np.stack([refined.copy() for _line in range(4)]).astype(np.uint8)
+        global_stats["full_histogram_refinement"] = refinement_stats
+        exact_global = bool(refinement_stats["exact"])
+        print(
+            f"[MOSAIC-GM] global one-line full histogram: "
+            f"colours={refinement_stats['source_colours']} "
+            f"error={refinement_stats['before_error']}->{refinement_stats['after_error']} "
+            f"swaps={len(refinement_stats['swaps'])}"
+        )
+        if exact_global:
+            print(f"[MOSAIC-GM] global one-line RGB333 identity proved for all {n} frames")
+
+    if exact_global:
+        stats = {
+            "algo": MOSAIC_GM,
+            "global": global_stats,
+            "global_candidates": [record for *_head, record in candidates],
+            "global_exact_all_frames": True,
+            "candidate_segments": 1,
+            "selected_segments": 1,
+        }
+        return pals_arr, [pals_arr], frame_seg, [], stats
+
+    segments = detect_palette_segments(
+        frames, None if frame_cache is None else frame_cache.segment_metrics)
+    segment_train_count = av_config.PALETTE_SEGMENT_TRAIN_FRAMES
+    segment_validation_count = av_config.PALETTE_SEGMENT_VALIDATE_FRAMES
+    segment_rel = av_config.PALETTE_SEGMENT_GAIN_RELATIVE
+    segment_abs = av_config.PALETTE_SEGMENT_GAIN_PER_PIXEL
+    selected = []
+    segment_stats = []
+    for start, end in segments:
+        train_indices = sample_indices(start, end, segment_train_count)
+        local_palettes, local_stats = train_mosaic(train_indices)
+        validate_indices = sample_indices(start, end, segment_validation_count, half_step=True)
+        if frame_cache is None:
+            validate_tiles = load_tiles(validate_indices)
+            validate_flat, _detail = flatten_low_detail(validate_tiles)
+        else:
+            validate_flat = load_tiles(validate_indices, flattened=True)
+        evaluator = PaletteEvaluator(validate_flat)
+        local_active = int(local_stats["active_lines"])
+        local_score = score_palettes(
+            validate_flat, local_palettes[:local_active], evaluator=evaluator,
+            core_colors=int(local_stats["core_colors"]),
+        )
+        global_score = score_palettes(
+            validate_flat, pals_arr[:global_active], evaluator=evaluator,
+            core_colors=int(global_stats["core_colors"]),
+        )
+        improvement = global_score.score - local_score.score
+        relative = improvement / max(1.0, global_score.score)
+        per_pixel = improvement / max(1, len(validate_flat) * 64)
+        use_local = improvement > 0 and relative >= segment_rel and per_pixel >= segment_abs
+        selected.append(np.asarray(local_palettes if use_local else pals_arr, dtype=np.uint8))
+        segment_stats.append({
+            "start": int(start), "end": int(end),
+            "training_frames": len(train_indices),
+            "validation_frames": len(validate_indices),
+            "local": local_stats,
+            "local_score_per_pixel": local_score.summary()["score_per_pixel"],
+            "global_score_per_pixel": global_score.summary()["score_per_pixel"],
+            "relative_gain": relative,
+            "gain_per_pixel": per_pixel,
+            "selected": "local" if use_local else "global",
+        })
+
+    # Consecutive candidate segments that select the same palette need no CRAM
+    # switch and collapse to one frame_seg epoch automatically.
+    seg_pals = []
+    frame_seg[:] = -1
+    for (start, end), palettes in zip(segments, selected):
+        if not seg_pals or not np.array_equal(seg_pals[-1], palettes):
+            seg_pals.append(palettes)
+        frame_seg[start:end] = len(seg_pals) - 1
+    current = 0
+    for frame in range(n):
+        if frame_seg[frame] < 0:
+            frame_seg[frame] = current
+        else:
+            current = int(frame_seg[frame])
+    seg_bounds = [
+        frame for frame in range(1, n)
+        if frame_seg[frame] != frame_seg[frame - 1]
+    ]
+    stats = {
+        "algo": MOSAIC_GM,
+        "global": global_stats,
+        "global_candidates": [record for *_head, record in candidates],
+        "global_exact_all_frames": False,
+        "candidate_segments": len(segments),
+        "selected_segments": len(seg_pals),
+        "segments": segment_stats,
+    }
+    return pals_arr, seg_pals, frame_seg, seg_bounds, stats
+
+
+OUT = sim_work_dir()
+# 実機CAVCエンコード用の決定ログ出力先。既定off(mp4出力に一切影響しない・追加のみ)。
+# 毎フレームの「更新セル(cell,pal,key)」＋区間パレットを吐き、pack_streamが再生してCAVC化する。
+_EMIT_DEC_ENV = os.environ.get("CBRSIM_EMIT_DEC", "").strip()
+# Boolean-looking values select the conventional file beside the other sim
+# artifacts.  An explicit path remains supported for one-off comparisons.
+EMIT_DEC = (str(OUT / "decisions.pkl")
+            if _EMIT_DEC_ENV.lower() in {"1", "true", "yes", "on"}
+            else _EMIT_DEC_ENV)
+
+
+def _inline_boot_prefetch_slots(prefetch_slots, inline_count):
+    """Choose the boot requests carried by frame 0's inline payload.
+
+    The packer sorts the complete boot-prefetch suffix by slot, then
+    puts the first ``inline_count`` patterns in O_LOADS and the rest in the
+    direct-write sidecar. The allocator assigns free slots in ascending order,
+    so request order is also physical order during boot.
+    """
+    slots = tuple(int(slot) for slot in prefetch_slots)
+    count = max(0, min(int(inline_count), len(slots)))
+    return slots[:count]
+
+
+def apply_postplan_transfer_stats(stats, *, dma_runs, prefetch_cold):
+    """Publish final run counts without changing the raw-prefetch trace."""
+    table = np.asarray(stats)
+    runs = np.asarray(dma_runs, np.int64)
+    expected_prefetch = np.asarray(prefetch_cold, np.int64)
+    if table.ndim != 2 or table.shape[1] != len(STAT_COLUMNS):
+        raise ValueError(
+            "sim stats shape does not match the named column contract")
+    if runs.shape != (len(table),):
+        raise ValueError("post-plan DMA-run trace length differs from stats")
+    if expected_prefetch.shape != (len(table),):
+        raise ValueError("raw-prefetch trace length differs from stats")
+    table[:, STAT_COLUMN_INDEX["dma_runs"]] = runs
+    observed_prefetch = table[
+        :, STAT_COLUMN_INDEX["prefetch"]].astype(np.int64)
+    if not np.array_equal(observed_prefetch, expected_prefetch):
+        raise AssertionError(
+            "post-plan transfer stats changed the raw-prefetch trace")
+
+
+def border_weight_mask():
+    w = np.ones((TROWS, TCOLS), np.float64)
+    w[:BORDER_TILES, :] = BORDER_WEIGHT
+    w[-BORDER_TILES:, :] = BORDER_WEIGHT
+    w[:, :BORDER_TILES] = BORDER_WEIGHT
+    w[:, -BORDER_TILES:] = BORDER_WEIGHT
+    return w.reshape(-1)
+
+
+def flatten_low_detail(tiles):
+    """tiles (C,64,3) uint8 rgb333 -> (平坦化後, detail (C,))"""
+    if HAS_NUMBA:
+        return flatten_low_detail_numba(np.ascontiguousarray(tiles, dtype=np.uint8), FLATTEN_STD)
+    f = tiles.astype(np.float64)
+    detail = f.std(axis=1).mean(axis=1)
+    mean = f.mean(axis=1)
+    out = tiles.copy()
+    m = detail < FLATTEN_STD
+    out[m] = np.round(mean[m]).astype(np.uint8)[:, None, :]
+    return out, detail
+
+
+_SEG_UNIFORM_TOL_DEFAULT = float(os.environ.get("CBRSIM_SEG_UNIFORM_TOL", "24"))
+
+
+def _frame_features(path, include_luma=False):
+    """Decode one master frame into reusable palette and quantization data."""
+    with Image.open(path) as opened:
+        rgb_img = opened.convert("RGB")
+        image_u8 = np.asarray(rgb_img, dtype=np.uint8)
+        luma_u8 = np.asarray(rgb_img.convert("L"), dtype=np.uint8) if include_luma else None
+    uni_tol = float(os.environ.get("CBRSIM_SEG_UNIFORM_TOL", "24"))
+    if HAS_NUMBA:
+        dark, uniform, fade_probe = frame_metrics_numba(image_u8, uni_tol, TROWS, TCOLS)
+    else:
+        image = image_u8.astype(np.float64)
+        luminance = image @ np.array([.299, .587, .114])
+        dark = float((luminance < 32).mean())
+        distance = np.sqrt(((image - image.reshape(-1, 3).mean(0)) ** 2).sum(2))
+        uniform = float((distance < uni_tol).mean())
+        fade_probe = image_u8.reshape(
+            TROWS, TILE, TCOLS, TILE, 3
+        ).mean(axis=(1, 3)).reshape(C_CELLS, 3).astype(np.float32)
+
+    tiles = tile_blocks(to_rgb333(image_u8))
+    strengths = edge_strengths(tiles)
+    flattened, detail = flatten_low_detail(tiles)
+    flatten_mask = detail < FLATTEN_STD
+    # Low-detail tiles are solid after flattening, so one RGB333 colour is
+    # enough to reconstruct them without retaining a second full movie copy.
+    flat_color = flattened[:, 0].copy()
+    return (
+        tiles, strengths, detail.astype(np.float32),
+        flatten_mask, flat_color, fade_probe, dark, uniform, luma_u8,
+    )
+
+
+class FrameFeatureCache:
+    """One-decode source for palette learning and final quantization."""
+
+    def __init__(self, frames, workers=None, arrays=None, store_luma=False):
+        self.frames = list(frames)
+        n = len(self.frames)
+        empty = arrays.empty if arrays is not None else np.empty
+        self.tiles = empty((n, C_CELLS, 64, 3), dtype=np.uint8)
+        self.edge_strength = empty((n, C_CELLS, 64), dtype=np.uint8)
+        self.detail = empty((n, C_CELLS), dtype=np.float32)
+        self.flatten_mask = empty((n, C_CELLS), dtype=bool)
+        self.flat_color = empty((n, C_CELLS, 3), dtype=np.uint8)
+        self.fade_probe = empty((n, C_CELLS, 3), dtype=np.float32)
+        self.luma = empty((n, H, W), dtype=np.uint8) if (store_luma and n > 0) else None
+        dark = np.empty(n, dtype=np.float64)
+        uniform = np.empty(n, dtype=np.float64)
+
+        worker_count = min(12, n_workers()) if workers is None else max(1, int(workers))
+        print(
+            f"precompute palette frame features: {n} frames on "
+            f"{worker_count} threads ...",
+            flush=True,
+        )
+        if worker_count == 1:
+            results = (_frame_features(path, store_luma) for path in self.frames)
+            pool = None
+        else:
+            from concurrent.futures import ThreadPoolExecutor
+            pool = ThreadPoolExecutor(max_workers=worker_count)
+            # Bound outstanding decodes on Python versions without map buffersize.
+            # One slow PNG must not retain every later decoded frame in futures.
+            def bounded_results():
+                from collections import deque
+                pending = deque()
+                paths = iter(self.frames)
+                for _ in range(worker_count * 2):
+                    path = next(paths, None)
+                    if path is not None:
+                        pending.append(pool.submit(_frame_features, path, store_luma))
+                while pending:
+                    yield pending.popleft().result()
+                    path = next(paths, None)
+                    if path is not None:
+                        pending.append(pool.submit(_frame_features, path, store_luma))
+            results = bounded_results()
+        emit("features", 0, n)
+        try:
+            for index, result in enumerate(results):
+                emit("features", index + 1, n)
+                (self.tiles[index], self.edge_strength[index], self.detail[index],
+                 self.flatten_mask[index], self.flat_color[index],
+                 self.fade_probe[index],
+                 dark[index], uniform[index], luma_u8) = result
+                if self.luma is not None:
+                    self.luma[index] = luma_u8
+                if arrays is not None and index % 256 == 255:
+                    arrays.settle()
+        finally:
+            if pool is not None:
+                pool.shutdown(wait=True)
+        emit("palette")
+        self.segment_metrics = dark, uniform
+        resident = (
+            self.tiles.nbytes + self.edge_strength.nbytes + self.detail.nbytes
+            + self.flatten_mask.nbytes + self.flat_color.nbytes
+            + self.fade_probe.nbytes
+            + (self.luma.nbytes if self.luma is not None else 0)
+            + dark.nbytes + uniform.nbytes)
+        print(f"  palette frame cache: {resident / (1024 ** 2):.1f} MiB", flush=True)
+
+    @staticmethod
+    def _indices(indices):
+        if isinstance(indices, np.ndarray):
+            return indices.astype(np.int64, copy=False).reshape(-1)
+        return np.fromiter((int(index) for index in indices), dtype=np.int64)
+
+    def load_tiles(self, indices, flattened=False):
+        selected = self._indices(indices)
+        tiles = self.tiles[selected].reshape(-1, 64, 3)
+        if not flattened:
+            return tiles
+        result = tiles.copy()
+        mask = self.flatten_mask[selected].reshape(-1)
+        colors = self.flat_color[selected].reshape(-1, 3)
+        result[mask] = colors[mask, None, :]
+        return result
+
+    def load_training(self, indices):
+        selected = self._indices(indices)
+        tiles = self.tiles[selected].reshape(-1, 64, 3)
+        strengths = self.edge_strength[selected].reshape(-1, 64)
+        return tiles, strengths
+
+    def flattened_frame(self, index):
+        tiles = self.tiles[int(index)].copy()
+        mask = self.flatten_mask[int(index)]
+        tiles[mask] = self.flat_color[int(index), mask, None, :]
+        return tiles
+
+    def flattened_frames(self, start, end):
+        tiles = self.tiles[start:end].copy()
+        mask = self.flatten_mask[start:end]
+        tiles[mask] = self.flat_color[start:end][mask][:, None, :]
+        return tiles
+
+
+def assign_palette(flat_tiles, pals_arr, exclude_deep_black=False):
+    """flat_tiles (C,64,3) rgb333 -> assign (C,) 最良パレット(RGB二乗誤差が最小の面)。"""
+    keys = rgb333_keys(flat_tiles)
+    cost = np.stack([
+        palette_lut(pal, squared=True, exclude_deep_black=exclude_deep_black)[0]
+        for pal in pals_arr])
+    err = cost[:, keys].sum(2, dtype=np.int64).T               # (C,4)
+    return err.argmin(1).astype(np.int8)
+
+
+def idx_for(pixels, assign, pals_arr, exclude_deep_black=False):
+    """pixels (C,64,3) を、各セルの assign パレットで最近傍量子化 -> idx (C,64) 1..15"""
+    keys = rgb333_keys(pixels)
+    index = np.stack([
+        palette_lut(pal, squared=True, exclude_deep_black=exclude_deep_black)[1]
+        for pal in pals_arr])
+    return (index[assign[:, None], keys] + 1).astype(np.uint8)
+
+
+def render_cells(idx, assign, pals_arr):
+    """idx (C,64) 1..15, assign (C,) -> rgb888 (C,8,8,3)"""
+    C = idx.shape[0]
+    full16 = np.zeros((4, 16, 3), np.uint8)
+    full16[:, 1:] = pals_arr
+    rgb333 = full16[assign[:, None], idx]                       # (C,64,3)
+    return rgb333_to_rgb888(rgb333).reshape(C, TILE, TILE, 3)
+
+
+def reserve_fade_hud_colour(indices, assignments, palette):
+    """Keep P0/index15 out of movie pixels so DEBUG text stays visible."""
+
+    result = np.asarray(indices, np.uint8).copy()
+    assign = np.asarray(assignments)
+    pals = np.asarray(palette, np.int16)
+    if result.ndim != 2 or result.shape[1] != TILE * TILE:
+        raise ValueError("fade reference indices have an invalid shape")
+    if assign.shape != (len(result),) or pals.shape != (4, 15, 3):
+        raise ValueError("fade reference palette arrays have incompatible shapes")
+    replacement = 1 + int(np.argmin(np.sum(
+        (pals[0, :14] - pals[0, 14]) ** 2,
+        axis=1,
+    )))
+    p0 = assign == 0
+    result[p0] = np.where(result[p0] == 15, replacement, result[p0])
+    if np.any(result[p0] == 15):
+        raise AssertionError("fade reference still uses the DEBUG text colour")
+    return result
+
+
+def best_fade_palette(
+        palette, indices, assignments, target_rgb, preferred_scale):
+    """Choose the lowest-error RGB333 CRAM scale for one source frame."""
+
+    target = np.asarray(target_rgb, np.uint8)
+    best = None
+    seen = set()
+    for step in range(65):
+        scale = step / 64.0
+        candidate = fade_frames.scaled_palette(palette, scale)
+        key = candidate.tobytes()
+        if key in seen:
+            continue
+        seen.add(key)
+        rendered = render_cells(indices, assignments, candidate)
+        error = int(np.square(
+            rendered.astype(np.int32) - target.astype(np.int32),
+            dtype=np.int64,
+        ).sum())
+        score = (error, abs(scale - float(preferred_scale)), step)
+        if best is None or score < best[0]:
+            best = score, candidate
+    if best is None:
+        raise AssertionError("fade palette search produced no candidates")
+    return best[1]
+
+
+def own_pattern_cache_rgb(rgb):
+    """Return a compact owned RGB array for one cached 8x8 pattern.
+
+    ``plain_rgb[c]`` is a view. Keeping it in the pattern dictionary keeps its
+    complete per-frame backing array alive, which grows into hundreds of MiB on
+    long sources. Owning the small array also makes its shape explicit.
+    """
+    owned_rgb = np.array(rgb, dtype=np.uint8, order="C", copy=True)
+    if owned_rgb.shape != (TILE, TILE, 3):
+        raise ValueError(
+            f"pattern RGB shape {owned_rgb.shape}, expected {(TILE, TILE, 3)}")
+    return owned_rgb
+
+
+def pin_p0_debug_extremes(seg_pals):
+    """Put the darkest colour at P0/index1 and brightest at P0/index15.
+
+    This runs before quantisation. It only permutes the existing 4x15 CRAM
+    colours; no RGB333 value is created or changed. Moving colours between
+    palette rows can alter the best per-tile palette choice, so every frame is
+    quantised against the final grouping afterwards.
+    """
+    canonical = []
+    dark_swaps = []
+    bright_swaps = []
+    for seg, src in enumerate(seg_pals):
+        old = np.asarray(src, np.uint8)
+        if old.shape != (4, 15, 3):
+            raise ValueError(f"segment {seg} palette shape {old.shape}, expected (4, 15, 3)")
+        new = old.copy()
+
+        brightness = new.astype(np.int16).sum(axis=2)
+        darkest = int(brightness.min())
+        if int(brightness[0, 0]) == darkest:
+            dark_row, dark_slot = 0, 0
+        else:
+            dark_row, dark_slot = map(int, np.argwhere(brightness == darkest)[0])
+        new[0, 0], new[dark_row, dark_slot] = (
+            new[dark_row, dark_slot].copy(), new[0, 0].copy())
+
+        # Recompute after the first swap so the second source location remains
+        # exact even if P0/index1 originally held a globally brightest colour.
+        brightness = new.astype(np.int16).sum(axis=2)
+        brightest = int(brightness.max())
+        if int(brightness[0, 14]) == brightest:
+            bright_row, bright_slot = 0, 14
+        else:
+            bright_row, bright_slot = map(int, np.argwhere(brightness == brightest)[0])
+        new[0, 14], new[bright_row, bright_slot] = (
+            new[bright_row, bright_slot].copy(), new[0, 14].copy())
+
+        old_code = ((old[:, :, 0].astype(np.int16) << 6)
+                    | (old[:, :, 1].astype(np.int16) << 3)
+                    | old[:, :, 2].astype(np.int16))
+        new_code = ((new[:, :, 0].astype(np.int16) << 6)
+                    | (new[:, :, 1].astype(np.int16) << 3)
+                    | new[:, :, 2].astype(np.int16))
+        if not np.array_equal(np.sort(old_code, axis=None), np.sort(new_code, axis=None)):
+            raise AssertionError(f"segment {seg} colour multiset changed")
+        final_brightness = new.astype(np.int16).sum(axis=2)
+        if int(final_brightness[0, 0]) != int(final_brightness.min()):
+            raise AssertionError(f"segment {seg} P0 index1 is not globally darkest")
+        if int(final_brightness[0, 14]) != int(final_brightness.max()):
+            raise AssertionError(f"segment {seg} P0 index15 is not globally brightest")
+
+        canonical.append(new)
+        dark_swaps.append((dark_row, dark_slot + 1))
+        bright_swaps.append((bright_row, bright_slot + 1))
+
+    return canonical, {
+        "segments": len(canonical),
+        "dark_swapped_segments": sum(pos != (0, 1) for pos in dark_swaps),
+        "bright_swapped_segments": sum(pos != (0, 15) for pos in bright_swaps),
+        "dark_sources": dark_swaps,
+        "bright_sources": bright_swaps,
+    }
+
+
+def canonicalize_p0_index15(seg_pals, frame_seg, assigns, pidxs):
+    """Put a globally brightest nonzero colour at P0 index 15, losslessly.
+
+    Quantisation must run *before* this function with the original palette
+    order.  For each segment, the complete row containing the first globally
+    brightest RGB-sum colour is swapped with row 0, then that colour is swapped
+    with P0 slot 15.  Tile palette assignments and 1..15 pixel indices receive
+    the same permutations.  This avoids nearest-colour tie changes and proves
+    every quantised RGB333 pixel is identical.  Hardware index 0 stays fixed in
+    every row and is never part of either permutation.
+
+    Returns ``(canonical_palettes, stats)`` and updates ``assigns`` and
+    ``pidxs`` in place.
+    """
+    if len(assigns) != len(pidxs) or len(assigns) != len(frame_seg):
+        raise ValueError("palette canonicalization frame arrays have different lengths")
+
+    canonical = []
+    originals = []
+    row_remaps = []
+    index_remaps = []
+    row_swaps = []
+    index_swaps = []
+    for seg, src in enumerate(seg_pals):
+        old = np.asarray(src, np.uint8)
+        if old.shape != (4, 15, 3):
+            raise ValueError(f"segment {seg} palette shape {old.shape}, expected (4, 15, 3)")
+        new = old.copy()
+        brightness = old.astype(np.int16).sum(axis=2)
+        brightest = int(brightness.max())
+        # Avoid every permutation when the fixed destination is already tied
+        # for globally brightest.  Otherwise choose the first CRAM-order max,
+        # matching the old 68000 scanner's deterministic tie behaviour.
+        if int(brightness[0, 14]) == brightest:
+            src_row, src_slot = 0, 14
+        else:
+            src_row, src_slot = map(int, np.argwhere(brightness == brightest)[0])
+
+        row_remap = np.arange(4, dtype=np.uint8)          # old row -> new row
+        if src_row != 0:
+            new[[0, src_row]] = new[[src_row, 0]]
+            row_remap[0] = src_row
+            row_remap[src_row] = 0
+        index_remap = np.arange(16, dtype=np.uint8)       # old index -> new; 0 stays 0
+        if src_slot != 14:
+            new[0, [src_slot, 14]] = new[0, [14, src_slot]]
+            index_remap[src_slot + 1] = 15
+            index_remap[15] = src_slot + 1
+
+        # The two permutations preserve the complete 4x15 colour multiset,
+        # including duplicates, rather than merely its distinct set.
+        old_code = ((old[:, :, 0].astype(np.int16) << 6)
+                    | (old[:, :, 1].astype(np.int16) << 3)
+                    | old[:, :, 2].astype(np.int16))
+        new_code = ((new[:, :, 0].astype(np.int16) << 6)
+                    | (new[:, :, 1].astype(np.int16) << 3)
+                    | new[:, :, 2].astype(np.int16))
+        if not np.array_equal(np.sort(old_code, axis=None), np.sort(new_code, axis=None)):
+            raise AssertionError(f"segment {seg} colour multiset changed")
+        if int(new[0, 14].astype(np.int16).sum()) != brightest:
+            raise AssertionError(f"segment {seg} P0 index15 is not globally brightest")
+        if int(index_remap[0]) != 0:
+            raise AssertionError("reserved palette index 0 was remapped")
+
+        canonical.append(new)
+        originals.append(old.copy())
+        row_remaps.append(row_remap)
+        index_remaps.append(index_remap)
+        row_swaps.append((src_row, 0))
+        index_swaps.append((src_slot + 1, 15))
+
+    verified_pixels = 0
+    reassigned_tiles = 0
+    reindexed_pixels = 0
+    for i, (assign, idx) in enumerate(zip(assigns, pidxs)):
+        seg = int(frame_seg[i])
+        if seg < 0 or seg >= len(canonical):
+            raise ValueError(f"frame {i} refers to invalid palette segment {seg}")
+        assign = np.asarray(assign)
+        idx = np.asarray(idx)
+        if idx.shape[0] != assign.shape[0]:
+            raise ValueError(f"frame {i} assign/index cell count mismatch")
+        before_assign = assign.copy()
+        before_idx = idx.copy()
+        if before_idx.size and (int(before_idx.min()) < 1 or int(before_idx.max()) > 15):
+            raise AssertionError(f"frame {i} contains an index outside 1..15")
+        after_assign = row_remaps[seg][before_assign]
+        after_idx = before_idx.copy()
+        new_p0 = after_assign == 0
+        after_idx[new_p0] = index_remaps[seg][before_idx[new_p0]]
+
+        before_rgb = originals[seg][before_assign[:, None], before_idx - 1]
+        after_rgb = canonical[seg][after_assign[:, None], after_idx - 1]
+        if not np.array_equal(before_rgb, after_rgb):
+            raise AssertionError(f"frame {i} RGB changed while canonicalizing P0 index15")
+        assign[:] = after_assign
+        idx[:] = after_idx
+        reassigned_tiles += int((before_assign != after_assign).sum())
+        reindexed_pixels += int((before_idx != after_idx).sum())
+        verified_pixels += int(before_idx.size)
+
+    stats = {
+        "segments": len(canonical),
+        "row_swapped_segments": sum(a != b for a, b in row_swaps),
+        "index_swapped_segments": sum(a != b for a, b in index_swaps),
+        "reassigned_tiles": reassigned_tiles,
+        "reindexed_pixels": reindexed_pixels,
+        "verified_pixels": verified_pixels,
+        "row_swaps": row_swaps,
+        "index_swaps": index_swaps,
+    }
+    return canonical, stats
+
+
+# --- フレーム独立の量子化(読込→333化→タイル化→パレット割当→索引→レンダ)を並列化 ---
+# 差分/画質予算の本体は逐次(前フレーム状態に依存)だが、ここは各フレーム独立=実行時間の大半。
+# ワーカー数は PC の CPU コア数-2(動的)。env CBRSIM_WORKERS で上書き可、1で逐次。
+_WG = {}
+_PHASE_WORKERS = None
+
+
+def _quant_init(frames, seg_pals, frame_seg, seg_black_wanted=None):
+    _WG["frames"] = frames
+    _WG["seg_pals"] = seg_pals
+    _WG["frame_seg"] = frame_seg
+    _WG["seg_black_wanted"] = dict(seg_black_wanted or {})
+
+
+def _quant_one(i):
+    # 重い部分(割当/索引)だけ並列で。plain_rgb は逐次側で render_cells(軽い)＝IPCを小さく保つ。
+    seg = int(_WG["frame_seg"][i])
+    cur_pals = _WG["seg_pals"][seg]
+    no_black = not _WG.get("seg_black_wanted", {}).get(seg, True)
+    image_u8 = np.asarray(Image.open(_WG["frames"][i]).convert("RGB"))
+    m333 = to_rgb333(image_u8)
+    flat, detail = flatten_low_detail(tile_blocks(m333))
+    if PAL_ALGO == MOSAIC_GM and PAL_SEAM_WEIGHT > 0:
+        assign, pidx = coherent_assign_idx(
+            flat, cur_pals, TROWS, TCOLS,
+            seam_weight=PAL_SEAM_WEIGHT, iterations=PAL_SEAM_ITERATIONS,
+            exclude_deep_black=no_black)
+    else:
+        assign = assign_palette(flat, cur_pals, exclude_deep_black=no_black)
+        pidx = idx_for(flat, assign, cur_pals, exclude_deep_black=no_black)
+    return detail.astype(np.float32), assign, pidx
+
+
+def _quant_one_flat(i):
+    # GPU モード用: 割当/索引は GPU 側でやるので、ここは読込→333化→タイル化→平坦化まで。
+    # 各ワーカーは cupy に触れない(fork と CUDA は両立しない)。flat を親へ返す。
+    m333 = to_rgb333(np.asarray(Image.open(_WG["frames"][i]).convert("RGB")))
+    flat, detail = flatten_low_detail(tile_blocks(m333))
+    return detail.astype(np.float32), flat.astype(np.uint8)
+
+
+def n_workers():
+    if _PHASE_WORKERS is not None:
+        return _PHASE_WORKERS
+    return resource_tokens.requested_cpu_workers()
+
+
+def _gpu_requested():
+    return os.environ.get(
+        "CBRSIM_GPU", "1").strip().lower() not in {
+        "0", "off", "false", "no",
+    }
+
+
+@contextmanager
+def _parallel_phase(
+    name,
+    *,
+    worker_limit=None,
+    use_gpu=False,
+    gpu_worker_limit=None,
+):
+    """Reserve exactly the CPU/GPU capacity this parallel stage will use."""
+
+    global _PHASE_WORKERS
+    gpu_lease = None
+    cpu_lease = None
+    gpu_on = False
+    try:
+        if use_gpu and _gpu_requested():
+            print(f"{name}: waiting for GPU token ...", flush=True)
+            gpu_lease = resource_tokens.acquire_tokens("gpu")
+            import gpu_quant
+            gpu_on = gpu_quant.enabled()
+            if not gpu_on:
+                gpu_lease.release()
+                gpu_lease = None
+        limit = worker_limit
+        if (gpu_on and gpu_worker_limit is not None
+                and "CBRSIM_WORKERS" not in os.environ):
+            limit = (
+                gpu_worker_limit if limit is None
+                else min(limit, gpu_worker_limit)
+            )
+        workers = resource_tokens.requested_cpu_workers(limit=limit)
+        print(
+            f"{name}: waiting for {workers} CPU token(s)"
+            f"{' + 1 GPU token' if gpu_on else ''} ...",
+            flush=True,
+        )
+        cpu_lease = resource_tokens.acquire_tokens("cpu", count=workers)
+        _PHASE_WORKERS = workers
+        print(
+            f"{name}: resource grant CPU={workers}"
+            f" GPU={1 if gpu_on else 0}",
+            flush=True,
+        )
+        yield workers, gpu_on
+    finally:
+        _PHASE_WORKERS = None
+        if cpu_lease is not None:
+            cpu_lease.release()
+        if gpu_lease is not None:
+            gpu_lease.release()
+
+
+def quant_worker_count(gpu_enabled, requested, override_present=False):
+    """Keep the verified GPU feeder width unless a diagnostic overrides it."""
+    requested = max(1, int(requested))
+    return requested if override_present or not gpu_enabled else min(requested, 4)
+
+
+def quant_pool_start_method(gpu_enabled):
+    """Choose a safe process start method for the quantization feeder pool.
+
+    GPU palette work initializes CUDA in the parent before this pool starts.
+    Forking that live CUDA process can corrupt CPython/CUDA state, so GPU runs
+    must start clean worker interpreters. CPU-only runs retain the cheaper fork
+    path because they have no device context to inherit.
+    """
+    import multiprocessing as mp
+    return ("fork" if not gpu_enabled and "fork" in mp.get_all_start_methods()
+            else "spawn")
+
+
+def precompute_quant(frames, seg_pals, frame_seg, frame_cache=None,
+                     seg_black_wanted=None, arrays=None):
+    """各フレームの (detail, assign, plain_idx, plain_rgb) を並列に前計算して返す。"""
+    n = len(frames)
+    import gpu_quant
+    gpu_on = gpu_quant.enabled()
+    w = quant_worker_count(
+        gpu_on, n_workers(), override_present="CBRSIM_WORKERS" in os.environ)
+    emit("quant", 0, n)
+    empty = arrays.empty if arrays is not None else np.empty
+    details = empty((n, C_CELLS), np.float32)
+    assigns = empty((n, C_CELLS), np.int8)
+    pidxs = empty((n, C_CELLS, 64), np.uint8)
+    if gpu_on:
+        # CPU(並列)で読込/333化/タイル化 → GPU で割当/索引。imap で両者を重ねる
+        # (ワーカーが flat を出す傍から親GPUが処理＝CPU I/OとGPU計算を並行)。
+        if frame_cache is None:
+            print(
+                f"precompute quantization: {n} frames, "
+                f"CPU load x{w} + GPU assign/idx ...",
+                flush=True,
+            )
+        cache = gpu_quant.PalCache()
+        if frame_cache is not None:
+            print(
+                f"precompute quantization: {n} cached frames + GPU assign/idx ...",
+                flush=True,
+            )
+        wanted = dict(seg_black_wanted or {})
+        if frame_cache is not None:
+            coherent_shape = ((TROWS, TCOLS) if PAL_ALGO == MOSAIC_GM else None)
+            batch_limit = 64
+            i = 0
+            while i < n:
+                emit("quant", i, n)
+                seg = int(frame_seg[i])
+                end = min(n, i + batch_limit)
+                while end > i + 1 and np.any(frame_seg[i:end] != seg):
+                    mismatch = int(np.flatnonzero(frame_seg[i:end] != seg)[0])
+                    end = i + mismatch
+                details[i:end] = frame_cache.detail[i:end]
+                flats = frame_cache.flattened_frames(i, end)
+                assigns[i:end], pidxs[i:end] = gpu_quant.assign_idx_batch(
+                    flats, seg, seg_pals, cache,
+                    coherent_shape=coherent_shape,
+                    seam_weight=PAL_SEAM_WEIGHT,
+                    seam_iterations=PAL_SEAM_ITERATIONS,
+                    exclude_deep_black=not wanted.get(seg, True))
+                if arrays is not None and (end % 256 == 0 or i // 256 != (end - 1) // 256):
+                    arrays.settle()
+                i = end
+        elif w > 1:
+            import multiprocessing as mp
+            with mp.get_context(quant_pool_start_method(gpu_on)).Pool(
+                    w, initializer=_quant_init, initargs=(frames, seg_pals, frame_seg)) as pool:
+                for i, (det, flat) in enumerate(
+                        pool.imap(_quant_one_flat, range(n), chunksize=8)):
+                    details[i] = det
+                    assigns[i], pidxs[i] = gpu_quant.assign_idx_one(
+                        flat, int(frame_seg[i]), seg_pals, cache,
+                        coherent_shape=((TROWS, TCOLS) if PAL_ALGO == MOSAIC_GM else None),
+                        seam_weight=PAL_SEAM_WEIGHT,
+                        seam_iterations=PAL_SEAM_ITERATIONS,
+                        exclude_deep_black=not wanted.get(
+                            int(frame_seg[i]), True))
+        else:
+            _quant_init(frames, seg_pals, frame_seg)
+            for i in range(n):
+                det, flat = _quant_one_flat(i)
+                details[i] = det
+                assigns[i], pidxs[i] = gpu_quant.assign_idx_one(
+                    flat, int(frame_seg[i]), seg_pals, cache,
+                    coherent_shape=((TROWS, TCOLS) if PAL_ALGO == MOSAIC_GM else None),
+                    seam_weight=PAL_SEAM_WEIGHT,
+                    seam_iterations=PAL_SEAM_ITERATIONS,
+                    exclude_deep_black=not wanted.get(int(frame_seg[i]), True))
+        if arrays is not None:
+            arrays.settle()
+        return (details, assigns, pidxs)
+
+    print(f"precompute quantization: {n} frames on {w} workers ...", flush=True)
+    def collect(results):
+        for i, (detail, assign, pidx) in enumerate(results):
+            emit("quant", i + 1, n)
+            details[i], assigns[i], pidxs[i] = detail, assign, pidx
+            if arrays is not None and i % 256 == 255:
+                arrays.settle()
+
+    if w > 1:
+        import multiprocessing as mp
+        with mp.get_context(quant_pool_start_method(False)).Pool(
+                w, initializer=_quant_init,
+                initargs=(frames, seg_pals, frame_seg, seg_black_wanted)) as pool:
+            collect(pool.imap(_quant_one, range(n), chunksize=8))
+    else:
+        _quant_init(frames, seg_pals, frame_seg, seg_black_wanted)
+        collect(map(_quant_one, range(n)))
+    if arrays is not None:
+        arrays.settle()
+    return details, assigns, pidxs
+
+
+class FadeDeadlineInfeasible(SystemExit):
+    """A fade preparation deadline could not complete in the decision replay.
+
+    The runner treats this as a re-plan request: the failed shot's anchor is
+    demoted and the encode restarts without that fade. Deriving from
+    SystemExit keeps a non-retrying caller failing loudly with the full
+    diagnostics.
+    """
+
+    def __init__(self, anchor, message):
+        super().__init__(message)
+        self.anchor = int(anchor)
+
+
+def main(demoted_fade_anchors=frozenset(), arrays=None):
+    global DEDITHER_VF, RAW_VF
+    if (sys.version_info[:3] == (3, 14, 4)
+            and np.__version__ == "2.5.1"):
+        raise SystemExit(
+            "unsafe numeric runtime: CPython 3.14.4 + NumPy 2.5.1 corrupted "
+            "long sim runs on this host. Bootstrap the locked GPU environment "
+            "and run tools/python.sh --gpu tools/sim.py (NumPy 2.3.5).")
+    if CONFIG_PROFILE is not None:
+        print(f"encode profile: {CONFIG_PROFILE.path} sha256={CONFIG_PROFILE.sha256}")
+    extraction = {**os.environ, "CBRSIM_SRC": SRC, "CBRSIM_FPS": FPS_STR,
+                  "CBRSIM_DURATION": DURATION, "CBRSIM_W": str(W),
+                  "CBRSIM_H": str(H), "CBRSIM_AUDIO_RATE": str(AUDIO_RATE)}
+    DEDITHER_VF, RAW_VF = astra_extract.filters(extraction)
+    # Stage timing uses the same short names as ENCODE.md.
+    _t_all = time.perf_counter()
+    _phases = []
+
+    def _mark(name, t0):
+        dt = time.perf_counter() - t0
+        _phases.append((name, dt))
+        return time.perf_counter()
+    _t = time.perf_counter()
+
+    emit("extract")
+    # Extract: create the master, comparison, and audio inputs.
+    # CBRSIM_REUSE=1: 既に展開済みの master/raw/audio を再利用し ffmpeg 展開を省く
+    # (レイアウト調整でパネルだけ描き直したいとき用。OUTは丸ごとクリアしない)。
+    reuse = (
+        os.environ.get("CBRSIM_REUSE", "0").strip().lower() not in {
+        "", "0", "false", "no", "off",
+        }
+    )
+    master_dir = OUT / "master"     # ディザ除去済み(量子化入力)
+    raw_dir = OUT / "raw"           # 生のオリジナル(比較TR用)
+    cached = reuse and any(master_dir.glob("*.png")) and any(raw_dir.glob("*.png"))
+    if cached:
+        print("CBRSIM_REUSE: cached master/raw/audio を再利用(ffmpeg展開をスキップ)")
+    else:
+        with _parallel_phase("Extract") as (extract_workers, _gpu_on):
+            prepare_dir(OUT, clean=True)
+            prepared = os.environ.get("ASTRA_PREPARED_INPUT")
+            if prepared and SOURCE_RANGE:
+                astra_extract.materialize(Path(prepared), OUT, SOURCE_RANGE,
+                                          FPS_STR, AUDIO_RATE, AUDIO_FILE)
+            else:
+                astra_extract.extract(OUT, extraction, DEDITHER_VF, RAW_VF,
+                                      workers=extract_workers, bounds=SOURCE_RANGE,
+                                      audio_name=AUDIO_FILE)
+            if PREPROCESS_AUTO_RANGE:
+                masters = sorted(master_dir.glob("*.png"))
+                black, white = auto_range.detect_range(
+                    auto_range.scan_histogram(masters))
+                if (black, white) == (0, 255):
+                    print("auto_range: no dominant near-endpoint spike; "
+                          "levels unchanged")
+                else:
+                    print(f"auto_range: stretching black={black} "
+                          f"white={white} to 0..255 (master+raw)")
+                    auto_range.rewrite_files(
+                        masters if DEDITHER_VF == RAW_VF else masters + sorted(raw_dir.glob("*.png")),
+                        auto_range.build_lut(black, white),
+                        workers=extract_workers)
+    _t = _mark("Extract", _t)
+    frames = sorted(master_dir.glob("*.png"))
+    n = len(frames)
+    if SOURCE_RANGE is not None and n != SOURCE_RANGE[1] - SOURCE_RANGE[0]:
+        raise ValueError(f"source range {SOURCE_RANGE} produced only {n} frames")
+    wordram_layout = pattern_supply.word_ram_layout(
+        n, C_CELLS, MAX_COLD)
+    if ACTIVE_TILES < C_CELLS:
+        ever_nonblack = np.zeros((TROWS, TCOLS), dtype=bool)
+        for frame_path in frames:
+            image = np.asarray(Image.open(frame_path).convert("RGB"), dtype=np.uint8)
+            tiles = image.reshape(TROWS, TILE, TCOLS, TILE, 3).transpose(0, 2, 1, 3, 4)
+            ever_nonblack |= np.any(tiles != 0, axis=(2, 3, 4))
+        measured_active_tiles = int(ever_nonblack.sum())
+        if measured_active_tiles != ACTIVE_TILES:
+            raise SystemExit(
+                f"configured active_tiles={ACTIVE_TILES}, but the master frames contain "
+                f"{measured_active_tiles} tiles that are ever non-black")
+    print(f"  {n} frames @ {W}x{H} ({TCOLS}x{TROWS}={C_CELLS} cells, "
+          f"active={ACTIVE_TILES})")
+    frame_cold_caps = np.asarray(
+        av_config.frame_cold_caps(n, FPS, _COLD_CAP_REQUEST), np.int64)
+    print(f"  cold cap={COLD_CAP_SPEC} (ceiling {MAX_COLD}): profile; "
+          f"fps={FPS:g}")
+
+    # The source WAV remains the packer's input.  Analysis must instead audition
+    # the exact stream reconstructed by the Sub CPU and quantized for RF5C164.
+    # Give the preview WAV one chunk per source-video frame so its samples remain
+    # aligned with the 30/24/15 fps analysis timeline.
+    import wave
+    source_path = OUT / AUDIO_FILE
+    with wave.open(str(source_path), "rb") as wav:
+        if wav.getnchannels() != 1 or wav.getsampwidth() != 2:
+            raise SystemExit(
+                f"ADPCM source WAV must be mono s16: {source_path}")
+        if wav.getframerate() != AUDIO_RATE:
+            raise SystemExit(
+                f"ADPCM source WAV rate is {wav.getframerate()}, "
+                f"expected {AUDIO_RATE}")
+        raw = wav.readframes(wav.getnframes())
+    source_pcm = np.frombuffer(raw, "<i2").copy()
+    target_samples = n * AUDIO_PCM_BYTES
+    retimed = ima_adpcm.retime_pcm_s16(source_pcm, target_samples)
+    _controls, rf5_chunks = ima_adpcm.encode_decode_chunks(
+        retimed, AUDIO_PCM_BYTES)
+    playback_pcm = ima_adpcm.sign_magnitude_to_pcm16(b"".join(rf5_chunks))
+    playback_path = OUT / AUDIO_PLAYBACK_FILE
+    with wave.open(str(playback_path), "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(AUDIO_PLAYBACK_RATE)
+        wav.writeframes(playback_pcm.astype("<i2", copy=False).tobytes())
+    print(
+        f"  ADPCM playback model: {len(source_pcm)} -> {len(retimed)} samples, "
+        f"IMA decode + RF5C164 8-bit -> {playback_path.name} "
+        f"@ {AUDIO_PLAYBACK_RATE}Hz")
+    del raw, source_pcm, retimed, _controls, rf5_chunks, playback_pcm
+
+    # PRG先読みパッチ: {frame_idx: set(pattern_key)}。カット到達時にそのセル群を
+    # バッファから適用する。パターンもcell->tile対応も事前ロード済みなのでCDバイト0。
+    prg_patch = {}
+    if PRG_PRELOAD_PATH and Path(PRG_PRELOAD_PATH).exists():
+        import pickle
+        prg_patch = pickle.load(open(PRG_PRELOAD_PATH, "rb"))
+        uniq = len(set().union(*prg_patch.values())) if prg_patch else 0
+        print(f"  PRG先読み(patch): {len(prg_patch)}カット, distinct {uniq} tiles "
+              f"({uniq*PATTERN_BYTES/1024:.0f}KB) をロード時バッファ")
+
+    # Palette: train the CRAM palette segments.
+    print(
+        f"training palettes ({PAL_ALGO})  "
+        f"DITHER={OUTPUT_DITHER} SEGPAL={SEGPAL_ON} NEAR={NEAR_ON} ...")
+    emit("features")
+    need_motion_luma = (
+        os.environ.get("CBRSIM_PRIORITIZE_MOTION", "0") == "1"
+        or os.environ.get("CBRSIM_SMOOTH_MOTION_FALLBACK", "0") == "1"
+        or os.environ.get("CBRSIM_MOTION_COMPENSATION", "0") == "1"
+    )
+    with _parallel_phase(
+            "Palette", worker_limit=12, use_gpu=True):
+        frame_cache = FrameFeatureCache(frames, arrays=arrays, store_luma=need_motion_luma)
+        try:
+            _global_pals, seg_pals, frame_seg, seg_bounds, palette_stats = segment_and_train(
+                frames, frame_cache=frame_cache)
+        except Exception as error:
+            import gpu_quant
+            if not gpu_quant.is_cuda_error(error):
+                raise
+            print(f"CUDA falló al entrenar paletas. Se continúa por CPU: {error}", flush=True)
+            gpu_quant.disable()
+            _global_pals, seg_pals, frame_seg, seg_bounds, palette_stats = segment_and_train(
+                frames, frame_cache=frame_cache)
+    if frame_cache is not None:
+        del frame_cache.edge_strength
+        if arrays is not None:
+            arrays.settle()
+        fade_probes = frame_cache.fade_probe
+        fade_dark = frame_cache.segment_metrics[0]
+    else:
+        fade_probes = np.empty((n, C_CELLS, 3), np.float32)
+        fade_dark = np.empty(n, np.float64)
+        for frame, path in enumerate(frames):
+            features = _frame_features(path)
+            fade_probes[frame] = features[5]
+            fade_dark[frame] = features[6]
+    fade_candidates = fade_frames.detect_fade_shots(
+        fade_probes, fade_dark, spatial_shape=(TROWS, TCOLS))
+    fade_layout = fade_frames.build_layout(
+        fade_candidates,
+        frame_seg,
+        max_segments=av_config.PALTAB_MAX_SEG,
+    )
+    original_seg_pals = seg_pals
+    seg_pals = [
+        np.asarray(original_seg_pals[source], np.uint8).copy()
+        for source in fade_layout.palette_sources
+    ]
+    frame_seg = fade_layout.frame_segments
+    seg_bounds = [
+        frame for frame in range(1, n)
+        if frame_seg[frame] != frame_seg[frame - 1]
+    ]
+    palette_stats["fade_detection"] = {
+        "candidate_shots": len(fade_candidates),
+        "selected_shots": len(fade_layout.shots),
+        "kinds": {
+            kind: sum(shot.kind == kind for shot in fade_layout.shots)
+            for kind in ("in", "out", "in_out")
+        },
+        "anchors": list(fade_layout.anchors),
+        "restorations": list(fade_layout.restorations),
+    }
+    palette_stats["spatial_assignment"] = {
+        "enabled": bool(PAL_ALGO == MOSAIC_GM and PAL_SEAM_WEIGHT > 0),
+        "seam_weight": float(PAL_SEAM_WEIGHT),
+        "iterations": int(PAL_SEAM_ITERATIONS),
+    }
+    if SEGPAL_ON:
+        print(f"  per-segment palettes: {len(seg_pals)}区間, CRAM差替 {len(seg_bounds)}点 "
+              f"(candidates={palette_stats['candidate_segments']})")
+    print(
+        "  automatic black fades: "
+        f"detected={len(fade_candidates)} selected={len(fade_layout.shots)} "
+        f"kinds={palette_stats['fade_detection']['kinds']} "
+        f"anchors={list(fade_layout.anchors)}; "
+        "no source time ranges",
+        flush=True,
+    )
+    _t = _mark("Palette", _t)
+
+    # Scroll: source-wide automatic detection only.  No profile time range or
+    # hand-authored frame interval participates in adoption.  Adoption needs
+    # the full-width 40-column grid: HScroll shifts every scanline, so a
+    # narrower centered grid would roll its side borders, while a letterboxed
+    # 40xN grid keeps its top/bottom border rows uniform and the player DMAs
+    # the same PC_ROW0-offset 64-column band it stages for normal frames.
+    # Vertical windows roll the 64x32 plane through all 32 rows behind the
+    # full-screen viewport, so they additionally need the 28-row grid; a
+    # letterboxed grid would scroll its letterbox rows on screen.
+    # CBRSIM_SCROLL=0 is a diagnostic isolation knob: it disables adoption so
+    # the ordinary no-scroll allocation path can be A/B tested on the same
+    # source (e.g. reproducing issue #113 without a rolling plane).
+    scroll_supported = bool(
+        TCOLS == av_config.SCREEN_COLS
+        and PATTERN_SUPPLY_ON
+        and os.environ.get("CBRSIM_SCROLL", "1") != "0"
+    )
+    scroll_axes = (
+        (scroll_frames.AXIS_HORIZONTAL, scroll_frames.AXIS_VERTICAL)
+        if TROWS == scroll_plan.VERTICAL_VIEWPORT_ROWS
+        else (scroll_frames.AXIS_HORIZONTAL,))
+    scroll_estimates = ()
+    scroll_segments = ()
+    scroll_measurements = {}
+    scroll_windows = ()
+    scroll_states = {}
+    scroll_active = np.zeros(n, np.bool_)
+    scroll_vertical = np.zeros(n, np.bool_)
+    scroll_positions = np.zeros((n, 2), np.int16)
+    scroll_anchor_guard_counts = {}
+    if scroll_supported and n > 1:
+        emit("scroll")
+        raw_frames = sorted(raw_dir.glob("*.png"))
+        if len(raw_frames) != n:
+            raise SystemExit(
+                "automatic scroll detection requires one raw frame per master")
+        print(
+            "automatic scroll detection: source-wide axis-only block voting; "
+            "no source time ranges ...",
+            flush=True,
+        )
+        with _parallel_phase("Scroll", worker_limit=1, use_gpu=True):
+            try:
+                scroll_estimates, scroll_segments = scroll_frames.detect_segments(
+                    raw_frames, backend="auto")
+            except Exception as error:
+                import gpu_quant
+                if not gpu_quant.is_cuda_error(error):
+                    raise
+                print(f"CUDA falló al analizar el desplazamiento. Se continúa por CPU: {error}", flush=True)
+                scroll_estimates, scroll_segments = scroll_frames.detect_segments(
+                    raw_frames, backend="cpu")
+            axis_segments = tuple(
+                segment for segment in scroll_segments
+                if segment.axis in scroll_axes)
+            for segment in axis_segments:
+                for row in scroll_frames.measure_segment_adoption(
+                        segment, frames):
+                    scroll_measurements[int(row.frame)] = row
+        forbidden_scroll_frames = set(int(value) for value in seg_bounds)
+        forbidden_scroll_frames.update(
+            int(value) for value in fade_layout.preparation_frames)
+        forbidden_scroll_frames.update(
+            int(value) for value in np.flatnonzero(
+                np.asarray(fade_layout.reference_frames) >= 0))
+        scroll_windows = scroll_plan.select_windows(
+            axis_segments,
+            scroll_measurements,
+            fps=FPS,
+            forbidden_frames=forbidden_scroll_frames,
+        )
+        scroll_states = scroll_plan.build_frame_states(
+            scroll_windows, columns=TCOLS, rows=TROWS)
+        # World-mosaic guard sampling: every guard edge is quantized from the
+        # first window frame where that edge is completely inside the source
+        # viewport. The pan premise makes world content static, so the fully
+        # revealed pixels are the exact future display; the guard key then
+        # depends on neither runtime plane state nor the reveal phase, stays
+        # identical while the same edge repeats, and survives the cell's later
+        # promotion into the primary viewport.
+        scroll_guard_full_view = {}
+        for window in scroll_windows:
+            for frame in range(window.anchor + 1, window.end + 1):
+                state = scroll_states[frame]
+                if not state.guard_cells:
+                    continue
+                if window.axis == scroll_frames.AXIS_HORIZONTAL:
+                    low = min(column for _row, column in state.world_guard)
+                    high = max(column for _row, column in state.world_guard)
+                    span = TCOLS * TILE
+
+                    def _fully(position, low=low, high=high, span=span):
+                        return (low * TILE >= -position
+                                and (high + 1) * TILE <= -position + span)
+                    axis_position = (
+                        lambda probe: scroll_states[probe].hscroll)
+                else:
+                    low = min(row for row, _column in state.world_guard)
+                    high = max(row for row, _column in state.world_guard)
+                    span = TROWS * TILE
+
+                    def _fully(position, low=low, high=high, span=span):
+                        return (low * TILE >= -position
+                                and (high + 1) * TILE <= -position + span)
+                    axis_position = (
+                        lambda probe: scroll_states[probe].vscroll)
+                sample = window.end
+                for probe in range(frame, window.end + 1):
+                    if _fully(int(axis_position(probe))):
+                        sample = probe
+                        break
+                scroll_guard_full_view[frame] = int(sample)
+        for window in scroll_windows:
+            # The anchor remains an ordinary frame.  The first moving frame
+            # seeds the rolling shadow and carries the first absolute control.
+            for frame in range(window.anchor + 1, window.end + 1):
+                state = scroll_states[frame]
+                scroll_active[frame] = True
+                scroll_vertical[frame] = (
+                    window.axis == scroll_frames.AXIS_VERTICAL)
+                scroll_positions[frame, 0] = state.hscroll
+                scroll_positions[frame, 1] = state.vscroll
+            first_state = scroll_states[window.anchor + 1]
+            scroll_anchor_guard_counts[int(window.anchor)] = len(
+                first_state.guard_cells)
+        detection_path = OUT / "scroll_detection.tsv"
+        selected_by_frame = {
+            frame: window
+            for window in scroll_windows
+            for frame in range(window.anchor + 1, window.end + 1)
+        }
+        with detection_path.open("w", encoding="utf-8", newline="\n") as stream:
+            stream.write(
+                "frame\taxis\tdelta\tsupport\tresidual\tgain\taccepted\t"
+                "fixed_changed\tscroll_changed\tfixed_cost\tscroll_cost\t"
+                "overlap_rmse\tselected\n")
+            for row in scroll_estimates:
+                adoption = scroll_measurements.get(int(row.frame))
+                stream.write(
+                    f"{int(row.frame)}\t{row.axis}\t{int(row.delta)}\t"
+                    f"{float(row.support):.6f}\t{float(row.residual):.6f}\t"
+                    f"{float(row.gain):.6f}\t{int(bool(row.accepted))}\t"
+                    f"{int(adoption.fixed_changed) if adoption else 0}\t"
+                    f"{int(adoption.scroll_changed) if adoption else 0}\t"
+                    f"{float(adoption.fixed_cost) if adoption else 0.0:.2f}\t"
+                    f"{float(adoption.scroll_cost) if adoption else 0.0:.2f}\t"
+                    f"{float(adoption.overlap_rmse) if adoption else 0.0:.6f}\t"
+                    f"{int(int(row.frame) in selected_by_frame)}\n")
+        print(
+            "  automatic scroll: "
+            f"axis_segments={len(axis_segments)} "
+            f"adopted={len(scroll_windows)} "
+            f"controls={int(scroll_active.sum())}; "
+            f"windows={[ (w.anchor, w.end, w.axis, w.final_position) for w in scroll_windows ]}; "
+            f"trace={detection_path}",
+            flush=True,
+        )
+    else:
+        print(
+            "automatic scroll: disabled; requires the full-width 40-column "
+            "grid with pattern supply",
+            flush=True,
+        )
+
+    border_mask = border_weight_mask()
+    border_bool = border_mask < 1.0        # 外周2タイル(True)。ここのMissは飢餓に数えない
+    # 中央距離(同点tie-break用): 画面中心からの二乗距離。小さい=中央=優先。
+    _rr, _cc = np.mgrid[0:TROWS, 0:TCOLS].astype(np.float64)
+    center_dist = ((_rr - (TROWS - 1) / 2) ** 2 + (_cc - (TCOLS - 1) / 2) ** 2).reshape(-1)
+
+    # --- 状態 ---
+    cur_rgb = np.zeros((C_CELLS, TILE, TILE, 3), np.uint8)      # 表示中の各セル
+    cur_key = [None] * C_CELLS          # 表示中パターン(idx bytes)
+    cur_pal = np.full(C_CELLS, -1, np.int16)
+    committed_plain = [None] * C_CELLS  # 内容変化検出用: 直近commitのplainキー(Flbkは表示した近似キー)
+    import tile_alloc
+    from tile_alloc import (
+        FrameTransitionGuard,
+        TileAllocator,
+        cold_transfer_order,
+    )
+    # 共有割り当て(連続, pack と同一コード)。これが residency の真の源=pack の realized と一致=cap=realized。
+    # 判定は前フレーム末の状態を参照し、割り当て(スロット付与+追い出し)は各フレーム末に cell順で実行
+    # (=pack の resolve と同一順)。VRAM_TILES=pack POOL。
+    scroll_plane_enabled = bool(np.any(scroll_active))
+    plane_state_cells = (
+        shadow_updates.SCROLL_PLANE_CELLS
+        if scroll_plane_enabled else C_CELLS)
+    normal_plane_cells = (
+        scroll_plan.normal_plane_cells(TCOLS, TROWS)
+        if scroll_plane_enabled else tuple(range(C_CELLS)))
+    alloc = TileAllocator(C_CELLS, VRAM_TILES, 1)
+    allocator_expanded = False
+    ref_count = {}                       # pattern key -> 参照セル数(repoint用に保持, residencyはallocが真)
+    l3 = {}                             # L3(PRG-RAM) victim cache: pattern key -> last_used frame
+    pat_rgb = {}                        # 近似dedup: pattern key -> 代表rgb(8,8,3) uint8
+    pat_colors = {}                     # pattern key -> rendered RGB333 colour keys (64,) uint16
+    pat_pal = {}                        # pattern key -> 表示パレット(assign)
+    pat_seg = {}                        # pattern key -> このタイルの index列を量子化した区間(パレットエポック)。
+                                        # 区間跨ぎのNear/near_keep流用は、旧区間の index列を新CRAMで
+                                        # 引くと虹色ゴミになる(harness/palette_flashで実証)。cur_segと一致
+                                        # するタイルだけ流用可。dedup(fresh keyが常駐keyと一致)は index列が
+                                        # そのまま新区間の量子化なので安全=対象外。
+    # Keep the chronological occurrence order, including reloads of a key.
+    # Each frame indexes only patterns actually resident in VRAM.
+    pattern_history = defaultdict(list)
+    occurrence = 0
+
+    def cache_pattern(key, rgb, pal, seg):
+        if not isinstance(key, bytes) or len(key) != 64:
+            length = len(key) if hasattr(key, "__len__") else "unknown"
+            raise ValueError(
+                f"pattern key must be exactly 64 bytes, got "
+                f"{type(key).__name__} length {length}")
+        cached_rgb = own_pattern_cache_rgb(rgb)
+        pat_rgb[key] = cached_rgb
+        pat_colors[key] = rendered_color_keys(cached_rgb).reshape(64)
+        pat_pal[key] = int(pal)
+        pat_seg[key] = int(seg)
+
+    def touch(key, fi):
+        pass                            # residency は alloc が真(コマ末に cell順で place)
+
+    def demote_to_l3(key, t):
+        if L3_TILES <= 0:
+            return
+        l3[key] = t
+        while len(l3) > L3_TILES:
+            del l3[min(l3, key=l3.get)]
+
+    def ensure_capacity(fi):
+        pass                            # 追い出しは alloc.place が担う(コマ末の cell順割り当て)
+
+    # CRAMエミュレーション: 表示中タイルは「インデックス列(disp_idx)」と「パレット行(disp_pal)」で
+    # 保持し、cur_rgb は現区間パレットで毎フレーム引き直す(=実機の挙動)。これにより区間跨ぎで
+    # 旧インデックス列が新CRAMでゴミ化する現象がプレビュー/near判定にそのまま現れる。
+    disp_idx = np.zeros((C_CELLS, TILE * TILE), np.uint8)   # 表示中タイルのindex列(0=bg,1..15)
+    disp_pal = np.zeros(C_CELLS, np.int32)                  # 表示中タイルのパレット行
+
+    def repoint(c, key, pal, rgb, fi):
+        old = cur_key[c]
+        if old is not None:
+            ref_count[old] -= 1
+            if ref_count[old] <= 0:
+                ref_count.pop(old, None)
+        cur_key[c] = key
+        ref_count[key] = ref_count.get(key, 0) + 1
+        cur_pal[c] = pal
+        disp_idx[c] = np.frombuffer(key, np.uint8)
+        disp_pal[c] = pal
+        cur_rgb[c] = rgb                                     # 暫定(このフレーム末に引き直す)
+        touch(key, fi)
+
+    wait = np.zeros(C_CELLS, np.int32)         # TSVのMiss carry/age用。優先度には使わない
+    age_press = np.zeros(C_CELLS, np.float64)  # Miss/Flbkの距離加重優先度圧力
+    cell_tier = np.zeros(C_CELLS, np.int8)     # 現在の表示劣化度(0=Miss,1=Flbk,2=Near,9=正確)
+    approx_carry = np.zeros(C_CELLS, np.int32)  # 近似(tier<9)のまま持ち越した連続コマ数(格上げ/正確化で0)
+    plane_key = [None] * plane_state_cells
+    plane_pal = np.full(plane_state_cells, -1, np.int16)
+    plane_committed = [None] * plane_state_cells
+    plane_disp_idx = np.zeros((plane_state_cells, TILE * TILE), np.uint8)
+    plane_disp_pal = np.zeros(plane_state_cells, np.int32)
+    plane_wait = np.zeros(plane_state_cells, np.int32)
+    plane_age_press = np.zeros(plane_state_cells, np.float64)
+    plane_cell_tier = np.zeros(plane_state_cells, np.int8)
+    plane_approx_carry = np.zeros(plane_state_cells, np.int32)
+    previous_scroll_state = None
+
+    def store_logical_plane(cells):
+        """Persist the current logical viewport into physical Plane A cells."""
+
+        physical = tuple(int(cell) for cell in cells)
+        if len(physical) != C_CELLS:
+            raise AssertionError("scroll primary cell count differs from geometry")
+        for logical, cell in enumerate(physical):
+            plane_key[cell] = cur_key[logical]
+            plane_pal[cell] = cur_pal[logical]
+            plane_committed[cell] = committed_plain[logical]
+        plane_disp_idx[np.asarray(physical)] = disp_idx
+        plane_disp_pal[np.asarray(physical)] = disp_pal
+        plane_wait[np.asarray(physical)] = wait
+        plane_age_press[np.asarray(physical)] = age_press
+        plane_cell_tier[np.asarray(physical)] = cell_tier
+        plane_approx_carry[np.asarray(physical)] = approx_carry
+
+    def load_logical_plane(cells):
+        """Load one rolling-plane viewport into the sequential decision state."""
+
+        nonlocal age_press, approx_carry, wait, ref_count
+        physical = tuple(int(cell) for cell in cells)
+        if len(physical) != C_CELLS:
+            raise AssertionError("scroll primary cell count differs from geometry")
+        index = np.asarray(physical)
+        for logical, cell in enumerate(physical):
+            cur_key[logical] = plane_key[cell]
+            cur_pal[logical] = plane_pal[cell]
+            committed_plain[logical] = plane_committed[cell]
+        disp_idx[:] = plane_disp_idx[index]
+        disp_pal[:] = plane_disp_pal[index]
+        wait = plane_wait[index].copy()
+        age_press = plane_age_press[index].copy()
+        cell_tier[:] = plane_cell_tier[index]
+        approx_carry = plane_approx_carry[index].copy()
+        ref_count = {}
+        for key in cur_key:
+            if key is not None:
+                ref_count[key] = ref_count.get(key, 0) + 1
+    upgrade_log = []                            # 毎コマ: 格上げ枚数 / まだ近似のセル数(指標)
+    guniq = {k: set() for k in ("same", "near", "flbk")}  # 全編で使った別タイル(ユニーク数)
+
+    frame_bytes_log = []
+    tile_records_log = []      # パターン転送数(=32B支払い回数)
+    name_records_log = []      # ネームテーブル書換数
+    dedup_saved_log = []       # dedupで節約したパターン転送数(L1/L2=VRAM常駐ヒット)
+    l3_hits_log = []           # L3(PRG-RAM)ヒット数(CD再読みを回避できた再登場パターン)
+    prg_hits_log = []          # PRG先読みヒット数(事前ロード済みで0CD Fillできたタイル)
+    # coldlife計測: coldロード(Raw/Buf)が次フレーム以降も役立つかの実測。先読み減点
+    # ヒューリスティックの効果上限を測るためのカウンタで、エンコード決定には影響しない。
+    coldlife_pending = []      # 前フレームのcoldロード [(cell, key, kind), ...]
+    coldlife = {
+        "total": {"raw": 0, "buf": 0},           # frame 1以降の全coldロード
+        "survive_target": {"raw": 0, "buf": 0},  # 次フレームもターゲット不変(そのまま有効)
+        "die_settle": {"raw": 0, "buf": 0},      # 次で変わるがその次は安定(1フレーム待てば1ロード節約)
+        "die_motion": {"raw": 0, "buf": 0},      # 次もその次も変化(連続運動: 減点するとゴースト蓄積)
+        "tail": {"raw": 0, "buf": 0},            # 末尾フレームで分類不能
+        "disp_seen1": {"raw": 0, "buf": 0},      # 翌フレームの実表示を確認できた母数
+        "disp_alive1": {"raw": 0, "buf": 0},     # 実表示: 翌フレームどこかのセルで表示継続(Near-keep/再利用込み)
+        "disp_cell1": {"raw": 0, "buf": 0},      # 実表示: 翌フレーム同じセルで表示継続
+    }
+    stat_rows = []             # per-frame status line 用の実測値
+    stale_rows = []            # per-frame の Miss(stale)マスク(packbits, 72B/frame)
+    starved_frames = 0
+    dec_frames = []            # 実機決定ログ: 各要素 = そのフレームの [(cell, pal, key), ...]
+    dec_miss = []              # per-frame Miss数(デバッグオーバーレイ用。デコード側では算出不能)
+    dec_cats = []              # per-frame カテゴリ数[raw,same,near,flbk,buf,miss,scrl](デバッグ欄用)
+    dec_category_rows = []     # analysis: 2-byte/cell overlapping category masks
+    transfer_tiles_log = []    # pack/player照合用: cold pattern tile数
+    transfer_runs_log = []     # pack/player照合用: packed cold-run record数
+    supply_sources_log = []    # per-frame update-aligned Prg/Wr/Dic source codes
+    ring_per_log = []          # resolved cells/entries/cold flags for ring planning
+    ring_prefetch_log = []     # resolved physical prefetch records for ring planning
+    ring_transfer_orders_log = []
+    ring_dic_indices_log = []  # update-aligned Dic indices (-1 for non-Dic)
+    ring_raw_flags_log = []    # update-aligned same-frame Raw funding markers
+    ring_category_cells_log = []  # update-aligned logical analysis cells (-1=guard)
+    prg_loads_log = []         # physical PrgBuf pattern consumption
+    prg_cold_cells_log = []    # physical Prg loads mapped to cells (-1=prefetch)
+    wr0_loads_log = []         # physical boot-preload consumption by source
+    wr1_loads_log = []
+    dic_loads_log = []
+    prefetch_requests_log = []  # successful (pattern key, deadline) requests
+    prefetch_cold_log = []      # physical PrgBuf loads without a name update
+    quality_budget = QUALITY_BUDGET_BYTES if QUALITY_BUDGET_ON else 0
+    quality_budget_log = []
+    quality_budget_balance_log = []
+    quality_budget_debt_log = []
+
+    # DEBUG色はCRAMに既にある色だけを並べ替えて固定する。異なるパレット行との
+    # 入替があり得るので、全フレームを最終的な行構成に対して量子化する前に行う。
+    seg_pals, pal_extreme_stats = pin_p0_debug_extremes(seg_pals)
+    print(f"  P0 DEBUG colours pinned: index1 darkest swaps "
+          f"{pal_extreme_stats['dark_swapped_segments']}/{pal_extreme_stats['segments']}, "
+          f"index15 brightest swaps "
+          f"{pal_extreme_stats['bright_swapped_segments']}/{pal_extreme_stats['segments']}")
+
+    # Quantize: build palette assignments and indexed patterns.
+    # フレーム独立の割当/索引を並列で前計算(実行時間の大半)。以降のループは逐次(状態依存)。
+    # Deep-black demand: a segment lends its deep-black palette entries to
+    # colour reproduction only when the source itself contains such darkness.
+    # The Bayer-view tiles are already in memory, so the measure is exact.
+    seg_black_wanted = {}
+    if frame_cache is not None:
+        n_frames = len(frame_cache.frames)
+        frame_black = np.empty(n_frames, np.float64)
+        for start in range(0, n_frames, 256):
+            chunk = frame_cache.tiles[start:start + 256]
+            frame_black[start:start + len(chunk)] = (
+                chunk.astype(np.int16).sum(-1) == 0).mean(axis=(1, 2))
+        # A slice owns a reference to the entire backing array, not just 256 frames.
+        del chunk
+        for seg in sorted(set(int(v) for v in frame_seg)):
+            members = np.asarray(
+                [i for i in range(n_frames) if int(frame_seg[i]) == seg])
+            demand = float(frame_black[members].mean())
+            seg_black_wanted[seg] = demand >= DEEP_BLACK_DEMAND_MIN
+        kept = sorted(k for k, v in seg_black_wanted.items() if v)
+        print(
+            f"  deep-black demand: threshold {DEEP_BLACK_DEMAND_MIN:.3f}, "
+            f"black usable in segments {kept if kept else 'none'}",
+            flush=True)
+    with _parallel_phase(
+            "Quantize", use_gpu=True, gpu_worker_limit=4):
+        Q_detail, Q_assign, Q_pidx = precompute_quant(
+            frames, seg_pals, frame_seg, frame_cache=frame_cache,
+            seg_black_wanted=seg_black_wanted, arrays=arrays)
+    # Both DEBUG extremes are pinned before quantization. Verify that the
+    # lossless index-15 canonicalizer preserves rendered pixels.
+    seg_pals, pal15_stats = canonicalize_p0_index15(
+        seg_pals, frame_seg, Q_assign, Q_pidx)
+
+    def quantize_scroll_plane(frame, state, palette):
+        """Quantize primary plus guard tiles on the rolling-plane pixel phase."""
+
+        cells = (*state.primary_cells, *state.guard_cells)
+        cell_index = np.asarray(cells, np.int64)
+        base_rgb = render_cells(
+            plane_disp_idx[cell_index],
+            plane_disp_pal[cell_index],
+            palette,
+        )
+        source = np.asarray(
+            Image.open(frames[int(frame)]).convert("RGB"), np.uint8)
+        aligned = scroll_runtime.aligned_rgb_tiles(source, state, base_rgb)
+        # Quantize on a world-aligned canvas.  Every world cell is 8-aligned,
+        # so the position-fixed Bayer field keeps one stable phase across the
+        # rolling plane and edge attenuation sees the real neighbour pixels.
+        world = (*state.world_primary, *state.world_guard)
+        world_rows = tuple(int(row) for row, _column in world)
+        world_columns = tuple(int(column) for _row, column in world)
+        top = min(world_rows)
+        left = min(world_columns)
+        canvas = np.zeros(
+            ((max(world_rows) - top + 1) * TILE,
+             (max(world_columns) - left + 1) * TILE, 3), np.uint8)
+        for index, (row, column) in enumerate(world):
+            y = (int(row) - top) * TILE
+            x = (int(column) - left) * TILE
+            canvas[y:y + TILE, x:x + TILE] = aligned[index]
+        quantized = to_rgb333(canvas)
+        rgb333 = np.stack([
+            quantized[
+                (int(row) - top) * TILE:(int(row) - top + 1) * TILE,
+                (int(column) - left) * TILE:(int(column) - left + 1) * TILE,
+            ]
+            for row, column in world
+        ])
+        flattened, detail = flatten_low_detail(
+            rgb333.reshape(len(cells), TILE * TILE, 3))
+        assignments = assign_palette(flattened, palette)
+        indices = idx_for(flattened, assignments, palette)
+        primary = C_CELLS
+        if state.guard_cells:
+            (
+                guard_detail,
+                guard_assign,
+                guard_idx,
+            ) = quantize_guard_edge(frame, state, palette)
+            return (
+                detail[:primary].astype(np.float32),
+                assignments[:primary],
+                indices[:primary],
+                guard_detail,
+                guard_assign,
+                guard_idx,
+                aligned[primary:],
+            )
+        return (
+            detail[:primary].astype(np.float32),
+            assignments[:primary],
+            indices[:primary],
+            detail[primary:].astype(np.float32),
+            assignments[primary:],
+            indices[primary:],
+            aligned[primary:],
+        )
+
+    scroll_guard_cache = {}
+
+    def quantize_guard_edge(frame, state, palette):
+        """Quantize the guard edge once from its fully revealed source frame.
+
+        The world-mosaic sample makes the guard key independent of runtime
+        plane state and of the per-frame reveal phase: the same edge yields
+        the same key every frame, the guard pass skips already-committed
+        cells, and the later primary quantization of the identical static
+        world content reproduces the key.
+        """
+
+        sample = int(scroll_guard_full_view.get(int(frame), int(frame)))
+        key = (sample, state.world_guard)
+        hit = scroll_guard_cache.get(key)
+        if hit is not None:
+            return hit
+        sample_state = scroll_states[sample]
+        source = np.asarray(
+            Image.open(frames[sample]).convert("RGB"), np.uint8)
+        height, width = source.shape[:2]
+        rows = tuple(int(row) for row, _column in state.world_guard)
+        columns = tuple(int(column) for _row, column in state.world_guard)
+        top = min(rows)
+        left = min(columns)
+        canvas = np.zeros(
+            ((max(rows) - top + 1) * TILE,
+             (max(columns) - left + 1) * TILE, 3), np.uint8)
+        for row, column in state.world_guard:
+            source_y = int(row) * TILE + int(sample_state.vscroll)
+            source_x = int(column) * TILE + int(sample_state.hscroll)
+            if not (0 <= source_y and source_y + TILE <= height
+                    and 0 <= source_x and source_x + TILE <= width):
+                continue                    # never-revealed tail edge stays 0
+            y = (int(row) - top) * TILE
+            x = (int(column) - left) * TILE
+            canvas[y:y + TILE, x:x + TILE] = source[
+                source_y:source_y + TILE, source_x:source_x + TILE]
+        quantized = to_rgb333(canvas)
+        rgb333 = np.stack([
+            quantized[
+                (int(row) - top) * TILE:(int(row) - top + 1) * TILE,
+                (int(column) - left) * TILE:(int(column) - left + 1) * TILE,
+            ]
+            for row, column in state.world_guard
+        ])
+        flattened, guard_detail = flatten_low_detail(
+            rgb333.reshape(len(state.world_guard), TILE * TILE, 3))
+        guard_assign = assign_palette(flattened, palette)
+        guard_idx = idx_for(flattened, guard_assign, palette)
+        hit = (
+            guard_detail.astype(np.float32),
+            guard_assign,
+            guard_idx,
+        )
+        scroll_guard_cache[key] = hit
+        return hit
+
+    # A black anchor is an ordinary full-refresh frame whose hidden indexed
+    # image is the following shot's bright reference.  Every fade frame then
+    # reuses that exact image and changes only CRAM.  P0/index15 remains
+    # reserved for DEBUG text, so fade references remap its movie pixels to the
+    # nearest other P0 colour before any frame is frozen to the reference.
+    fade_references = {}
+    for reference in sorted(set(
+            int(value) for value in fade_layout.reference_frames
+            if int(value) >= 0)):
+        segment = int(frame_seg[reference])
+        fade_references[reference] = (
+            reserve_fade_hud_colour(
+                Q_pidx[reference], Q_assign[reference], seg_pals[segment]),
+            np.asarray(Q_assign[reference], np.int8).copy(),
+            np.asarray(Q_detail[reference]).copy(),
+        )
+    # Fade feasibility is proved by the decision replay itself: when a
+    # preparation deadline cannot complete, the runner re-plans with that
+    # shot's anchor demoted to ordinary frames. Static estimates cannot
+    # separate a survivable window from a churning one (a moving detailed
+    # shot keeps reclaiming the advance pins), so no planning-side estimator
+    # decides adoption. The palette segment tables keep the demoted shot's
+    # boundaries; its entry palette is unscaled, so ordinary frames simply
+    # play through them.
+    demoted_fade_shots = [
+        shot for shot in fade_layout.shots
+        if int(shot.anchor) in demoted_fade_anchors]
+    kept_fade_shots = [
+        shot for shot in fade_layout.shots
+        if int(shot.anchor) not in demoted_fade_anchors]
+    if demoted_fade_shots:
+        for shot in demoted_fade_shots:
+            print(
+                "  fade demotion: "
+                f"anchor=f{int(shot.anchor)} kind={shot.kind} "
+                "(decision replay proved its preparation deadline "
+                "infeasible)",
+                flush=True,
+            )
+        (fade_reference_frames, fade_desired_scales, fade_phases,
+         fade_preparation_frames,
+         fade_preparation_deadlines) = fade_frames.overlay_shot_targets(
+            kept_fade_shots, n)
+        fade_entry_scales = list(fade_layout.entry_scales)
+        for shot in demoted_fade_shots:
+            fade_entry_scales[
+                int(fade_layout.frame_segments[int(shot.anchor)])] = 1.0
+        fade_layout = dataclasses.replace(
+            fade_layout,
+            shots=tuple(kept_fade_shots),
+            entry_scales=tuple(fade_entry_scales),
+            reference_frames=fade_reference_frames,
+            desired_scales=fade_desired_scales,
+            phases=fade_phases,
+            preparation_frames=fade_preparation_frames,
+            preparation_deadlines=fade_preparation_deadlines,
+        )
+        palette_stats["fade_detection"]["demoted_infeasible"] = sorted(
+            int(shot.anchor) for shot in demoted_fade_shots)
+        palette_stats["fade_detection"]["selected_shots"] = len(
+            fade_layout.shots)
+
+    for frame, raw_reference in enumerate(fade_layout.reference_frames):
+        reference = int(raw_reference)
+        if reference < 0:
+            continue
+        indices, assignments, detail = fade_references[reference]
+        Q_pidx[frame] = indices
+        Q_assign[frame] = assignments
+        Q_detail[frame] = detail
+
+    segment_entry_cram = np.asarray([
+        fade_frames.scaled_palette(palette, scale)
+        for palette, scale in zip(
+            seg_pals, fade_layout.entry_scales, strict=True)
+    ], np.uint8)
+    frame_types = np.full(n, shadow_updates.FRAME_NORMAL, np.uint8)
+    frame_cram = np.zeros((n, 4, 15, 3), np.uint8)
+    desired_cram = {}
+    for frame in np.flatnonzero(np.isfinite(fade_layout.desired_scales)):
+        reference = int(fade_layout.reference_frames[frame])
+        if reference < 0:
+            raise AssertionError(f"fade frame {frame} has no reference image")
+        if frame_cache is not None:
+            target_rgb = rgb333_to_rgb888(
+                frame_cache.tiles[frame]
+            ).reshape(C_CELLS, TILE, TILE, 3)
+        else:
+            source_rgb333 = tile_blocks(to_rgb333(np.asarray(
+                Image.open(frames[frame]).convert("RGB"), np.uint8)))
+            target_rgb = rgb333_to_rgb888(source_rgb333).reshape(
+                C_CELLS, TILE, TILE, 3)
+        indices, assignments, _detail = fade_references[reference]
+        segment = int(frame_seg[frame])
+        desired_cram[int(frame)] = best_fade_palette(
+            seg_pals[segment],
+            indices,
+            assignments,
+            target_rgb,
+            float(fade_layout.desired_scales[frame]),
+        )
+    cached_luma = (frame_cache.luma if (frame_cache is not None and frame_cache.luma is not None) else None)
+    del frame_cache
+    del fade_probes
+    if arrays is not None:
+        arrays.settle()
+
+    active_cram = np.asarray(segment_entry_cram[0], np.uint8).copy()
+    active_frame_cram = np.empty((n, 4, 15, 3), np.uint8)
+    for frame in range(n):
+        if frame and int(frame_seg[frame]) != int(frame_seg[frame - 1]):
+            active_cram = np.asarray(
+                segment_entry_cram[int(frame_seg[frame])], np.uint8).copy()
+        target = desired_cram.get(frame)
+        if target is not None and not np.array_equal(target, active_cram):
+            phase = int(fade_layout.phases[frame])
+            if phase not in (
+                    shadow_updates.FRAME_FADE_IN,
+                    shadow_updates.FRAME_FADE_OUT):
+                raise AssertionError(f"fade frame {frame} has no direction")
+            frame_types[frame] = phase
+            frame_cram[frame] = target
+            active_cram = target.copy()
+        active_frame_cram[frame] = active_cram
+
+    scroll_fade_overlap = scroll_active & (
+        frame_types != shadow_updates.FRAME_NORMAL)
+    if np.any(scroll_fade_overlap):
+        frame = int(np.flatnonzero(scroll_fade_overlap)[0])
+        raise AssertionError(
+            f"automatic scroll frame {frame} overlaps an inline fade control")
+    control_frame_types = np.asarray(frame_types, np.uint8).copy()
+    control_frame_types[scroll_active] = shadow_updates.FRAME_SCROLL
+
+    # A one-frame black gap or the bright entrance of a fade-out cannot
+    # necessarily install its reference within the cold cap.  Preload those
+    # references into otherwise unreferenced VRAM slots.  Every window is
+    # derived from the detected shot and the normal runtime-prefetch batch
+    # limit; there is no timeline or profile-side range override.
+    fade_prefetch_plan = {}
+
+    def plan_fade_reference(
+            window, deadline, reference, *, request_limit=None,
+            requested_keys=None):
+        frames = tuple(int(frame) for frame in window)
+        if not frames:
+            return
+        keys = (
+            tuple(requested_keys)
+            if requested_keys is not None else
+            tuple(dict.fromkeys(
+                Q_pidx[int(reference)][cell].tobytes()
+                for cell in range(C_CELLS)
+            ))
+        )
+        nominal_per_frame = (len(keys) + len(frames) - 1) // len(frames)
+        nominal_remaining = len(keys)
+        for offset, frame in enumerate(frames):
+            if frame in fade_prefetch_plan:
+                raise AssertionError(
+                    f"fade prefetch plans overlap at frame {frame}")
+            nominal_requests = min(nominal_per_frame, nominal_remaining)
+            fade_prefetch_plan[frame] = (
+                int(deadline),
+                keys,
+                len(frames) - offset,
+                None if request_limit is None else int(request_limit),
+                nominal_requests,
+            )
+            nominal_remaining -= nominal_requests
+
+    for shot in fade_layout.shots:
+        if shot.left_black is not None or shot.anchor == 0:
+            continue
+        reference_keys, window = raw_prefetch.plan_mandatory_reference_window(
+            (
+                Q_pidx[int(shot.reference)][cell].tobytes()
+                for cell in range(C_CELLS)
+            ),
+            deadline=int(shot.anchor),
+            max_requests_per_frame=RAW_PREFETCH_MAX_REQUESTS_PER_FRAME,
+        )
+        if not reference_keys:
+            continue
+        # Optional raw prediction can lose an entire busy frame's spare room,
+        # and a forced destination may remain part of the preceding display
+        # while a multi-VBlank transfer finishes.  The helper retains every
+        # distinct reference key and derives three equal retry windows.  The
+        # live loop recomputes each catch-up count from the patterns still
+        # missing, without assuming anchor-frame delivery or a source-time
+        # override.
+        plan_fade_reference(
+            window,
+            int(shot.anchor),
+            int(shot.reference),
+            request_limit=RAW_PREFETCH_MAX_REQUESTS_PER_FRAME,
+            requested_keys=reference_keys,
+        )
+
+    for group in fade_frames.connected_groups(fade_layout.shots):
+        for previous_shot, next_shot in zip(group, group[1:]):
+            window = tuple(range(
+                int(previous_shot.start), int(next_shot.left_black.start)))
+            if not window:
+                continue
+            plan_fade_reference(
+                window,
+                int(next_shot.left_black.start),
+                int(next_shot.reference),
+            )
+
+    adaptive_enabled = os.environ.get("CBRSIM_ADAPTIVE_MOTION", "0") == "1"
+    detail_motion = os.environ.get("CBRSIM_DETAIL_MOTION", "0") == "1"
+    hold_frames = np.zeros(n, dtype=bool)
+    motion_prefetch = {}
+    compensate_motion = os.environ.get("CBRSIM_MOTION_COMPENSATION", "0") == "1"
+    if adaptive_enabled or compensate_motion:
+        if adaptive_enabled and (not av_config.PAL or FPS != 25):
+            raise ValueError("adaptive motion requires the 25 fps PAL player")
+        locked = scroll_active.copy()
+        # The previous scroll state also owns the first rebase after scrolling.
+        locked[1:] |= scroll_active[:-1]
+        locked |= np.asarray(fade_layout.reference_frames) >= 0
+        locked |= frame_types != shadow_updates.FRAME_NORMAL
+        locked[1:] |= frame_seg[1:] != frame_seg[:-1]
+        for frame in (*fade_layout.preparation_frames, *fade_prefetch_plan):
+            locked[frame] = True
+        display_plan = adaptive_motion.plan_display(
+            cached_luma if (cached_luma is not None and DEDITHER_VF == RAW_VF) else sorted(raw_dir.glob("*.png")),
+            locked,
+            (row.frame for row in scroll_estimates if row.cut),
+            allow_holds=adaptive_enabled,
+            cold_caps=frame_cold_caps if detail_motion else None)
+        hold_frames = display_plan.holds
+        motion_prefetch = adaptive_motion.preload_requests(
+            display_plan, locked, Q_pidx, Q_detail)
+        print(f"adaptive motion: holds={int(hold_frames.sum())}/{n} "
+              f"cuts={np.flatnonzero(display_plan.cuts).tolist()}", flush=True)
+    _t = _mark("Quantize", _t)
+    # palettes.bin is the legacy fallback CRAM image.  In segmented mode the
+    # separately trained global palette was never the actual initial CRAM, so
+    # write the actual entry palette and keep every consumer aligned with PALTAB.
+    (OUT / "palettes.bin").write_bytes(
+        pals_to_bytes(list(segment_entry_cram[0])))
+    np.savez(OUT / "seg_palettes.npz",
+             seg_pals=np.asarray(seg_pals, np.uint8),
+             segment_entry_cram=segment_entry_cram,
+             frame_seg=np.asarray(frame_seg, np.int32),
+             frame_types=frame_types,
+             frame_cram=frame_cram,
+             active_frame_cram=active_frame_cram)
+    print(f"  P0 index15 globally brightest: row swaps "
+          f"{pal15_stats['row_swapped_segments']}/{pal15_stats['segments']}, "
+          f"index swaps {pal15_stats['index_swapped_segments']}/{pal15_stats['segments']}; "
+          f"RGB identity verified for {pal15_stats['verified_pixels']} pixels "
+          f"({pal15_stats['reassigned_tiles']} tile assignments and "
+          f"{pal15_stats['reindexed_pixels']} indices remapped, frame0 included)")
+    print(
+        "  CRAM fade controls: "
+        f"in={int(np.count_nonzero(frame_types == shadow_updates.FRAME_FADE_IN))} "
+        f"out={int(np.count_nonzero(frame_types == shadow_updates.FRAME_FADE_OUT))}; "
+        f"frames={np.flatnonzero(frame_types).tolist()}; "
+        f"prefetch_frames={sorted(fade_prefetch_plan)}",
+        flush=True,
+    )
+
+    body_fresh = stream_schedule.body_fresh_byte_supply(
+        n,
+        FPS,
+        cells=C_CELLS,
+        audio_frame_bytes=AUDIO_CONTROL_BYTES,
+        frame_types=control_frame_types,
+    )
+    body_gross_bytes = np.asarray(body_fresh["gross"], np.int64)
+    body_fixed_control_bytes = np.asarray(
+        body_fresh["fixed_control"], np.int64)
+    body_variable_supply_bytes = np.asarray(body_fresh["variable"], np.int64)
+
+    emit("forecast", 0, n)
+    # Forecast: build future demand and physical-delivery limits.
+    # Optional quality upgrades use a whole-movie reserve plan. The dry run
+    # follows the exact quantized target with the shared VRAM allocator. A
+    # backwards pass then retains only the quality-budget bytes that future
+    # bursts cannot replenish from their own frame supply. Its final target is
+    # zero, so future protection, recovery, and end draining share one policy.
+    upgrade_supply = body_variable_supply_bytes.copy()
+    if PAL_WRITE_BYTES:
+        for i in range(1, n):
+            if int(frame_seg[i]) != int(frame_seg[i - 1]):
+                upgrade_supply[i] = max(
+                    0, int(upgrade_supply[i]) - PAL_WRITE_BYTES)
+    cram_switch_frames = np.zeros(n, bool)
+    if n > 1:
+        cram_switch_frames[1:] = frame_seg[1:] != frame_seg[:-1]
+    fade_prepare_mask = np.zeros(n, bool)
+    if fade_layout.preparation_frames:
+        fade_prepare_mask[np.asarray(
+            fade_layout.preparation_frames, np.int64)] = True
+    def build_forecast():
+        """Build the Forecast stage's demand and boot-prefetch plan."""
+        # Only changes that fit Near may degrade gracefully. Anything beyond
+        # Near is at risk of Flbk or Miss and justifies moving budget capacity
+        # away from an earlier frame.
+        main_protected = np.zeros((n, C_CELLS), bool)
+        previous_target_rgb = None
+        for i in range(n):
+            target_pals = active_frame_cram[i]
+            target_rgb = render_cells(Q_pidx[i], Q_assign[i], target_pals)
+            if i == 0:
+                main_protected[i] = True
+            elif cram_switch_frames[i]:
+                # A CRAM epoch change invalidates every live name-table
+                # palette reference in the real encoder, even where the
+                # quantized pattern and palette-line number compare equal.
+                # Protect that mandatory full refresh before earlier optional
+                # updates can spend its whole-movie allowance.
+                main_protected[i] = True
+            else:
+                previous_display_rgb = previous_target_rgb
+                target_changed = (
+                    np.any(Q_pidx[i] != Q_pidx[i - 1], axis=1)
+                    | (Q_assign[i] != Q_assign[i - 1])
+                )
+                graceful = f3_mask_eval(
+                    previous_display_rgb, target_rgb, target_changed, NEAR_F3)
+                main_protected[i] = target_changed & ~graceful
+            previous_target_rgb = target_rgb
+            emit("forecast", i + 1, n * 3)
+        baseline_demand_prediction = upgrade_planner.predict_update_demand_details(
+            Q_pidx,
+            Q_assign,
+            vram_tiles=VRAM_TILES,
+            name_bytes=NAME_BYTES,
+            pattern_bytes=PATTERN_BYTES,
+            max_cold=frame_cold_caps,
+            protected_frames=main_protected,
+            forced_update_frames=cram_switch_frames,
+        )
+        baseline_prefetch_forecast = raw_prefetch.forecast_requests(
+            Q_pidx,
+            Q_assign,
+            main_protected,
+            vram_tiles=VRAM_TILES,
+            max_cold=frame_cold_caps,
+        ) if BOOT_VRAM_PREFETCH_ON or RAW_PREFETCH_ON else None
+        emit("forecast", 2 * n, 3 * n)
+        frame0_keys = tuple(dict.fromkeys(
+            Q_pidx[0][cell].tobytes() for cell in range(C_CELLS)))
+        frame0_inline_pattern_limit = min(
+            C_CELLS,
+            VRAM_TILES,
+            av_config.FRAME0_PATTERN_STAGING_KB * 1024 // PATTERN_BYTES,
+        )
+        boot_inline_capacity = max(
+            0, frame0_inline_pattern_limit - len(frame0_keys))
+        boot_sidecar_capacity = av_config.boot_vram_sidecar_capacity()
+        boot_prefetch_capacity = min(
+            max(0, VRAM_TILES - len(frame0_keys)),
+            boot_inline_capacity + boot_sidecar_capacity,
+        )
+        boot_prefetch_plan = (
+            raw_prefetch.plan_boot_requests(
+                baseline_demand_prediction,
+                baseline_prefetch_forecast,
+                frame0_keys,
+                capacity=boot_prefetch_capacity,
+            )
+            if BOOT_VRAM_PREFETCH_ON else ()
+        )
+        # Re-run the exact-target trace with boot residency installed so every
+        # future source and reserve sees the same initial VRAM state.
+        demand_prediction = (
+            upgrade_planner.predict_update_demand_details(
+                Q_pidx,
+                Q_assign,
+                vram_tiles=VRAM_TILES,
+                name_bytes=NAME_BYTES,
+                pattern_bytes=PATTERN_BYTES,
+                max_cold=frame_cold_caps,
+                protected_frames=main_protected,
+                forced_update_frames=cram_switch_frames,
+                boot_prefetch_requests=boot_prefetch_plan,
+            )
+            if boot_prefetch_plan else baseline_demand_prediction
+        )
+        predicted_name_bytes = np.maximum(
+            np.asarray(demand_prediction.exact_bytes, np.int64)
+            - np.asarray(demand_prediction.exact_cold, np.int64)
+            * PATTERN_BYTES,
+            0,
+        )
+        predicted_run_bytes = (
+            np.asarray(demand_prediction.exact_cold, np.int64)
+            * stream_schedule.RUN_DESCRIPTOR_BYTES
+        )
+        predicted_prg_supply_patterns = np.maximum(
+            np.asarray(upgrade_supply, np.int64)
+            - predicted_name_bytes
+            - predicted_run_bytes,
+            0,
+        ) // PATTERN_BYTES
+        supply_budget = pattern_supply.plan_frame_budgets(
+            demand_prediction,
+            enabled=PATTERN_SUPPLY_ON,
+            wr0_patterns=wordram_layout.wr0_patterns,
+            wr1_patterns=wordram_layout.wr1_patterns,
+            prg_supply_patterns=predicted_prg_supply_patterns,
+            prg_capacity_patterns=(
+                PRG_BUF_CAP_KB * 1024 // PATTERN_BYTES),
+        )
+        # Only numeric demand traces are consumed after boot-source selection.
+        demand_prediction = dataclasses.replace(
+            demand_prediction, cold_keys=(), protected_keys=(), cold_slots=())
+        del baseline_demand_prediction
+        if RAW_PREFETCH_ON:
+            prefetch_forecast = raw_prefetch.forecast_requests(
+                Q_pidx,
+                Q_assign,
+                main_protected,
+                vram_tiles=VRAM_TILES,
+                max_cold=frame_cold_caps,
+                boot_prefetch_requests=boot_prefetch_plan,
+            ) if boot_prefetch_plan else baseline_prefetch_forecast
+        else:
+            prefetch_forecast = raw_prefetch.PrefetchForecast(
+                requests=tuple(() for _ in range(n)),
+                protected_cold=np.zeros(n, np.int64),
+                requested_patterns=np.zeros(n, np.int64),
+            )
+        del baseline_prefetch_forecast
+        return (
+            main_protected,
+            frame0_keys,
+            frame0_inline_pattern_limit,
+            boot_inline_capacity,
+            boot_sidecar_capacity,
+            boot_prefetch_capacity,
+            boot_prefetch_plan,
+            demand_prediction,
+            predicted_prg_supply_patterns,
+            supply_budget,
+            prefetch_forecast,
+        )
+
+    (
+        main_protected,
+        frame0_keys,
+        frame0_inline_pattern_limit,
+        boot_inline_capacity,
+        boot_sidecar_capacity,
+        boot_prefetch_capacity,
+        boot_prefetch_plan,
+        demand_prediction,
+        predicted_prg_supply_patterns,
+        supply_budget,
+        prefetch_forecast,
+    ) = build_forecast()
+    if scroll_plane_enabled:
+        original_wr = np.asarray(supply_budget.wr, np.int64)
+        reserved_wr = np.zeros(n, np.int64)
+        capacities = (
+            int(wordram_layout.wr0_patterns),
+            int(wordram_layout.wr1_patterns),
+        )
+        # World-mosaic guard keys are stable while the same edge repeats, so
+        # a guard column/row only loads on the frame where the edge becomes a
+        # NEW set of cells. Fund exactly those crossing frames' complete
+        # edges from the boot preload in chronological order; the heaviest
+        # scroll frames can then never depend on same-frame Prg payload for
+        # their mandatory guards.
+        def _guard_need(frame):
+            state = scroll_states[frame]
+            previous = scroll_states.get(frame - 1)
+            if previous is not None and (
+                    previous.guard_cells == state.guard_cells):
+                return 0
+            return len(state.guard_cells)
+
+        for parity, capacity in enumerate(capacities):
+            frames_for_scroll = [
+                int(frame) for frame in np.flatnonzero(scroll_active)
+                if int(frame) % 2 == parity
+            ]
+            remaining = int(capacity)
+            for frame in frames_for_scroll:
+                count = min(_guard_need(frame), remaining)
+                reserved_wr[frame] = count
+                remaining -= count
+                if remaining <= 0:
+                    break
+            for frame in np.argsort(-original_wr, kind="stable"):
+                frame = int(frame)
+                if remaining <= 0:
+                    break
+                if frame % 2 != parity or scroll_active[frame]:
+                    continue
+                count = min(int(original_wr[frame]), remaining)
+                reserved_wr[frame] = count
+                remaining -= count
+        supply_budget = dataclasses.replace(
+            supply_budget, wr=reserved_wr)
+        print(
+            "scroll WordBuf reserve: incoming guards first; "
+            f"Wr0={int(reserved_wr[::2].sum())}/{capacities[0]} "
+            f"Wr1={int(reserved_wr[1::2].sum())}/{capacities[1]} "
+            f"guard_min={int(reserved_wr[scroll_active].min()) if np.any(scroll_active) else 0}",
+            flush=True,
+        )
+    if np.any(cram_switch_frames):
+        full_name_refresh_bytes = C_CELLS * NAME_BYTES
+        protected_all = np.all(
+            np.asarray(main_protected, bool), axis=1)
+        exact_bytes = np.asarray(
+            demand_prediction.exact_bytes, np.int64)
+        protected_bytes = np.asarray(
+            demand_prediction.protected_bytes, np.int64)
+        missing_cram_reserve = np.flatnonzero(
+            cram_switch_frames
+            & (
+                ~protected_all
+                | (exact_bytes < full_name_refresh_bytes)
+                | (protected_bytes < full_name_refresh_bytes)
+            )
+        )
+        if missing_cram_reserve.size:
+            frame = int(missing_cram_reserve[0])
+            raise AssertionError(
+                f"frame {frame}: CRAM switch lacks mandatory full "
+                f"{full_name_refresh_bytes}B name-table reserve")
+    boot_inline_requests = min(
+        len(boot_prefetch_plan), boot_inline_capacity)
+    boot_sidecar_requests = len(boot_prefetch_plan) - boot_inline_requests
+
+    # Construct one online shared-sector ledger before image decisions.  The
+    # exact control bytes finalized by frame i are known before frame i+1
+    # chooses Prg work, so descriptor savings immediately become next-frame
+    # payload capacity.  Every prefix is sector-rounded separately for control
+    # and payload; the packer later repeats this proof but cannot discover a
+    # different split.
+    predicted_prg_demand = np.maximum(
+        np.asarray(demand_prediction.exact_cold, np.int64)
+        - np.asarray(supply_budget.total, np.int64),
+        0,
+    )
+    for frame in np.flatnonzero(scroll_active):
+        state = scroll_states[int(frame)]
+        predicted_prg_demand[int(frame)] = max(
+            int(predicted_prg_demand[int(frame)]),
+            len(state.guard_cells),
+        )
+    maximum_control_blocks = stream_schedule.control_block_lengths(
+        np.where(
+            np.isin(control_frame_types, (
+                shadow_updates.FRAME_FADE_IN,
+                shadow_updates.FRAME_FADE_OUT,
+            )),
+            0,
+            C_CELLS,
+        ).astype(np.int64),
+        frame_cold_caps,
+        cells=C_CELLS,
+        audio_frame_bytes=AUDIO_CONTROL_BYTES,
+        frame_types=control_frame_types,
+    )
+    maximum_control_blocks[0] = 0
+    physical_budget_state = physical_budget.SharedSectorPlanner(
+        n,
+        max_prg_patterns=MAX_COLD,
+        max_cold_patterns=frame_cold_caps,
+        prebuffer_capacity_patterns=(
+            PRG_BUF_CAP_KB * 1024 // PATTERN_BYTES),
+        frame_sectors=cavc_routing.FRAME_SECTORS,
+        fps=FPS,
+        ring_capacity_patterns=(
+            PRG_DELIVERY_CAP_KB * 1024 // PATTERN_BYTES),
+        maximum_control_block_bytes=maximum_control_blocks,
+        fill=av_config.PACK_FORWARD_FILL,
+    )
+    print(
+        "physical budget: one-pass cadence-sector prefix ledger; "
+        f"Prg desired={int(predicted_prg_demand.sum())} patterns; "
+        f"per-frame Prg cap={MAX_COLD}, cold cap={COLD_CAP_SPEC}; "
+        f"timed route={cavc_routing.FRAME_SECTORS} useful sectors/slot; "
+        "every exact prefix also stays within cumulative CD-1x time",
+        flush=True,
+    )
+
+    dic_dictionary_keys = set(supply_budget.dic_dictionary)
+    dic_dictionary_index = {
+        key: index for index, key in enumerate(supply_budget.dic_dictionary)
+    }
+    preload_credit_bytes = supply_budget.total * PATTERN_BYTES
+    protected_credit_bytes = (
+        np.minimum(supply_budget.total, demand_prediction.protected_cold)
+        * PATTERN_BYTES)
+    # A boot-preloaded cold pattern still needs its two-byte name entry but no
+    # BODY payload.  Remove only that 32-byte payload from the future reserve
+    # traces; the live encoder below applies the same charge to actual work.
+    upgrade_demand = np.maximum(
+        demand_prediction.exact_bytes - preload_credit_bytes, 0)
+    main_demand = np.maximum(
+        demand_prediction.protected_bytes - protected_credit_bytes, 0)
+    # The dry-run allocator advances to the complete exact target even when
+    # its per-frame cold count is clipped.  A multi-frame black preparation
+    # run deliberately does the opposite: it carries unfinished exact work
+    # into the next hidden frame.  Give every such frame its maximum legal
+    # exact-work allowance so the quality planner cannot reserve that budget
+    # for later optional updates.
+    fade_prepare_demand = np.where(
+        fade_prepare_mask,
+        C_CELLS * NAME_BYTES
+        + frame_cold_caps
+        * (PATTERN_BYTES + stream_schedule.RUN_DESCRIPTOR_BYTES),
+        0,
+    ).astype(np.int64)
+    fade_prefetch_demand = np.zeros(n, np.int64)
+    for frame, (_deadline, _keys, _frames_remaining, _request_limit,
+                planned) in fade_prefetch_plan.items():
+        fade_prefetch_demand[int(frame)] = (
+            int(planned)
+            * (PATTERN_BYTES + stream_schedule.RUN_DESCRIPTOR_BYTES)
+        )
+    # Hidden-anchor preparation replaces ordinary visible demand, while
+    # one-sided-reference prefetch is additional work performed after the
+    # visible updates.  Reserve the latter additively so a busy normal frame
+    # cannot spend its bytes before the mandatory prefetch runs.
+    fade_mandatory_demand = (
+        fade_prepare_demand + fade_prefetch_demand)
+    main_demand = (
+        np.maximum(main_demand, fade_prepare_demand)
+        + fade_prefetch_demand)
+    cram_quality_risk_bytes = np.maximum(
+        main_demand - upgrade_supply, 0)
+    cram_quality_priority_frames = (
+        upgrade_planner.select_peak_priority_frames(
+            cram_switch_frames,
+            cram_quality_risk_bytes,
+            CRAM_QUALITY_PRIORITY_SEARCH_FRAMES,
+        )
+    )
+    mandatory_main_demand = np.maximum(
+        np.where(
+            cram_switch_frames,
+            C_CELLS * NAME_BYTES,
+            0,
+        ).astype(np.int64),
+        fade_prepare_demand,
+    ) + fade_prefetch_demand
+    main_reserve_plan = upgrade_planner.build_balanced_reserve_plan(
+        main_demand,
+        upgrade_supply,
+        QUALITY_BUDGET_BYTES,
+        minimum_demand=mandatory_main_demand,
+    )
+    fade_prefetch_mask = fade_prefetch_demand > 0
+    mandatory_main_frames = (
+        cram_switch_frames | fade_prepare_mask | fade_prefetch_mask)
+    if np.any(
+        main_reserve_plan.planned_demand[mandatory_main_frames]
+        < mandatory_main_demand[mandatory_main_frames]
+    ):
+        raise AssertionError(
+            "balanced quality plan diluted mandatory CRAM/fade preparation")
+    # Optional exact upgrades are not required to avoid Miss.  Keep their
+    # complete-demand reserve strict: balancing this deliberately infeasible
+    # all-exact trace spends too much saved allowance before unpredicted live
+    # Main work.  Only the narrower Miss-risk trace shares unavoidable loss.
+    upgrade_base_reserve = upgrade_planner.build_reserve_curve(
+        upgrade_demand, upgrade_supply, QUALITY_BUDGET_BYTES)
+    main_base_reserve = main_reserve_plan.reserve
+    upgrade_base_reserve = np.maximum(
+        upgrade_base_reserve, main_base_reserve)
+    main_reserve = upgrade_planner.relax_reserve_for_priority_frames(
+        main_base_reserve,
+        cram_quality_priority_frames,
+        cram_quality_risk_bytes,
+    )
+    upgrade_reserve = upgrade_planner.relax_reserve_for_priority_frames(
+        upgrade_base_reserve,
+        cram_quality_priority_frames,
+        cram_quality_risk_bytes,
+    )
+    terminal_drain_plan = upgrade_planner.build_terminal_drain_plan(
+        upgrade_demand,
+        upgrade_supply,
+        upgrade_base_reserve,
+    )
+    terminal_drain_credit = terminal_drain_plan.credit
+    main_reserve_floor = main_reserve - terminal_drain_credit
+    upgrade_reserve_floor = upgrade_reserve - terminal_drain_credit
+    print(
+        "quality plan: upgrade exact reserve "
+        f"start={upgrade_reserve[0] // 1024 if n else 0}KB "
+        f"peak={upgrade_reserve.max() // 1024 if n else 0}KB "
+        f"end={upgrade_reserve[-1] // 1024 if n else 0}KB strict; "
+        "main Miss-risk reserve "
+        f"start={main_reserve[0] // 1024 if n else 0}KB "
+        f"peak={main_reserve.max() // 1024 if n else 0}KB "
+        f"end={main_reserve[-1] // 1024 if n else 0}KB "
+        f"balanced_shortfall={main_reserve_plan.shortfall.sum() // 1024}KB; "
+        "CRAM priority "
+        f"search={CRAM_QUALITY_PRIORITY_SEARCH_FRAMES}frames "
+        f"selected={int(np.count_nonzero(cram_quality_priority_frames))}frames "
+        f"relief={int(cram_quality_risk_bytes[
+            cram_quality_priority_frames].sum()) // 1024}KB; "
+        "terminal drain "
+        f"start=f{terminal_drain_plan.start_frame} "
+        f"credit={terminal_drain_plan.maximum_credit // 1024}KB",
+        flush=True,
+    )
+    print(
+        "pattern supply plan: "
+        f"enabled={int(PATTERN_SUPPLY_ON)} "
+        f"PrgPressure=f{supply_budget.prg_pressure_start} "
+        f"Wr0={supply_budget.wr0_patterns}/{wordram_layout.wr0_patterns} "
+        f"Wr1={supply_budget.wr1_patterns}/{wordram_layout.wr1_patterns} "
+        f"Dic={supply_budget.dic_patterns}/{pattern_supply.DIC_BUF_PATTERNS} "
+        f"hits={int(supply_budget.dic.sum())} "
+        f"frames={int(np.count_nonzero(supply_budget.total))}",
+        flush=True,
+    )
+    print(
+        "raw VRAM prefetch: "
+        f"boot={int(BOOT_VRAM_PREFETCH_ON)} "
+        f"frame0_exact={len(frame0_keys)} "
+        f"boot_loads={len(boot_prefetch_plan)}/{boot_prefetch_capacity} "
+        f"(inline={boot_inline_requests}/{boot_inline_capacity}, "
+        f"backside={boot_sidecar_requests}/{boot_sidecar_capacity}); "
+        f"runtime={int(RAW_PREFETCH_ON)} lookahead={RAW_PREFETCH_LOOKAHEAD} "
+        f"max_requests/frame={RAW_PREFETCH_MAX_REQUESTS_PER_FRAME} "
+        f"min_batch={RAW_PREFETCH_MIN_BATCH} "
+        f"budget_floor={RAW_PREFETCH_BUDGET_FLOOR_PATTERNS}patterns "
+        f"request_frames={int(np.count_nonzero(prefetch_forecast.requested_patterns))} "
+        f"requested_patterns={int(prefetch_forecast.requested_patterns.sum())}",
+        flush=True,
+    )
+    _t = _mark("Forecast", _t)
+
+    emit("decide", 0, n)
+    # Decide: make and commit the frame decisions in playback order.
+    # Optional, low-frequency timing for the sequential decision loop.  Keep
+    # this disabled for normal encodes: the nested resident-search timers are
+    # deliberately detailed enough to add measurable profiling overhead.
+    _loop_profile = os.environ.get("CBRSIM_LOOP_PROFILE", "0").strip().lower() not in {
+        "", "0", "false", "no", "off",
+    }
+    _lp_sections = (
+        "prepare", "decision_setup", "decision_commit", "upgrade",
+        "allocate_route", "budget_finalize", "accounting", "tail",
+    )
+    _lp_totals = {name: 0.0 for name in _lp_sections}
+    _lp_frames = {name: [] for name in _lp_sections}
+    _lp_nested_totals = {"resident_filter": 0.0, "resident_distance": 0.0}
+    _lp_nested_frames = {name: [] for name in _lp_nested_totals}
+    _lp_counts = {
+        "changed": 0, "ordered": 0, "resident_calls": 0,
+        "resident_candidates": 0, "resident_empty": 0,
+        "resident_cache_hits": 0, "resident_cache_builds": 0,
+        "resident_adjacent_calls": 0, "resident_adjacent_candidates": 0,
+        "resident_adjacent_empty": 0,
+        "exact_blocked": 0, "flbk_no_candidate": 0,
+        "flbk_budget_blocked": 0, "flbk_not_improved": 0,
+        "flbk_absolute_reject": 0, "flbk_accepted": 0,
+    }
+
+    def _lp_mark(name, started, frame_times):
+        now = time.perf_counter()
+        elapsed = now - started
+        frame_times[name] += elapsed
+        return now
+    # The loop creates and releases many short-lived containers but no
+    # intentional reference cycles.  A generation-2 cyclic-GC scan over the
+    # growing pattern dictionaries causes isolated 50-90 ms stalls.  Collect
+    # once before the loop and restore the caller's GC state afterwards;
+    # ordinary reference-count reclamation remains active throughout.
+    import gc as _gc
+    _gc_was_enabled = _gc.isenabled()
+    if _gc_was_enabled:
+        _gc.collect()
+        _gc.disable()
+
+    fade_prepare_frames = frozenset(
+        int(frame) for frame in fade_layout.preparation_frames)
+    fade_prepare_deadlines = frozenset(
+        int(frame) for frame in fade_layout.preparation_deadlines)
+    fade_prefetch_slots = {}
+    cur_pals = np.asarray(segment_entry_cram[0], np.uint8).copy()
+    prioritize_tile_edges = os.environ.get("CBRSIM_PRIORITIZE_TILE_EDGES", "0") == "1"
+    prioritize_motion = os.environ.get("CBRSIM_PRIORITIZE_MOTION", "0") == "1"
+    smooth_motion_fallback = os.environ.get("CBRSIM_SMOOTH_MOTION_FALLBACK", "0") == "1"
+    track_motion = prioritize_motion or smooth_motion_fallback or compensate_motion
+    if track_motion and n:
+        if cached_luma is not None:
+            previous_luma = cached_luma[0].astype(np.int16)
+        else:
+            with Image.open(frames[0]) as image:
+                previous_luma = np.asarray(image.convert("L"), dtype=np.int16)
+    for i in range(n):
+        emit("decide", i, n)
+        if _loop_profile:
+            _lp_frame = {name: 0.0 for name in _lp_sections}
+            _lp_nested_frame = {name: 0.0 for name in _lp_nested_totals}
+            _lp_t = time.perf_counter()
+        scroll_state = scroll_states.get(i) if bool(scroll_active[i]) else None
+        update_entry_bytes = (
+            shadow_updates.LIST_ITEM_BYTES
+            if scroll_state is not None else NAME_BYTES)
+        if scroll_state is not None:
+            if previous_scroll_state is None:
+                if not allocator_expanded:
+                    alloc.expand_cell_domain(
+                        shadow_updates.SCROLL_PLANE_CELLS,
+                        zip(
+                            normal_plane_cells,
+                            range(C_CELLS),
+                            strict=True,
+                        ),
+                    )
+                    allocator_expanded = True
+                store_logical_plane(normal_plane_cells)
+            load_logical_plane(scroll_state.primary_cells)
+            active_plane_cells = (
+                *scroll_state.primary_cells,
+                *scroll_state.guard_cells,
+            )
+            alloc.replace_display_cells(
+                ((cell, cell) for cell in active_plane_cells),
+                clear_others=True,
+            )
+            allocation_cells = tuple(scroll_state.primary_cells)
+        else:
+            if previous_scroll_state is not None:
+                alloc.replace_display_cells(
+                    zip(
+                        normal_plane_cells,
+                        previous_scroll_state.primary_cells,
+                        strict=True,
+                    ),
+                    clear_others=True,
+                )
+                previous_scroll_state = None
+            allocation_cells = (
+                normal_plane_cells
+                if allocator_expanded else tuple(range(C_CELLS)))
+
+        pal_swap = SEGPAL_ON and i > 0 and int(frame_seg[i]) != int(frame_seg[i - 1])
+        if pal_swap:
+            cur_pal[:] = -1                                     # CRAM総入替→全セルを再評価(暗転中で安価)
+            cur_pals = np.asarray(
+                segment_entry_cram[int(frame_seg[i])], np.uint8).copy()
+        if int(frame_types[i]) != shadow_updates.FRAME_NORMAL:
+            if pal_swap:
+                raise AssertionError(
+                    f"frame {i}: fade control coincides with a palette segment switch")
+            cur_pals = np.asarray(frame_cram[i], np.uint8).copy()
+        cur_seg = int(frame_seg[i])                            # 現フレームのパレットエポック
+        # CRAMエミュ: 表示中タイルを現区間パレットで引き直す(pal_swap時は全セルが新CRAMで再色付け
+        # =区間跨ぎの旧タイルはここでゴミ色になる)。near/near_keep判定はこの実表示色に対して行う。
+        if i > 0:
+            cur_rgb[:] = render_cells(disp_idx, disp_pal, cur_pals)
+        if scroll_state is not None:
+            (
+                detail,
+                assign,
+                plain_idx,
+                guard_detail,
+                guard_assign,
+                guard_idx,
+                _guard_source_rgb,
+            ) = quantize_scroll_plane(i, scroll_state, cur_pals)
+        else:
+            detail = Q_detail[i]
+            assign = Q_assign[i]
+            plain_idx = Q_pidx[i]  # 前計算済み(並列)
+            guard_detail = np.zeros(0, np.float32)
+            guard_assign = np.zeros(0, np.int8)
+            guard_idx = np.zeros((0, TILE * TILE), np.uint8)
+        plain_rgb = render_cells(plain_idx, assign, cur_pals)  # 軽いので逐次(IPC回避)
+        plain_keys = [plain_idx[c].tobytes() for c in range(C_CELLS)]
+        # resident探索用の平均色バケツ座標(常時計算・軽い)
+        mbk = (plain_rgb.reshape(C_CELLS, 64, 3).mean(1) // RESIDENT_BW).astype(np.int32)
+
+        # 内容変化検出(dither非依存: plain同士で比較)
+        key_changed = np.fromiter(
+            (plain_keys[c] != committed_plain[c] for c in range(C_CELLS)), bool, C_CELLS)
+        pal_changed = assign.astype(np.int16) != cur_pal
+        changed = key_changed | pal_changed
+
+        if (int(frame_types[i]) != shadow_updates.FRAME_NORMAL
+                and changed.any()):
+            raise SystemExit(
+                f"automatic fade frame {i} was not fully prepared on its "
+                f"black anchor ({int(changed.sum())} cells still differ)")
+
+        diff = np.abs(plain_rgb.astype(np.int32) - cur_rgb.astype(np.int32)).sum(axis=(1, 2, 3))
+        if (prioritize_tile_edges or detail_motion) and i > 0 and scroll_state is None:
+            weight = 0.38 if detail_motion else 0.65
+            diff = diff + weight * tile_edge_error(cur_rgb, plain_rgb)
+        detail_norm = detail / (detail.max() + 1e-6)
+        # Miss/Flbkだけが前フレームまでに積んだ、距離加重圧力で
+        # 優先度を底上げする。Nearは短時間なら許容できるため対象外。
+        age_press = update_age_pressure(age_press, cell_tier, diff)
+        aging = priority_aging(age_press)
+        # 優先度 = RGB総和の変化量 × 任意の細かさ項 × 距離加重エージング × 枠重み
+        score = diff.astype(np.float64) * (1.0 + DETAIL_ALPHA * detail_norm) * aging * border_mask
+        tile_motion = None
+        if track_motion and i > 0:
+            if cached_luma is not None:
+                source_luma = cached_luma[i].astype(np.int16)
+            else:
+                with Image.open(frames[i]) as image:
+                    source_luma = np.asarray(image.convert("L"), dtype=np.int16)
+            if (scroll_state is None and i not in fade_prepare_frames
+                    and frame_types[i] == shadow_updates.FRAME_NORMAL):
+                # Give updates to moving areas before fine static texture.
+                delta = np.abs(source_luma - previous_luma)
+                tile_motion = delta.reshape(TROWS, TILE, TCOLS, TILE)
+                tile_motion = tile_motion.mean(axis=(1, 3)).ravel()
+                if prioritize_motion:
+                    score *= 1 + 3 * np.clip((tile_motion - 4) / 16, 0, 1)
+                    if detail_motion:
+                        # Repair older estimates on contours before refreshing
+                        # low-error texture across the same moving area.
+                        old = np.asarray(cell_tier) < 2
+                        score *= 1 + old * np.clip((tile_motion - 5) / 9, 0, 1) * 1.6
+            previous_luma = source_luma
+        # Near: 変化タイルのうち見た目ほぼ同じ(F3)は先に省略(old表示を維持)。買い戻し(Raw更新)は
+        # 準備金を食い潰すので入れない(=配給とセットでしか成立しないため今は無し)。
+        # MIDFAR時は Near も統合探索(commit_unified)で判定するので事前フィルタしない。
+        near = (near_mask_eval(cur_rgb, plain_rgb, changed)
+                if i > 0 and NEAR_ON and not MIDFAR_ON
+                else np.zeros(C_CELLS, bool))
+        # 同点tie-break: CENTERTIE_ON なら中央優先(lexsort: 主=-score, 副=center_dist)。
+        # 既定は従来どおり argsort(-score)=不定(実機用simの決定を変えないため)。
+        order = np.lexsort((center_dist, -score)) if CENTERTIE_ON else np.argsort(-score)
+        hold_display = bool(hold_frames[i])
+        order = [] if hold_display else [
+            int(c) for c in order if changed[c] and not near[c]]
+        if _loop_profile:
+            _lp_counts["changed"] += int(changed.sum())
+            _lp_counts["ordered"] += len(order)
+            _lp_t = _lp_mark("prepare", _lp_t, _lp_frame)
+
+        # Reserve the exact fixed BODY control first.  The remaining bytes come
+        # from the player's integer CD-sector cadence and fund variable control
+        # entries, run descriptors, and Prg pattern payload together.
+        budget = max(
+            int(body_variable_supply_bytes[i])
+            - (PAL_WRITE_BYTES if pal_swap else 0),
+            0,
+        )
+        frame_cd = budget                             # このフレーム自身のCDタイル予算
+        # frame0はDAT冒頭の専用ヘッダとしてboot中に時間無制限でVRAMへロードする(=ストリーミング
+        # PrgBuf/quality budgetを一切消費しない)。よってframe0は予算無制限で全面フルロードし、
+        # quality budgetは満量のままframe1へ渡す。実機の崩壊はframe0の大バーストが
+        # リングを削っていたのが原因で、ヘッダ化で根絶する。
+        if i == 0:
+            decision_budget = 1 << 30
+        elif QUALITY_BUDGET_ON:
+            funded_limit = upgrade_planner.planned_spend_limit(
+                budget_before=quality_budget,
+                frame_supply=frame_cd,
+                reserve_after=int(main_reserve_floor[i]),
+                already_spent=0,
+            )
+            decision_budget = funded_limit
+        else:
+            decision_budget = frame_cd
+        frame_total_budget = int(decision_budget)
+        frame_fade_prefetch_patterns = int(
+            fade_prefetch_plan.get(i, (None, None, None, None, 0))[4])
+        frame_fade_prefetch_bytes = int(fade_prefetch_demand[i])
+        cut_request = motion_prefetch.get(i) if compensate_motion and not hold_display else None
+        reserve_tiles = 0
+        if cut_request:
+            _deadline, keys, cap = cut_request
+            missing = sum(not alloc.is_resident(key) for key in keys)
+            reserve_tiles = min(cap, missing, frame_total_budget // 100)
+        reserve_bytes = reserve_tiles * (PATTERN_BYTES + stream_schedule.RUN_DESCRIPTOR_BYTES)
+        decision_budget = max(
+            0, frame_total_budget - frame_fade_prefetch_bytes - reserve_bytes)
+        frame_visible_decision_budget = int(decision_budget)
+        scroll_guard_budget_reserve = 0
+        if scroll_state is not None:
+            scroll_guard_budget_reserve = (
+                len(scroll_state.guard_cells)
+                * (
+                    update_entry_bytes
+                    + PATTERN_BYTES
+                    + stream_schedule.RUN_DESCRIPTOR_BYTES
+                )
+            )
+            decision_budget = max(
+                0,
+                frame_visible_decision_budget
+                - scroll_guard_budget_reserve,
+            )
+        frame_patch = (frozenset() if QUALITY_BUDGET_ON
+                       else prg_patch.get(i, frozenset()))
+
+        updated = np.zeros(C_CELLS, bool)
+        dedup_mask = np.zeros(C_CELLS, bool)   # 更新したが同一パターン流用(VRAM常駐)だったタイル
+        prg_mask = np.zeros(C_CELLS, bool)     # PRG先読みバッファから0CDで埋めたタイル
+        raw_mask = np.zeros(C_CELLS, bool)     # 新規CD転送したタイル(Raw)
+        near_mask = np.zeros(C_CELLS, bool)    # MIDFAR: ほぼ同一常駐を流用/維持(Near)
+        flbk_mask = np.zeros(C_CELLS, bool)    # MIDFAR: Missのフォールバック(荒くても常駐で穴埋め)(Flbk)
+        loaded_keys = set()
+        tile_recs = 0
+        name_recs = 0
+        dedup_saved = 0
+        l3_hits = 0
+        prg_hits = 0
+        spent_tiles = 0
+        cold_spent = 0             # このコマのcold数(Raw+Buf=実機のパターンDMA数)
+        prg_spent = 0              # このコマの物理PrgBuf消費数
+        frame_wr_budget_total = int(supply_budget.wr[i])
+        frame_wr_budget = frame_wr_budget_total
+        wr_used = 0
+        dic_used = 0
+        preload_sources = {}
+        physical_frame_limit = physical_budget_state.begin_frame(i)
+        cold_limit_active = i > 0
+        frame_max_cold = int(physical_frame_limit.cold_patterns)
+        frame_max_prg = int(physical_frame_limit.prg_patterns)
+        if scroll_state is not None:
+            # Fragmented scroll-frame colds are singleton runs; per-run setup
+            # time dominates. Keep the frame's transfer time at the qualified
+            # ordinary-frame level (see av_config.SCROLL_SINGLETON_COLD_FRACTION)
+            # while always affording the mandatory incoming guard column.
+            scroll_cold_ceiling = max(
+                len(scroll_state.guard_cells),
+                int(frame_max_cold
+                    * av_config.SCROLL_SINGLETON_COLD_FRACTION),
+            )
+            frame_max_cold = min(frame_max_cold, scroll_cold_ceiling)
+            frame_max_prg = min(frame_max_prg, scroll_cold_ceiling)
+        frame_control_block_limit = int(
+            physical_frame_limit.control_block_bytes)
+        visible_frame_max_cold = max(
+            0, frame_max_cold - frame_fade_prefetch_patterns - reserve_tiles)
+        visible_frame_max_prg = max(
+            0, frame_max_prg - frame_fade_prefetch_patterns - reserve_tiles)
+        scroll_guard_source_reserve = (
+            len(scroll_state.guard_cells)
+            if scroll_state is not None else 0)
+        scroll_guard_wr_reserve = min(
+            frame_wr_budget_total, scroll_guard_source_reserve)
+        scroll_prg_capacity_reserve = max(
+            scroll_guard_source_reserve,
+            int(scroll_anchor_guard_counts.get(i, 0)),
+        )
+        visible_frame_max_cold = max(
+            0, visible_frame_max_cold - scroll_guard_source_reserve)
+        frame_wr_budget = max(
+            0, frame_wr_budget_total - scroll_guard_wr_reserve)
+        visible_frame_max_prg = max(
+            0, visible_frame_max_prg - scroll_prg_capacity_reserve)
+        visible_control_block_limit = max(
+            int(body_fixed_control_bytes[i]),
+            frame_control_block_limit
+            - (frame_fade_prefetch_patterns + reserve_tiles)
+            * stream_schedule.RUN_DESCRIPTOR_BYTES,
+        )
+        # Pattern data is installed before the final name-table DMA. The
+        # preceding display therefore keeps all of its slots live while this
+        # frame's new and cache-only identities are prepared. Budget that
+        # temporary union explicitly; otherwise a zero-byte cache hit can
+        # still force an unfunded reload at allocation time.
+        transition_guard = FrameTransitionGuard(alloc)
+
+        def commit_repoint(c, key, pal, rgb):
+            transition_guard.commit(c, key)
+            repoint(c, key, pal, rgb, i)
+
+        def reserved_variable_spend(
+            decision_spent=0,
+            cold_tiles=0,
+        ):
+            """Upper-bound BODY work before actual source runs are known."""
+
+            return (
+                decision_spent
+                + cold_tiles * stream_schedule.RUN_DESCRIPTOR_BYTES)
+
+        def decision_fits(
+                cost, *, extra_cold=0, extra_updates=1, limit=None,
+                cell=None, key=None):
+            if limit is None:
+                limit = decision_budget
+            funded = reserved_variable_spend(
+                spent_tiles + cost,
+                cold_spent + extra_cold,
+            ) <= limit
+            control = (
+                int(body_fixed_control_bytes[i])
+                + (name_recs + int(extra_updates)) * update_entry_bytes
+                + (cold_spent + int(extra_cold))
+                * stream_schedule.RUN_DESCRIPTOR_BYTES
+            )
+            transition = (
+                cell is None or key is None
+                or transition_guard.fits(cell, key)
+            )
+            return (
+                funded
+                and control <= visible_control_block_limit
+                and transition
+            )
+
+        def current_reserved_spend():
+            return reserved_variable_spend(spent_tiles, cold_spent)
+
+        def preload_source(key):
+            if i == 0:
+                return pattern_supply.SOURCE_PRG
+            if key in dic_dictionary_keys:
+                return pattern_supply.SOURCE_DIC
+            if wr_used < frame_wr_budget:
+                return pattern_supply.SOURCE_WR
+            return pattern_supply.SOURCE_PRG
+
+        def commit_preload(key, source):
+            nonlocal wr_used, dic_used
+            if source == pattern_supply.SOURCE_DIC:
+                dic_used += 1
+            elif source == pattern_supply.SOURCE_WR:
+                wr_used += 1
+            else:
+                raise AssertionError("Prg is not a preload source")
+            preload_sources[key] = source
+
+        def prg_source_fits(
+                source, cell=None, *, preserve_fade_prefetch=True):
+            limit = (
+                visible_frame_max_prg
+                if preserve_fade_prefetch else frame_max_prg)
+            return (
+                source != pattern_supply.SOURCE_PRG
+                or prg_spent < limit
+            )
+
+        def commit_prg_source(
+                source, cell=None, *, preserve_fade_prefetch=True):
+            nonlocal prg_spent
+            if source == pattern_supply.SOURCE_PRG:
+                if not prg_source_fits(
+                        source,
+                        cell,
+                        preserve_fade_prefetch=preserve_fade_prefetch):
+                    raise AssertionError("per-frame cold cap exceeded by Prg")
+                prg_spent += 1
+        resident_bucket_cache = {}
+        adjacent_bucket_cache = {}
+        latest_resident_matches = [None] * C_CELLS if MIDFAR_ON else None
+        local_motion = compensate_motion and tile_motion is not None
+        if local_motion:
+            previous_keys = tuple(cur_key)
+        resident_buckets = defaultdict(list)
+        indexed_keys = set()
+        if MIDFAR_ON:
+            for key in alloc.key_slot:
+                history = pattern_history.get(key)
+                if history:
+                    indexed_keys.add(key)
+                    for bucket, serial in history:
+                        resident_buckets[bucket].append((serial, key))
+
+        def append_resident_bucket(key, bucket):
+            nonlocal occurrence
+            if not MIDFAR_ON:
+                return
+            adjacent_bucket_cache.clear()
+            history = pattern_history[key]
+            fresh = not history
+            if key not in indexed_keys:
+                # A reload makes earlier occurrences eligible again, with
+                # their original order and multiplicity.
+                indexed_keys.add(key)
+                for old_bucket, serial in history:
+                    resident_buckets[old_bucket].append((serial, key))
+            occurrence += 1
+            history.append((bucket, occurrence))
+            resident_buckets[bucket].append((occurrence, key))
+            if fresh:
+                entry = resident_bucket_cache.get(bucket)
+                if entry is not None and RESIDENT_K > 0:
+                    keys, descriptors = entry
+                    keys = (key,) + keys[:RESIDENT_K - 1]
+                    next_descriptors = np.empty((len(keys), 64), dtype=np.uint16)
+                    next_descriptors[0] = pat_colors[key]
+                    if len(keys) > 1:
+                        next_descriptors[1:] = descriptors[:len(keys) - 1]
+                    resident_bucket_cache[bucket] = keys, next_descriptors
+            else:
+                for affected, _serial in history:
+                    resident_bucket_cache.pop(affected, None)
+
+        def revalidate_pattern_segment(key):
+            if pat_seg.get(key) == cur_seg:
+                return
+            pat_seg[key] = cur_seg
+            adjacent_bucket_cache.clear()
+            for affected, _serial in pattern_history.get(key, ()):
+                resident_bucket_cache.pop(affected, None)
+
+        def activate_exact_pattern(key, cell):
+            """Publish a prefetched exact pattern to approximation metadata."""
+            if key not in pat_colors:
+                cache_pattern(key, plain_rgb[cell], assign[cell], cur_seg)
+                append_resident_bucket(
+                    key,
+                    (int(mbk[cell, 0]), int(mbk[cell, 1]), int(mbk[cell, 2])))
+            else:
+                revalidate_pattern_segment(key)
+
+        def commit_frame0_exact(c):
+            """Install frame 0 exactly; approximation has no boot-time value."""
+            nonlocal tile_recs, name_recs, dedup_saved, spent_tiles, cold_spent
+            key = plain_keys[c]
+            in_vram = key in loaded_keys
+            if in_vram:
+                dedup_saved += 1
+                dedup_mask[c] = True
+                activate_exact_pattern(key, c)
+                cost = update_entry_bytes
+            else:
+                loaded_keys.add(key)
+                cold_spent += 1
+                tile_recs += 1
+                raw_mask[c] = True
+                cost = update_entry_bytes + PATTERN_BYTES
+                cache_pattern(key, plain_rgb[c], assign[c], cur_seg)
+                append_resident_bucket(
+                    key,
+                    (int(mbk[c, 0]), int(mbk[c, 1]), int(mbk[c, 2])))
+            name_recs += 1
+            spent_tiles += cost
+            commit_repoint(c, key, int(assign[c]), plain_rgb[c])
+            committed_plain[c] = key
+            updated[c] = True
+
+        # frame0はBODY arm内のboot constructionなのでtimed limitsは0。
+
+        def commit_plain(c):
+            # Legacy non-unified path: exact resident/L3/preload/cold only.
+            nonlocal tile_recs, name_recs, dedup_saved, l3_hits, prg_hits, spent_tiles, cold_spent
+            key = plain_keys[c]
+            in_vram = alloc.is_resident(key) or key in loaded_keys      # L1/L2: VRAM常駐(転送ゼロ)
+            in_prg = (not in_vram) and key in frame_patch
+            in_l3 = (not in_vram) and (not in_prg) and L3_TILES > 0 and key in l3
+            free = in_vram or in_l3
+            source = (preload_source(key)
+                      if not in_prg and not free
+                      else pattern_supply.SOURCE_PRG)
+            preload = source != pattern_supply.SOURCE_PRG
+            cost = 0 if in_prg else (
+                update_entry_bytes + (0 if free or preload else PATTERN_BYTES))
+            if not decision_fits(
+                    cost, extra_cold=int(not free), cell=c, key=key):
+                return False
+            rep_key = key; rep_pal = int(assign[c]); rep_rgb = plain_rgb[c]
+            if in_vram:
+                dedup_saved += 1; dedup_mask[c] = True
+                activate_exact_pattern(key, c)
+            elif in_prg:
+                if ((cold_limit_active
+                     and cold_spent >= visible_frame_max_cold)
+                        or not prg_source_fits(source, c)):
+                    return False
+                cold_spent += 1
+                commit_prg_source(source, c)
+                prg_hits += 1; prg_mask[c] = True; loaded_keys.add(key)
+            elif in_l3:
+                l3_hits += 1; loaded_keys.add(key); l3.pop(key, None)
+            else:                                                # cold: exact pattern load (Raw or saved/preload-funded Buf)
+                if ((cold_limit_active
+                     and cold_spent >= visible_frame_max_cold)
+                        or not prg_source_fits(source, c)):
+                    return False
+                cold_spent += 1
+                commit_prg_source(source, c)
+                loaded_keys.add(key)
+                if preload:
+                    commit_preload(key, source)
+                    prg_hits += 1; prg_mask[c] = True
+                elif QUALITY_BUDGET_ON and current_reserved_spend() >= frame_cd:
+                    prg_hits += 1; prg_mask[c] = True
+                else:
+                    tile_recs += 1; raw_mask[c] = True
+                cache_pattern(key, plain_rgb[c], assign[c], cur_seg)
+                append_resident_bucket(
+                    key, (int(mbk[c, 0]), int(mbk[c, 1]), int(mbk[c, 2])))
+            name_recs += 1; spent_tiles += cost
+            commit_repoint(c, rep_key, rep_pal, rep_rgb)
+            committed_plain[c] = key; updated[c] = True
+            return True
+
+        # === 統合探索(MIDFAR): Same/Near/Flbk/Miss を1つのVRAM最良一致に統合 ===
+        if MIDFAR_ON:
+            # 現在表示がほぼ同一=0Bで維持可。ただし near_keep の入力 cur_rgb は「現在表示」なので、前フレームが
+            # Flbk の近似コピーだと、その近似をさらに Near として維持=ゴーストが居座る(issue #10)。
+            # よって現在表示が正確(cell_tier==9)なセルに限定。近似中のセルは best_resident で正解基準に再評価。
+            near_keep = near_mask_eval(cur_rgb, plain_rgb, changed)   # 現在表示がほぼ同一=0Bで維持可
+            if NEAR_KEEP_ACCURATE_ONLY:
+                near_keep = near_keep & (cell_tier == 9)
+            # 区間跨ぎ維持の禁止: 現在表示タイルが別区間(パレットエポック)由来なら、その index列を
+            # 現CRAMで引くとゴミ化する。維持不可=強制更新にする(harness/palette_flashで実証)。
+            for c in np.where(near_keep)[0]:
+                ck = cur_key[c]
+                if ck is None or pat_seg.get(ck) != cur_seg:
+                    near_keep[int(c)] = False
+            plain_colors = rendered_color_keys(plain_rgb).reshape(C_CELLS, 64)
+            cur_colors = rendered_color_keys(cur_rgb).reshape(C_CELLS, TILE, TILE)
+
+            def resident_entry(bucket):
+                """Return cached eligible keys and descriptors for one bucket."""
+                entry = resident_bucket_cache.get(bucket)
+                if entry is not None:
+                    if _loop_profile:
+                        _lp_counts["resident_cache_hits"] += 1
+                    return entry
+                if _loop_profile:
+                    _lp_counts["resident_cache_builds"] += 1
+                bucket_history = resident_buckets.get(bucket, ())
+                cand = []
+                for _serial, key in sorted(bucket_history, reverse=True):
+                    if pat_seg[key] == cur_seg:
+                        cand.append(key)
+                        if len(cand) >= RESIDENT_K:
+                            break
+                keys = tuple(cand)
+                descriptors = (
+                    np.stack([pat_colors[k] for k in keys]) if keys else None)
+                entry = (keys, descriptors)
+                resident_bucket_cache[bucket] = entry
+                return entry
+
+            def best_resident(c):
+                """target に最も近い常駐候補 (key, dYm, dYp, dCm)。無ければ (None,大,大,大)。
+                平均色バケツで前絞り→候補のF3(画素輝度差平均/最大・色差平均)をベクトル計算し最小を採る。"""
+                if _loop_profile:
+                    _lp_counts["resident_calls"] += 1
+                    _br_t = time.perf_counter()
+                b = (int(mbk[c, 0]), int(mbk[c, 1]), int(mbk[c, 2]))
+                entry = resident_entry(b)
+                cand, arr = entry
+                if _loop_profile:
+                    _lp_counts["resident_candidates"] += len(cand)
+                    _elapsed = time.perf_counter() - _br_t
+                    _lp_nested_totals["resident_filter"] += _elapsed
+                    _lp_nested_frame["resident_filter"] += _elapsed
+                if not cand:
+                    if _loop_profile:
+                        _lp_counts["resident_empty"] += 1
+                    return (None, 1e9, 1e9, 1e9)
+                if _loop_profile:
+                    _br_t = time.perf_counter()
+                latest = latest_resident_matches[c]
+                if latest is not None and latest[0] is entry:
+                    return latest[1]
+                target = plain_colors[c]
+                if HAS_NUMBA:
+                    j, ym, yp, cm = best_resident_metrics(
+                        arr, target, _F3_DY_LUT, _F3_DC_LUT)
+                else:
+                    dY = _F3_DY_LUT[arr, target]
+                    dYm = dY.mean(1)
+                    dYp = dY.max(1)
+                    dCm = _F3_DC_LUT[arr, target].mean(1)
+                    j = int(np.argmin(dYm + 0.3 * dYp + 0.5 * dCm))
+                    ym, yp, cm = float(dYm[j]), float(dYp[j]), float(dCm[j])
+                if _loop_profile:
+                    _elapsed = time.perf_counter() - _br_t
+                    _lp_nested_totals["resident_distance"] += _elapsed
+                    _lp_nested_frame["resident_distance"] += _elapsed
+                result = cand[j], ym, yp, cm
+                latest_resident_matches[c] = entry, result
+                return result
+
+            def adjacent_residents(c):
+                """Take the newest eligible resident from each neighbouring colour bucket."""
+                b = (int(mbk[c, 0]), int(mbk[c, 1]), int(mbk[c, 2]))
+                entry = adjacent_bucket_cache.get(b)
+                if entry is None:
+                    candidates = []
+                    seen = set()
+                    for dr, dg, db in RESIDENT_NEIGHBOURS:
+                        neighbour = (b[0] + dr, b[1] + dg, b[2] + db)
+                        if min(neighbour) < 0:
+                            continue
+                        neighbour_keys, _descriptors = resident_entry(neighbour)
+                        for key in neighbour_keys:
+                            if key not in seen:
+                                candidates.append(key)
+                                seen.add(key)
+                                break
+                    entry = (candidates, np.stack([pat_colors[k] for k in candidates])
+                             if candidates else None)
+                    adjacent_bucket_cache[b] = entry
+                return entry
+
+            def best_adjacent_resident(c):
+                if _loop_profile:
+                    _lp_counts["resident_adjacent_calls"] += 1
+                    _br_t = time.perf_counter()
+                cand, arr = adjacent_residents(c)
+                if _loop_profile:
+                    _lp_counts["resident_adjacent_candidates"] += len(cand)
+                if not cand:
+                    if _loop_profile:
+                        _lp_counts["resident_adjacent_empty"] += 1
+                        _elapsed = time.perf_counter() - _br_t
+                        _lp_nested_totals["resident_filter"] += _elapsed
+                        _lp_nested_frame["resident_filter"] += _elapsed
+                    return (None, 1e9, 1e9, 1e9)
+                if _loop_profile:
+                    _elapsed = time.perf_counter() - _br_t
+                    _lp_nested_totals["resident_filter"] += _elapsed
+                    _lp_nested_frame["resident_filter"] += _elapsed
+                    _br_t = time.perf_counter()
+                target = plain_colors[c]
+                if HAS_NUMBA:
+                    j, ym, yp, cm = best_resident_metrics(
+                        arr, target, _F3_DY_LUT, _F3_DC_LUT)
+                else:
+                    dY = _F3_DY_LUT[arr, target]
+                    dYm = dY.mean(1)
+                    dYp = dY.max(1)
+                    dCm = _F3_DC_LUT[arr, target].mean(1)
+                    j = int(np.argmin(dYm + 0.3 * dYp + 0.5 * dCm))
+                    ym, yp, cm = float(dYm[j]), float(dYp[j]), float(dCm[j])
+                if _loop_profile:
+                    _elapsed = time.perf_counter() - _br_t
+                    _lp_nested_totals["resident_distance"] += _elapsed
+                    _lp_nested_frame["resident_distance"] += _elapsed
+                return cand[j], ym, yp, cm
+
+            def choose_smooth_fallback(c, baseline):
+                """Choose an affordable pattern with fewer visible seams in motion."""
+                bucket = tuple(int(value) for value in mbk[c])
+                local, _ = resident_entry(bucket)
+                nearby, _ = adjacent_residents(c)
+                candidates = tuple(dict.fromkeys(
+                    key for key in (baseline, *local, *nearby) if key is not None))
+                if not candidates:
+                    return baseline
+
+                # Include leaving the current tile in place as a reference.
+                target = plain_colors[c]
+                current = cur_colors[c].ravel()
+                if HAS_NUMBA:
+                    n_cand = len(candidates) + 1
+                    patterns = np.empty((n_cand, 64), dtype=np.uint16)
+                    patterns[0] = current
+                    for idx_k, k in enumerate(candidates):
+                        patterns[idx_k + 1] = pat_colors[k]
+                    fidelity, quality = score_smooth_fallback_numba(
+                        patterns, target, cur_colors, plain_colors, c,
+                        TROWS, TCOLS, _F3_DY_LUT, _F3_DC_LUT, _MD_LUM,
+                    )
+                else:
+                    patterns = np.stack([current, *(pat_colors[k] for k in candidates)])
+                    pixel_error = _F3_DY_LUT[patterns, target]
+                    color_error = _F3_DC_LUT[patterns, target].mean(axis=1)
+                    fidelity = pixel_error.mean(axis=1) + 0.3 * pixel_error.max(axis=1) + 0.5 * color_error
+                    luma = _MD_LUM[patterns].reshape(-1, TILE, TILE)
+                    target_luma = _MD_LUM[target].reshape(TILE, TILE)
+                    residual = luma - target_luma
+                    subcells = luma.reshape(-1, 2, TILE // 2, 2, TILE // 2)
+                    target_subcells = target_luma.reshape(2, TILE // 2, 2, TILE // 2)
+                    shape_error = np.abs(subcells.mean(axis=(2, 4)) -
+                                         target_subcells.mean(axis=(1, 3))).mean(axis=(1, 2))
+                    excess_texture = np.maximum(
+                        subcells.std(axis=(2, 4)) - target_subcells.std(axis=(1, 3)),
+                        0).mean(axis=(1, 2))
+                    seam_error = np.zeros(len(luma))
+                    edges = 0
+                    row, col = divmod(c, TCOLS)
+                    for valid, neighbour, edge, opposite in (
+                        (col > 0, c - 1, np.s_[:, 0], np.s_[:, -1]),
+                        (col + 1 < TCOLS, c + 1, np.s_[:, -1], np.s_[:, 0]),
+                        (row > 0, c - TCOLS, np.s_[0, :], np.s_[-1, :]),
+                        (row + 1 < TROWS, c + TCOLS, np.s_[-1, :], np.s_[0, :]),
+                    ):
+                        if valid:
+                            shown = cur_colors[neighbour][opposite]
+                            ideal = plain_colors[neighbour].reshape(TILE, TILE)[opposite]
+                            seam_error += np.abs(
+                                residual[(slice(None), *edge)] - (_MD_LUM[shown] - _MD_LUM[ideal])
+                            ).mean(axis=1)
+                            edges += 1
+                    quality = fidelity + shape_error + excess_texture + 1.5 * seam_error / max(1, edges)
+                reference = 1 if baseline is not None else 0
+                for index in np.argsort(quality, kind="stable"):
+                    if quality[index] >= quality[reference]:
+                        break
+                    if index == 0 or fidelity[index] > fidelity[reference] + 5:
+                        continue
+                    key = candidates[index - 1]
+                    if decision_fits(update_entry_bytes, cell=c, key=key):
+                        return key
+                return baseline
+
+            def match_motion(c, baseline):
+                """Compare nearby previous-frame tiles against the current target."""
+                row, col = divmod(c, TCOLS)
+                neighbours = dict.fromkeys(
+                    previous_keys[y * TCOLS + x]
+                    for y in range(max(0, row - 2), min(TROWS, row + 3))
+                    for x in range(max(0, col - 2), min(TCOLS, col + 3)))
+                keys = [key for key in neighbours
+                        if key != baseline and pat_seg.get(key) == cur_seg
+                        and alloc.is_resident(key)]
+                if not keys:
+                    return baseline
+                reference = (pat_colors[baseline] if baseline is not None else
+                             cur_colors[c].ravel())
+                target = plain_colors[c]
+                if HAS_NUMBA:
+                    n_cand = len(keys) + 1
+                    colors = np.empty((n_cand, 64), dtype=np.uint16)
+                    colors[0] = reference
+                    for idx_k, k in enumerate(keys):
+                        colors[idx_k + 1] = pat_colors[k]
+                    scores = score_match_motion_numba(
+                        colors, target, cur_colors, plain_colors, c,
+                        TROWS, TCOLS, bool(detail_motion),
+                        _F3_DY_LUT, _F3_DC_LUT, _MD_LUM,
+                    )
+                else:
+                    colors = np.stack([reference, *(pat_colors[key] for key in keys)])
+                    luma_error = _F3_DY_LUT[colors, target]
+                    color_error = _F3_DC_LUT[colors, target]
+                    bias = np.abs((_MD_LUM[colors] - _MD_LUM[target]).mean(axis=1))
+                    scores = (luma_error.mean(axis=1) + 0.3 * luma_error.max(axis=1)
+                              + 0.5 * color_error.mean(axis=1) + 0.8 * bias)
+                    if detail_motion:
+                        target_tiles = plain_colors.reshape(C_CELLS, TILE, TILE)
+                        residual = (_MD_LUM[colors] - _MD_LUM[target]).reshape(-1, TILE, TILE)
+                        seams = np.zeros(len(colors))
+                        edges = 0
+                        for valid, neighbour, edge, opposite in (
+                            (col > 0, c - 1, np.s_[:, 0], np.s_[:, -1]),
+                            (col + 1 < TCOLS, c + 1, np.s_[:, -1], np.s_[:, 0]),
+                            (row > 0, c - TCOLS, np.s_[0, :], np.s_[-1, :]),
+                            (row + 1 < TROWS, c + TCOLS, np.s_[-1, :], np.s_[0, :]),
+                        ):
+                            if valid:
+                                nearby = _MD_LUM[cur_colors[neighbour][opposite]]
+                                ideal = _MD_LUM[target_tiles[neighbour][opposite]]
+                                seams += np.abs(residual[(slice(None), *edge)] - (nearby - ideal)).mean(axis=1)
+                                edges += 1
+                        scores += 0.6 * seams / max(edges, 1)
+                for index in np.argsort(scores[1:], kind="stable"):
+                    if scores[index + 1] + 1 >= scores[0]:
+                        break
+                    key = keys[index]
+                    if decision_fits(update_entry_bytes, cell=c, key=key):
+                        return key
+                return baseline
+
+            def tier_of(dYm, dYp, dCm):
+                for ti, (_nm, Ym, Yp, C) in enumerate(MIDFAR_TIERS):
+                    if dYm <= Ym and dYp <= Yp and dCm <= C:
+                        return ti          # 0=near,1=flbk
+                return -1
+
+            pending_exact_or_fallback = []
+
+            def commit_unified_cheap(c):
+                """Commit zero/2-byte decisions; defer every cold exact choice."""
+                nonlocal tile_recs, name_recs, dedup_saved, prg_hits, spent_tiles, cold_spent
+                key = plain_keys[c]
+                # 1. 現在表示がほぼ同一 → Near維持(0B, 更新なし・Missでもない)=帯域優先
+                if near_keep[c]:
+                    near_mask[c] = True
+                    return
+                exact = alloc.is_resident(key) or key in loaded_keys
+                if exact:
+                    bk, tier = key, 0
+                else:
+                    bk, dYm, dYp, dCm = best_resident(c)
+                    tier = tier_of(dYm, dYp, dCm) if bk is not None else -1
+                # 2. Good reuse (Same=exact / Near=tier0) points at resident VRAM.
+                selected_key = key if exact else bk
+                if ((exact or (bk is not None and tier == 0))
+                        and decision_fits(
+                            update_entry_bytes, cell=c, key=selected_key)):
+                    if exact:
+                        dedup_saved += 1; dedup_mask[c] = True                # Same(完全一致流用=Sameへ畳む)
+                        rk, rp, rr = key, int(assign[c]), plain_rgb[c]
+                        activate_exact_pattern(key, c)                        # fresh/prefetched keyを有効化
+                    else:
+                        near_mask[c] = True; rk, rp, rr = bk, pat_pal[bk], pat_rgb[bk]
+                    loaded_keys.add(rk); name_recs += 1; spent_tiles += update_entry_bytes
+                    commit_repoint(c, rk, rp, rr); committed_plain[c] = key; updated[c] = True
+                    return
+                # Cold exact and fallback share the remaining frame budget.
+                # Defer both so the exact selector can preserve every pending
+                # cell's two-byte fallback entry before spending pattern/run
+                # bytes.  Otherwise early exact loads can make step 4
+                # unreachable even when a resident fallback exists.
+                pending_exact_or_fallback.append(int(c))
+
+            def commit_unified_exact(c, limit):
+                """Try an exact decision while preserving later fallback names."""
+                nonlocal tile_recs, name_recs, dedup_saved, prg_hits, spent_tiles, cold_spent
+                key = plain_keys[c]
+                exact = alloc.is_resident(key) or key in loaded_keys
+                if exact:
+                    if not decision_fits(
+                            update_entry_bytes, limit=limit, cell=c, key=key):
+                        return False
+                    dedup_saved += 1
+                    dedup_mask[c] = True
+                    activate_exact_pattern(key, c)
+                    loaded_keys.add(key)
+                    name_recs += 1
+                    spent_tiles += update_entry_bytes
+                    commit_repoint(c, key, int(assign[c]), plain_rgb[c])
+                    committed_plain[c] = key
+                    updated[c] = True
+                    return True
+
+                source = preload_source(key)
+                preload = source != pattern_supply.SOURCE_PRG
+                cost = update_entry_bytes + (0 if preload else PATTERN_BYTES)
+                if (decision_fits(
+                            cost, extra_cold=1, cell=c, key=key)
+                        and decision_fits(
+                            cost, extra_cold=1, limit=limit,
+                            cell=c, key=key)
+                        and prg_source_fits(source, c)
+                        and not (
+                            cold_limit_active
+                            and cold_spent >= visible_frame_max_cold)):
+                    cold_spent += 1
+                    commit_prg_source(source, c)
+                    loaded_keys.add(key)
+                    if preload:
+                        commit_preload(key, source)
+                        prg_hits += 1; prg_mask[c] = True
+                    elif QUALITY_BUDGET_ON and current_reserved_spend() >= frame_cd:
+                        prg_hits += 1; prg_mask[c] = True
+                    else:
+                        tile_recs += 1; raw_mask[c] = True
+                    cache_pattern(key, plain_rgb[c], assign[c], cur_seg)
+                    append_resident_bucket(
+                        key, (int(mbk[c, 0]), int(mbk[c, 1]), int(mbk[c, 2])))
+                    name_recs += 1; spent_tiles += cost
+                    commit_repoint(c, key, int(assign[c]), plain_rgb[c]); committed_plain[c] = key; updated[c] = True
+                    return True
+                if _loop_profile:
+                    _lp_counts["exact_blocked"] += 1
+                return False
+
+            def commit_unified_fallback(c):
+                """Use the best resident fallback after the exact selection."""
+                nonlocal name_recs, dedup_saved, spent_tiles
+                key = plain_keys[c]
+                exact = alloc.is_resident(key) or key in loaded_keys
+                if exact:
+                    if not decision_fits(
+                            update_entry_bytes, cell=c, key=key):
+                        if _loop_profile:
+                            _lp_counts["flbk_budget_blocked"] += 1
+                        return
+                    dedup_saved += 1
+                    dedup_mask[c] = True
+                    activate_exact_pattern(key, c)
+                    loaded_keys.add(key)
+                    name_recs += 1
+                    spent_tiles += update_entry_bytes
+                    commit_repoint(c, key, int(assign[c]), plain_rgb[c])
+                    committed_plain[c] = key
+                    updated[c] = True
+                    return
+
+                bk, dYm, dYp, dCm = best_resident(c)
+                old_score = None
+
+                def acceptable(candidate, ym, yp, cm):
+                    nonlocal old_score
+                    if candidate is None:
+                        return False
+                    if not FLBK_IMPROVE_ONLY:
+                        return tier_of(ym, yp, cm) == 1
+                    if old_score is None:
+                        if HAS_NUMBA:
+                            old_score = float(cell_f3_score_lut(
+                                cur_colors[c].ravel(), plain_colors[c],
+                                _F3_DY_LUT, _F3_DC_LUT,
+                            ))
+                        else:
+                            cur = cur_rgb[c].astype(np.float64)
+                            tgt = plain_rgb[c].astype(np.float64)
+                            dY0 = np.abs(cur @ _LWv - tgt @ _LWv)
+                            dC0 = np.sqrt((cur @ _CBv - tgt @ _CBv) ** 2 +
+                                         (cur @ _CRv - tgt @ _CRv) ** 2)
+                            old_score = float(
+                                dY0.mean() + 0.3 * dY0.max() + 0.5 * dC0.mean())
+                    new_score = ym + 0.3 * yp + 0.5 * cm
+                    return new_score < old_score - FLBK_MIN_IMPROVE
+
+                accepted = acceptable(bk, dYm, dYp, dCm)
+                if not accepted:
+                    abk, aYm, aYp, aCm = best_adjacent_resident(c)
+                    if acceptable(abk, aYm, aYp, aCm):
+                        bk, dYm, dYp, dCm = abk, aYm, aYp, aCm
+                        accepted = True
+                if local_motion and FLBK_IMPROVE_ONLY and tile_motion[c] >= 7:
+                    choice = match_motion(c, bk if accepted else None)
+                    if choice is not None:
+                        bk, accepted = choice, True
+                if (smooth_motion_fallback and FLBK_IMPROVE_ONLY
+                        and tile_motion is not None and tile_motion[c] >= 8):
+                    choice = choose_smooth_fallback(c, bk if accepted else None)
+                    if choice is not None:
+                        bk, accepted = choice, True
+                # 4. ロード不可(画質予算尽き) → Flbk 近似流用(2B)で穴埋め(Missのフォールバック)。
+                #    改善モード(既定): 絶対しきいに縛らず、現在表示より少しでも target に近づく候補なら採る。
+                #    絶対モード(CBRSIM_FLBK_IMPROVE_ONLY=0): flbk tier(絶対しきい)内の候補のみ。
+                if bk is None:
+                    if _loop_profile:
+                        _lp_counts["flbk_no_candidate"] += 1
+                    return
+                if not decision_fits(
+                        update_entry_bytes, cell=c, key=bk):
+                    if _loop_profile:
+                        _lp_counts["flbk_budget_blocked"] += 1
+                    return
+                if bk is not None and not exact:
+                    if not accepted:
+                        if _loop_profile:
+                            _lp_counts[
+                                "flbk_not_improved"
+                                if FLBK_IMPROVE_ONLY
+                                else "flbk_absolute_reject"] += 1
+                        return
+                    if _loop_profile:
+                        _lp_counts["flbk_accepted"] += 1
+                    flbk_mask[c] = True
+                    loaded_keys.add(bk); name_recs += 1; spent_tiles += update_entry_bytes
+                    # 変化検出には理想keyではなく実際に表示した近似bkを記録する。
+                    # 理想keyを記録すると静止セルが次コマから「変化なし」になり、
+                    # cold枠が余っていてもショット終了まで補正されない(issue #104)。
+                    commit_repoint(c, bk, pat_pal[bk], pat_rgb[bk]); committed_plain[c] = bk; updated[c] = True
+                    return
+                # 5. Miss(何もしない)
+
+        if _loop_profile:
+            _lp_t = _lp_mark("decision_setup", _lp_t, _lp_frame)
+
+        # 優先度順(予算内)。買えない高優先はスキップし、安い(常駐)セルは拾う
+        if i == 0:
+            for c in range(C_CELLS):
+                commit_frame0_exact(c)
+        elif i in fade_prepare_frames and MIDFAR_ON:
+            # The hidden reference can be larger than one frame's cold-load
+            # cap.  Spend every black frame in the detected run preparing it,
+            # and require exact completion only on that run's final frame.
+            # Retry blocked cells because a later cell can load a shared key
+            # that makes an earlier name-only update affordable.
+            resident_before = sum(
+                1 for c in order
+                if alloc.is_resident(plain_keys[c]))
+            pending = list(order)
+            while pending:
+                deferred = []
+                progressed = False
+                for c in pending:
+                    if commit_unified_exact(c, decision_budget):
+                        progressed = True
+                    else:
+                        deferred.append(c)
+                pending = deferred
+                if not progressed:
+                    break
+            if i in fade_prepare_deadlines:
+                print(
+                    "  fade prepare: "
+                    f"f{i} cells={len(order)} "
+                    f"resident_before={resident_before} "
+                    f"cold={cold_spent}/{frame_max_cold} "
+                    f"Prg={prg_spent}/{frame_max_prg} "
+                    f"remaining={len(pending)}",
+                    flush=True,
+                )
+            if pending and i in fade_prepare_deadlines:
+                c = int(pending[0])
+                blocked = {
+                    "funded": 0, "control": 0, "transition": 0,
+                    "prg_source": 0, "cold_limit": 0,
+                }
+                for probe in pending:
+                    key = plain_keys[probe]
+                    source = preload_source(key)
+                    cost = update_entry_bytes + (
+                        0 if source != pattern_supply.SOURCE_PRG
+                        else PATTERN_BYTES)
+                    if reserved_variable_spend(
+                            spent_tiles + cost,
+                            cold_spent + 1) > decision_budget:
+                        blocked["funded"] += 1
+                    ctrl = (
+                        int(body_fixed_control_bytes[i])
+                        + (name_recs + 1) * update_entry_bytes
+                        + (cold_spent + 1)
+                        * stream_schedule.RUN_DESCRIPTOR_BYTES)
+                    if ctrl > visible_control_block_limit:
+                        blocked["control"] += 1
+                    if not transition_guard.fits(probe, key):
+                        blocked["transition"] += 1
+                    if not prg_source_fits(source, probe):
+                        blocked["prg_source"] += 1
+                    if (cold_limit_active
+                            and cold_spent >= visible_frame_max_cold):
+                        blocked["cold_limit"] += 1
+                deadline_shot = next(
+                    shot for shot in fade_layout.shots
+                    if int(shot.preparation_end) == i)
+                raise FadeDeadlineInfeasible(
+                    int(deadline_shot.anchor),
+                    f"automatic fade preparation deadline {i} cannot "
+                    f"prepare exact cell {c} within its frozen "
+                    f"quality/cold limits "
+                    f"(remaining={len(pending)}, "
+                    f"cold={cold_spent}/{frame_max_cold}, "
+                    f"Prg={prg_spent}/{frame_max_prg}, "
+                    f"work={current_reserved_spend()}/{decision_budget}B, "
+                    f"control={int(body_fixed_control_bytes[i]) + name_recs * update_entry_bytes + cold_spent * stream_schedule.RUN_DESCRIPTOR_BYTES}/"
+                    f"{frame_control_block_limit}B; "
+                    f"blocked_by funded={blocked['funded']} "
+                    f"control={blocked['control']} "
+                    f"transition={blocked['transition']} "
+                    f"prg_source={blocked['prg_source']} "
+                    f"cold_limit={blocked['cold_limit']}; "
+                    f"guard_used={transition_guard.used}/"
+                    f"{transition_guard.capacity})")
+        elif MIDFAR_ON:
+            # Phase 1: establish every free/cheap result without allowing a
+            # cold load to consume a later cell's fallback entry.
+            for c in order:
+                commit_unified_cheap(c)
+
+            # Phase 2: select exact loads in the same priority order.  Each
+            # accepted exact includes its own two-byte name and must leave two
+            # bytes for every still-pending cell.  This makes the final
+            # fallback phase reachable by construction.
+            exact_deferred = []
+            pending_count = len(pending_exact_or_fallback)
+            for position, c in enumerate(pending_exact_or_fallback):
+                remaining = pending_count - position - 1
+                fallback_reserve = len(exact_deferred) + remaining
+                exact_limit = (
+                    decision_budget - fallback_reserve * update_entry_bytes)
+                if not commit_unified_exact(c, exact_limit):
+                    exact_deferred.append(c)
+
+            # Phase 3: newly loaded exact patterns are now eligible resident
+            # candidates too, so recompute the best fallback at commit time.
+            for c in exact_deferred:
+                commit_unified_fallback(c)
+        else:
+            for c in order:
+                commit_plain(c)
+        if _loop_profile:
+            _lp_t = _lp_mark("decision_commit", _lp_t, _lp_frame)
+
+        # Upgrade approximate or carried cells to exact Raw/Buf using only
+        # bytes above this frame's whole-movie reserve target.
+        upgraded = 0
+        if i > 0 and UPGRADE_ON and QUALITY_BUDGET_ON and not hold_display:
+            upgrade_funded_limit = upgrade_planner.planned_spend_limit(
+                budget_before=quality_budget,
+                frame_supply=frame_cd,
+                reserve_after=int(upgrade_reserve_floor[i]),
+                already_spent=current_reserved_spend(),
+            )
+            upgrade_limit = max(
+                current_reserved_spend(),
+                upgrade_funded_limit,
+            )
+            if current_reserved_spend() < upgrade_limit:
+                def raw_upgrade(c, lim):
+                    nonlocal tile_recs, name_recs, dedup_saved, prg_hits, spent_tiles, upgraded, cold_spent
+                    key = plain_keys[c]
+                    in_vram = alloc.is_resident(key) or key in loaded_keys
+                    # A same-frame Near/Flbk decision already owns one
+                    # packed update entry.  Upgrading it replaces that entry's
+                    # final key; it does not append a second two-byte entry.
+                    # A carried approximation or Near keep has no entry yet.
+                    entry_cost = 0 if updated[c] else update_entry_bytes
+                    source = (preload_source(key) if not in_vram
+                              else pattern_supply.SOURCE_PRG)
+                    preload = source != pattern_supply.SOURCE_PRG
+                    cost = entry_cost if in_vram else (
+                        entry_cost + (0 if preload else PATTERN_BYTES))
+                    if not decision_fits(
+                            cost,
+                            extra_cold=int(not in_vram),
+                            extra_updates=int(not updated[c]),
+                            limit=lim,
+                            cell=c,
+                            key=key):
+                        return
+                    if ((not in_vram)
+                            and (
+                                (cold_limit_active
+                                 and cold_spent >= visible_frame_max_cold)
+                                or not prg_source_fits(source, c))):
+                        return
+                    near_mask[c] = False; flbk_mask[c] = False   # 近似を取消
+                    if in_vram:
+                        dedup_saved += 1; dedup_mask[c] = True
+                        activate_exact_pattern(key, c)
+                    else:
+                        cold_spent += 1
+                        commit_prg_source(source, c)
+                        loaded_keys.add(key)
+                        if preload:
+                            commit_preload(key, source)
+                            prg_hits += 1; prg_mask[c] = True
+                        else:
+                            tile_recs += 1; raw_mask[c] = True
+                        cache_pattern(key, plain_rgb[c], assign[c], cur_seg)
+                        append_resident_bucket(
+                            key, (int(mbk[c, 0]), int(mbk[c, 1]), int(mbk[c, 2])))
+                    if not updated[c]:
+                        name_recs += 1
+                    spent_tiles += cost
+                    commit_repoint(c, key, int(assign[c]), plain_rgb[c])
+                    committed_plain[c] = key; updated[c] = True; upgraded += 1
+                carried = (cell_tier < 9) & ~changed            # 変化せず近似のまま持ち越し(安定Near等)
+                cand_mask = near_mask | flbk_mask | carried
+                sev = np.full(C_CELLS, 9, np.int16)             # 劣化が重い順に格上げ(sev小=先)
+                sev[carried] = cell_tier[carried]
+                sev[flbk_mask] = 1; sev[near_mask] = 2
+                # A persistent approximation remains the highest-priority
+                # exact correction; every severity shares the same reserve.
+                if GHOST_ESCALATE_N:
+                    sev[(approx_carry >= GHOST_ESCALATE_N) & cand_mask] = 0
+                upgrade_score = score
+                if prioritize_tile_edges and scroll_state is None:
+                    upgrade_score = score + 0.65 * tile_edge_error(cur_rgb, plain_rgb)
+                for c in sorted((int(x) for x in np.where(cand_mask)[0]),
+                                key=lambda c: (int(sev[c]), -float(age_press[c]), -upgrade_score[c])):
+                    raw_upgrade(c, upgrade_limit)
+        if _loop_profile:
+            _lp_t = _lp_mark("upgrade", _lp_t, _lp_frame)
+
+        # The fine-scroll viewport can expose one extra incoming tile column
+        # or row.  Encode that guard edge exactly before allocation.  It is
+        # outside the 40x28 analysis category map, but it shares the same cold,
+        # Prg, control, and physical-deadline limits as visible work.
+        guard_updates = []
+        if scroll_state is not None:
+            # Primary decisions left a conservative exact edge allowance.
+            # Release it only to the guard path; unused bytes become ordinary
+            # post-decision/prefetch room later in this frame.
+            decision_budget = frame_visible_decision_budget
+            frame_wr_budget = frame_wr_budget_total
+            visible_frame_max_cold = max(
+                0, frame_max_cold - frame_fade_prefetch_patterns)
+            visible_frame_max_prg = max(
+                0, frame_max_prg - frame_fade_prefetch_patterns)
+            guard_rgb = render_cells(guard_idx, guard_assign, cur_pals)
+            guard_keys = [
+                guard_idx[index].tobytes()
+                for index in range(len(scroll_state.guard_cells))
+            ]
+            for guard_index, physical_cell in enumerate(
+                    scroll_state.guard_cells):
+                key = guard_keys[guard_index]
+                palette_line = int(guard_assign[guard_index])
+                if (key == plane_committed[physical_cell]
+                        and palette_line == int(plane_pal[physical_cell])):
+                    continue
+                resident = alloc.is_resident(key) or key in loaded_keys
+                source = (
+                    pattern_supply.SOURCE_PRG
+                    if resident else preload_source(key))
+                preload = source != pattern_supply.SOURCE_PRG
+                cost = update_entry_bytes + (
+                    0 if resident or preload else PATTERN_BYTES)
+                extra_cold = int(not resident)
+                if (not decision_fits(
+                        cost, extra_cold=extra_cold, extra_updates=1)
+                        or (
+                            not resident
+                            and (
+                                (cold_limit_active
+                                 and cold_spent >= visible_frame_max_cold)
+                                or not prg_source_fits(
+                                    source, int(physical_cell))
+                            )
+                        )):
+                    raise SystemExit(
+                        f"automatic scroll frame {i} cannot prepare guard "
+                        f"cell {int(physical_cell)} within the frozen "
+                        f"quality/cold limits (guard={guard_index + 1}/"
+                        f"{len(scroll_state.guard_cells)}, "
+                        f"cold={cold_spent}/{visible_frame_max_cold}, "
+                        f"Prg={prg_spent}/{visible_frame_max_prg}, "
+                        f"work={current_reserved_spend()}/{decision_budget}B)")
+                if resident:
+                    dedup_saved += 1
+                    if key not in pat_colors:
+                        cache_pattern(
+                            key, guard_rgb[guard_index], palette_line, cur_seg)
+                        mean = (
+                            guard_rgb[guard_index].reshape(64, 3).mean(0)
+                            // RESIDENT_BW
+                        ).astype(np.int32)
+                        append_resident_bucket(
+                            key, tuple(int(value) for value in mean))
+                    else:
+                        revalidate_pattern_segment(key)
+                else:
+                    cold_spent += 1
+                    commit_prg_source(source, int(physical_cell))
+                    loaded_keys.add(key)
+                    if preload:
+                        commit_preload(key, source)
+                    else:
+                        tile_recs += 1
+                    cache_pattern(
+                        key, guard_rgb[guard_index], palette_line, cur_seg)
+                    mean = (
+                        guard_rgb[guard_index].reshape(64, 3).mean(0)
+                        // RESIDENT_BW
+                    ).astype(np.int32)
+                    append_resident_bucket(
+                        key, tuple(int(value) for value in mean))
+                name_recs += 1
+                spent_tiles += cost
+                plane_key[physical_cell] = key
+                plane_pal[physical_cell] = palette_line
+                plane_committed[physical_cell] = key
+                plane_disp_idx[physical_cell] = guard_idx[guard_index]
+                plane_disp_pal[physical_cell] = palette_line
+                plane_wait[physical_cell] = 0
+                plane_age_press[physical_cell] = 0.0
+                plane_cell_tier[physical_cell] = 9
+                plane_approx_carry[physical_cell] = 0
+                guard_updates.append(
+                    (int(physical_cell), palette_line, key))
+
+        # 共有割り当て: このフレームの更新セルを cell順で place(=pack の resolve と同一順・同一コード)。
+        # ここで residency/追い出しが確定し、次フレームの cold 判定に反映される。維持(near_keep)セルは
+        # 更新でないので place しない=cur_slot/slot_refs が前回のまま(参照継続で保護)。realized=cap の要。
+        primary_updates = [
+            (
+                int(allocation_cells[int(c)]),
+                (
+                    int(allocation_cells[int(c)])
+                    if scroll_state is not None else int(c)
+                ),
+                cur_key[int(c)],
+                int(c),
+            )
+            for c in np.where(updated)[0]
+            if cur_key[int(c)] is not None
+        ]
+        combined_updates = primary_updates + [
+            (cell, cell, key, None) for cell, _pal, key in guard_updates
+        ]
+        combined_updates.sort(key=lambda item: item[1])
+        upd_ck = [
+            (allocation_cell, key)
+            for allocation_cell, _packed_cell, key, _logical
+            in combined_updates
+        ]
+        packed_update_cells = [
+            packed_cell
+            for _allocation_cell, packed_cell, _key, _logical
+            in combined_updates
+        ]
+        update_logical_cells = [
+            logical
+            for _allocation_cell, _packed_cell, _key, logical
+            in combined_updates
+        ]
+        update_palettes = [
+            (
+                int(cur_pal[logical])
+                if logical is not None else int(plane_pal[allocation_cell])
+            )
+            for allocation_cell, _packed_cell, _key, logical
+            in combined_updates
+        ]
+        pre_place_resident = [
+            alloc.is_resident(key) for _cell, key in upd_ck]
+        placements = alloc.place_frame(upd_ck, i)
+        transfer_order = cold_transfer_order(placements)
+        frame_sources = [pattern_supply.SOURCE_PRG] * len(upd_ck)
+        preload_updates = [
+            update_index
+            for update_index, ((_, key), (_, cold))
+            in enumerate(zip(upd_ck, placements))
+            if cold and key in preload_sources
+        ]
+        if len(preload_updates) != wr_used + dic_used:
+            raise AssertionError(
+                f"frame {i}: preload decisions={wr_used + dic_used} but allocator "
+                f"realized {len(preload_updates)} cold preload patterns")
+        if wr_used > int(supply_budget.wr[i]):
+            raise AssertionError(f"frame {i}: WordBuf source budget underflow")
+        for update_index in preload_updates:
+            key = upd_ck[update_index][1]
+            frame_sources[update_index] = preload_sources[key]
+
+        # Resolve display categories from the allocator's actual cold update,
+        # not from decision order. Decisions are priority-ordered but the
+        # player applies cells in cell order, so when several cells choose the
+        # same key, the cell that physically carries the pattern can differ
+        # from the cell that funded it. Only that actual cold cell is Raw or a
+        # physical-source category; the other same-frame users are Same.
+        raw_display_mask = np.zeros(C_CELLS, bool)
+        prg_source_mask = np.zeros(C_CELLS, bool)
+        wr0_source_mask = np.zeros(C_CELLS, bool)
+        wr1_source_mask = np.zeros(C_CELLS, bool)
+        dic_source_mask = np.zeros(C_CELLS, bool)
+        raw_keys = {cur_key[int(cell)] for cell in np.where(raw_mask)[0]}
+        buf_keys = {cur_key[int(cell)] for cell in np.where(prg_mask)[0]}
+        if raw_keys & buf_keys:
+            raise AssertionError(
+                f"frame {i}: exact key has both Raw and Buf funding")
+        for update_index, (
+                (cell, key), logical_cell, (_slot, cold), source,
+        ) in enumerate(zip(
+                upd_ck, update_logical_cells, placements, frame_sources,
+                strict=True)):
+            if not cold:
+                continue
+            if logical_cell is None:
+                continue
+            display_cell = int(logical_cell)
+            if key in raw_keys:
+                raw_display_mask[display_cell] = True
+                continue
+            if key not in buf_keys:
+                raise AssertionError(
+                    f"frame {i}: cold cell {cell} logical={logical_cell} "
+                    f"has no Raw/Buf funding (resident_before="
+                    f"{int(pre_place_resident[update_index])}, "
+                    f"raw={int(raw_mask[display_cell])}, "
+                    f"prg={int(prg_mask[display_cell])}, "
+                    f"dedup={int(dedup_mask[display_cell])}, "
+                    f"near={int(near_mask[display_cell])}, "
+                    f"flbk={int(flbk_mask[display_cell])})")
+            if source == pattern_supply.SOURCE_PRG:
+                prg_source_mask[display_cell] = True
+            elif source == pattern_supply.SOURCE_WR:
+                (wr0_source_mask if i % 2 == 0 else wr1_source_mask)[
+                    display_cell] = True
+            elif source == pattern_supply.SOURCE_DIC:
+                dic_source_mask[display_cell] = True
+            else:
+                raise AssertionError(
+                    f"frame {i}: unknown pattern source {source}")
+        if int(raw_display_mask.sum()) != int(raw_mask.sum()):
+            raise AssertionError(
+                f"frame {i}: allocator Raw split does not match funded loads")
+        if sum(mask.sum() for mask in (
+                prg_source_mask, wr0_source_mask, wr1_source_mask,
+                dic_source_mask)) != int(prg_mask.sum()):
+            raise AssertionError(
+                f"frame {i}: physical source split does not cover Buf loads")
+
+        # coldlife計測: このフレームのcoldロードを未来ターゲット(前計算済み)で分類。
+        # 「次フレームで死ぬ」でも、収束型(その次から安定)と連続運動型(変化が続く)は
+        # 意味が正反対: 前者は1フレーム遅らせれば中間ロードが浮き、後者は減点すると飢餓が出る。
+        frame_cold = []
+        if i > 0:
+            for (cl_cell, cl_key), logical_cell, (_cl_slot, cl_cold) in zip(
+                    upd_ck, update_logical_cells, placements, strict=True):
+                if not cl_cold:
+                    continue
+                if logical_cell is None:
+                    continue
+                kind = "raw" if cl_key in raw_keys else "buf"
+                c = int(logical_cell)
+                frame_cold.append((c, cl_key, kind))
+                coldlife["total"][kind] += 1
+                if i + 1 >= n:
+                    coldlife["tail"][kind] += 1
+                    continue
+                seg1_same = int(frame_seg[i + 1]) == int(frame_seg[i])
+                t1_same = (seg1_same
+                           and Q_pidx[i + 1][c].tobytes() == plain_keys[c]
+                           and int(Q_assign[i + 1][c]) == int(assign[c]))
+                if t1_same:
+                    coldlife["survive_target"][kind] += 1
+                elif i + 2 >= n or (
+                        int(frame_seg[i + 2]) == int(frame_seg[i + 1])
+                        and Q_pidx[i + 2][c].tobytes()
+                        == Q_pidx[i + 1][c].tobytes()
+                        and int(Q_assign[i + 2][c])
+                        == int(Q_assign[i + 1][c])):
+                    coldlife["die_settle"][kind] += 1
+                else:
+                    coldlife["die_motion"][kind] += 1
+
+        # Raw prefetch runs only after visible updates and upgrades have been
+        # decided. Frame 0 installs the frozen boot plan into free slots;
+        # later frames may optionally spend spare BODY/cold room on the next
+        # frame's predicted excess.
+        frame_prefetch_requests = []
+        frame_prefetch_physical = []
+        prefetch_cold_slots = []
+        if i == 0 and boot_prefetch_plan:
+            for key, deadline in boot_prefetch_plan:
+                result = alloc.prefetch(key, i, deadline)
+                if result is None or not result[1]:
+                    raise AssertionError(
+                        "frame 0 boot prefetch did not use a free VRAM slot")
+                slot, _cold = result
+                frame_prefetch_requests.append(
+                    (key, deadline, slot, False, False, False))
+                frame_prefetch_physical.append(
+                    (int(slot), True, key, int(deadline)))
+                cold_spent += 1
+                spent_tiles += PATTERN_BYTES
+                prefetch_cold_slots.append(int(slot))
+            if cold_spent > VRAM_TILES:
+                raise AssertionError(
+                    f"frame 0 exact+prefetch patterns {cold_spent} exceed "
+                    f"the {VRAM_TILES}-slot resident pool")
+            if len(frame0_keys) + boot_inline_requests > frame0_inline_pattern_limit:
+                raise AssertionError(
+                    "frame 0 inline patterns exceed the boot staging path")
+        # The ordinary Raw forecast is built from screen-space target tiles.
+        # A rolling plane also carries hidden pixel columns/rows whose exact
+        # key depends on the previous physical-plane contents.  Do not spend
+        # speculative loads from that mismatched coordinate model while a
+        # scroll control is active; visible primary and guard work remains
+        # fully budgeted, and ordinary prefetch resumes after the rebase.
+        elif (i > 0
+              and scroll_state is None
+              and (RAW_PREFETCH_ON or i in fade_prefetch_plan or i in motion_prefetch)):
+            fade_request = fade_prefetch_plan.get(i)
+            mandatory = fade_request is not None
+            if fade_request is not None:
+                (deadline, requested_keys, frames_remaining,
+                 request_limit, _nominal_requests) = fade_request
+                missing_requests = sum(
+                    not alloc.is_mandatory_pinned(key, deadline)
+                    for key in requested_keys
+                )
+                planned_requests = (
+                    missing_requests + frames_remaining - 1
+                ) // frames_remaining
+                if request_limit is not None:
+                    planned_requests = min(
+                        int(request_limit), planned_requests)
+                prefetch_spend_limit = frame_total_budget
+                if int(deadline) not in fade_prefetch_slots:
+                    block_start = alloc.least_live_contiguous_block(
+                        len(requested_keys), i)
+                    fade_prefetch_slots[int(deadline)] = {
+                        "start": int(block_start),
+                        "length": len(requested_keys),
+                        "key_slots": {},
+                        "slot_keys": {},
+                    }
+                block_state = fade_prefetch_slots[int(deadline)]
+                for assigned_key, assigned_slot in tuple(
+                        block_state["key_slots"].items()):
+                    if (alloc.is_mandatory_pinned(assigned_key, deadline)
+                            and alloc.resident_slot(assigned_key)
+                            == assigned_slot):
+                        continue
+                    del block_state["key_slots"][assigned_key]
+                    block_state["slot_keys"].pop(assigned_slot, None)
+                request_groups = ((int(deadline), requested_keys),)
+                request_room = int(planned_requests)
+                request_cap = int(planned_requests)
+                minimum_batch = 1
+            elif i in motion_prefetch:
+                deadline, requests, request_cap = motion_prefetch[i]
+                request_groups = ((deadline, requests),)
+                request_room = len(requests)
+                prefetch_spend_limit = min(frame_total_budget, decision_budget + reserve_bytes)
+                minimum_batch = 1
+            else:
+                prefetch_spend_limit = min(
+                    decision_budget,
+                    max(
+                        current_reserved_spend(),
+                        quality_budget + frame_cd
+                        - RAW_PREFETCH_BUDGET_FLOOR_PATTERNS * PATTERN_BYTES,
+                    ),
+                )
+                last_deadline = min(
+                    n, i + RAW_PREFETCH_LOOKAHEAD + 1)
+                request_groups = tuple(
+                    (deadline, prefetch_forecast.requests[deadline])
+                    for deadline in range(i + 1, last_deadline)
+                )
+                request_room = sum(
+                    len(requests) for _deadline, requests in request_groups)
+                request_cap = RAW_PREFETCH_MAX_REQUESTS_PER_FRAME
+                minimum_batch = RAW_PREFETCH_MIN_BATCH
+            cold_room = (
+                frame_max_cold - cold_spent
+                if cold_limit_active
+                else request_cap)
+            prg_room = frame_max_prg - prg_spent
+            body_room = max(
+                0,
+                (prefetch_spend_limit - current_reserved_spend())
+                // (PATTERN_BYTES + stream_schedule.RUN_DESCRIPTOR_BYTES),
+            )
+            control_room = max(
+                0,
+                (
+                    frame_control_block_limit
+                    - int(body_fixed_control_bytes[i])
+                    - name_recs * update_entry_bytes
+                    - cold_spent * stream_schedule.RUN_DESCRIPTOR_BYTES
+                ) // stream_schedule.RUN_DESCRIPTOR_BYTES,
+            )
+            capacity = min(
+                request_cap,
+                request_room,
+                cold_room,
+                prg_room,
+                body_room,
+                control_room,
+            )
+            if capacity >= minimum_batch:
+                for deadline, requests in request_groups:
+                    deadline_keys = {
+                        Q_pidx[deadline][cell].tobytes()
+                        for cell in range(C_CELLS)
+                    }
+                    for key in requests:
+                        if len(frame_prefetch_requests) >= capacity:
+                            break
+                        already_pinned = (
+                            alloc.is_mandatory_pinned(key, deadline)
+                            if mandatory else alloc.is_pinned(key, deadline)
+                        )
+                        if already_pinned:
+                            continue
+                        resident = alloc.is_resident(key)
+                        if resident and not mandatory:
+                            continue
+                        if mandatory:
+                            block_state = fade_prefetch_slots[int(deadline)]
+                            mandatory_result = alloc.prefetch_mandatory_in_block(
+                                key,
+                                i,
+                                deadline,
+                                block_state["start"],
+                                block_state["length"],
+                                assigned_slots=block_state["slot_keys"],
+                                avoid_keys=deadline_keys,
+                            )
+                            if mandatory_result is None:
+                                continue
+                            (slot, cold, request_relocate,
+                             request_forced) = mandatory_result
+                            result = (slot, cold)
+                        else:
+                            request_relocate = False
+                            request_forced = False
+                            result = alloc.prefetch(
+                                key,
+                                i,
+                                deadline,
+                                avoid_keys=deadline_keys,
+                            )
+                        if result is None:
+                            continue
+                        slot, cold = result
+                        if mandatory:
+                            block_start = int(block_state["start"])
+                            block_stop = block_start + int(block_state["length"])
+                            if block_start <= int(slot) < block_stop:
+                                block_state["key_slots"][key] = int(slot)
+                                block_state["slot_keys"][int(slot)] = key
+                        frame_prefetch_requests.append(
+                            (key, deadline, slot, mandatory,
+                             request_relocate, request_forced))
+                        frame_prefetch_physical.append(
+                            (int(slot), bool(cold), key, int(deadline)))
+                        if cold:
+                            cold_spent += 1
+                            commit_prg_source(
+                                pattern_supply.SOURCE_PRG,
+                                preserve_fade_prefetch=False,
+                            )
+                            spent_tiles += PATTERN_BYTES
+                            prefetch_cold_slots.append(int(slot))
+                    if len(frame_prefetch_requests) >= capacity:
+                        break
+
+        # Visible cold payload is already in physical-slot order. Prefetch is
+        # appended after it, so sort that suffix independently to avoid turning
+        # one contiguous speculative batch into request-order one-tile runs.
+        prefetch_cold_slots.sort()
+        dma_slots = [
+            int(placements[index][0]) for index in transfer_order
+        ] + prefetch_cold_slots
+        dma_sources = [
+            frame_sources[index] for index in transfer_order
+        ]
+        dma_sources.extend(
+            [pattern_supply.SOURCE_PRG] * len(prefetch_cold_slots))
+        dma_dic_indices = []
+        for index in transfer_order:
+            source = frame_sources[index]
+            key = upd_ck[index][1]
+            dma_dic_indices.append(
+                dic_dictionary_index[key]
+                if source == pattern_supply.SOURCE_DIC else -1)
+        dma_dic_indices.extend([-1] * len(prefetch_cold_slots))
+        frame_dic_indices = [
+            (
+                int(dic_dictionary_index[upd_ck[index][1]])
+                if frame_sources[index] == pattern_supply.SOURCE_DIC
+                else -1
+            )
+            for index in range(len(upd_ck))
+        ]
+        dma_tiles = len(dma_slots)                 # 実際にVRAMへ送る32Bパターンタイル数
+        if not L3_TILES and dma_tiles != cold_spent:
+            raise AssertionError(
+                f"frame {i}: encoder cold={cold_spent} allocator cold={dma_tiles}")
+        # MainのHUD cold_runsと同じsource-aware physical run数。VBlank境界で
+        # 1 recordが複数DMAに割れる場合があるため、物理VDP DMA発行回数とは
+        # 意図的に異なる。
+        run_prefetch_count = (
+            boot_inline_requests if i == 0 else len(prefetch_cold_slots))
+        run_tile_count = len(transfer_order) + run_prefetch_count
+        packed_runs = pattern_supply.count_source_runs(
+            dma_slots[:run_tile_count], dma_sources[:run_tile_count],
+            dma_dic_indices[:run_tile_count])
+        if PACKED_COLD_RUN_EXECUTION:
+            dma_runs = packed_runs
+        else:
+            legacy_order = [
+                index for index, (_slot, cold) in enumerate(placements)
+                if cold
+            ]
+            legacy_slots = [
+                int(placements[index][0]) for index in legacy_order
+            ]
+            legacy_sources = [
+                int(frame_sources[index]) for index in legacy_order
+            ]
+            legacy_dic_indices = [
+                (dic_dictionary_index[upd_ck[index][1]]
+                 if legacy_sources[position] == pattern_supply.SOURCE_DIC
+                 else -1)
+                for position, index in enumerate(legacy_order)
+            ]
+            dma_runs = pattern_supply.count_source_runs(
+                legacy_slots, legacy_sources, legacy_dic_indices)
+            if dma_runs != packed_runs:
+                raise AssertionError(
+                    f"frame {i}: legacy entry-order runs={dma_runs} differ "
+                    f"from packed suffix runs={packed_runs}; lower-rate "
+                    "plain-Prg streams must retain the contiguous identity map")
+        if dma_runs > cold_spent:
+            raise AssertionError(
+                f"frame {i}: source-aware runs={dma_runs} exceed "
+                f"cold tiles={cold_spent}")
+        if i > 0 and dma_tiles > frame_max_cold:
+            raise AssertionError(
+                f"frame {i}: physical cold tiles={dma_tiles} exceed "
+                f"construction limit {frame_max_cold}")
+        transfer_tiles_log.append(dma_tiles)
+        transfer_runs_log.append(dma_runs)
+        supply_sources_log.append(np.asarray(frame_sources, np.uint8))
+        ring_per_log.append((
+            tuple(int(cell) for cell in packed_update_cells),
+            tuple(
+                (int(palette_line) << 13) | (1 + int(slot))
+                for palette_line, (slot, _cold)
+                in zip(update_palettes, placements, strict=True)
+            ),
+            tuple(bool(cold) for _slot, cold in placements),
+        ))
+        ring_prefetch_log.append(tuple(sorted(
+            frame_prefetch_physical, key=lambda item: int(item[0]))))
+        ring_transfer_orders_log.append(
+            tuple(int(index) for index in transfer_order))
+        ring_dic_indices_log.append(tuple(frame_dic_indices))
+        ring_raw_flags_log.append(tuple(
+            (
+                True if logical is None
+                else bool(raw_display_mask[int(logical)])
+            )
+            for logical in update_logical_cells
+        ))
+        ring_category_cells_log.append(tuple(
+            -1 if logical is None else int(logical)
+            for logical in update_logical_cells
+        ))
+        tile_alloc.trace_state(alloc, i)
+        prefetch_requests_log.append(frame_prefetch_requests)
+        prefetch_cold_log.append(len(prefetch_cold_slots))
+        prg_used = sum(
+            source == pattern_supply.SOURCE_PRG for source in dma_sources)
+        if i > 0 and prg_used != prg_spent:
+            raise AssertionError(
+                f"frame {i}: selected Prg={prg_spent} differs from "
+                f"physical Prg loads={prg_used}")
+        prg_loads_log.append(prg_used)
+        frame_prg_cells = [
+            int(packed_update_cells[index])
+            for index in transfer_order
+            if frame_sources[index] == pattern_supply.SOURCE_PRG
+        ]
+        frame_prg_cells.extend([-1] * len(prefetch_cold_slots))
+        if len(frame_prg_cells) != prg_used:
+            raise AssertionError(
+                f"frame {i}: Prg cell trace {len(frame_prg_cells)} != "
+                f"physical loads {prg_used}")
+        prg_cold_cells_log.append(frame_prg_cells)
+        wr0_loads_log.append(
+            wr_used if i % 2 == 0 else 0)
+        wr1_loads_log.append(
+            wr_used if i % 2 == 1 else 0)
+        dic_loads_log.append(dic_used)
+        ensure_capacity(i)
+        if _loop_profile:
+            _lp_t = _lp_mark("allocate_route", _lp_t, _lp_frame)
+
+        # Exact variable BODY work is now known: every update contributes its
+        # two-byte entry, every source-aware run contributes four control bytes,
+        # and only Prg-sourced cold patterns consume BODY payload.  Charge this
+        # after allocation so source splits and slot fragmentation are exact.
+        variable_body_spent = (
+            name_recs * update_entry_bytes
+            + dma_runs * stream_schedule.RUN_DESCRIPTOR_BYTES
+            + prg_used * PATTERN_BYTES)
+        reserved_body_spent = current_reserved_spend()
+        if variable_body_spent > reserved_body_spent:
+            raise AssertionError(
+                f"frame {i}: exact BODY variable work {variable_body_spent}B "
+                f"exceeds incremental run reservation {reserved_body_spent}B")
+        exact_control_block_bytes = (
+            0 if i == 0 else
+            int(body_fixed_control_bytes[i])
+            + name_recs * update_entry_bytes
+            + dma_runs * stream_schedule.RUN_DESCRIPTOR_BYTES
+        )
+        physical_budget_state.commit_frame(
+            i,
+            prg_patterns=prg_used,
+            cold_patterns=dma_tiles,
+            control_block_bytes=exact_control_block_bytes,
+        )
+        if QUALITY_BUDGET_ON and i > 0:
+            decision_spent = name_recs * update_entry_bytes + prg_used * PATTERN_BYTES
+            if spent_tiles != decision_spent:
+                raise AssertionError(
+                    f"frame {i}: encoder decision spend {spent_tiles}B != "
+                    f"BODY update/payload spend {decision_spent}B")
+            available = quality_budget + frame_cd
+            quality_budget = min(
+                QUALITY_BUDGET_BYTES,
+                available - variable_body_spent)
+        elif QUALITY_BUDGET_ON:
+            quality_budget = QUALITY_BUDGET_BYTES
+        if QUALITY_BUDGET_ON:
+            quality_budget_log.append(
+                max(0, quality_budget) // PATTERN_BYTES)
+            quality_budget_balance_log.append(quality_budget)
+            quality_budget_debt_log.append(max(0, -quality_budget))
+        if _loop_profile:
+            _lp_t = _lp_mark("budget_finalize", _lp_t, _lp_frame)
+
+        # CRAMエミュ: このフレームの全更新を反映した最終表示を、現区間パレットで引き直す。
+        # プレビュー/カテゴリマップ/miss繰越は全てこの実表示色(=実機と同じ)で描く。
+        cur_rgb[:] = render_cells(disp_idx, disp_pal, cur_pals)
+
+        # 実機決定ログ: このフレームで実際に書き換えたセルの (cell, パレット, 表示パターンkey)。
+        # keyは64バイト(idx 1..15)を内包=pack_streamがそこから32Bパターンを復元できる。
+        # Flbkはcur_key=近似先(常駐), Buf/Rawはcur_key=新規ロードkey。dedup/Near/Missの区別は
+        # 「更新したか否か」に畳まれる(更新セルのみ列挙)ので、実機はmp4を完全再現できる。
+        if EMIT_DEC:
+            dec_frames.append([
+                (int(cell), int(palette_line), key)
+                for cell, palette_line, (_allocation_cell, key)
+                in zip(
+                    packed_update_cells,
+                    update_palettes,
+                    upd_ck,
+                    strict=True,
+                )
+            ])
+
+        bytes_spent = (
+            0 if i == 0 else
+            int(body_fixed_control_bytes[i]) + variable_body_spent)
+        frame_bytes_log.append(bytes_spent)
+        tile_records_log.append(tile_recs)
+        name_records_log.append(name_recs)
+        dedup_saved_log.append(dedup_saved)
+        l3_hits_log.append(l3_hits)
+        prg_hits_log.append(prg_hits)
+
+        # coldlife計測: 前フレームのcoldロードが今フレームの実表示に残ったか
+        # (Near-keepや他セルでの再利用も「生存」と数える表示ベースの実測)。
+        if coldlife_pending:
+            disp_now = {k for k in cur_key if k is not None}
+            for cl_cell, cl_key, kind in coldlife_pending:
+                coldlife["disp_seen1"][kind] += 1
+                if cl_key in disp_now:
+                    coldlife["disp_alive1"][kind] += 1
+                if cur_key[cl_cell] == cl_key:
+                    coldlife["disp_cell1"][kind] += 1
+        coldlife_pending = frame_cold
+
+        # --- per-frame 実測(status line用) ---
+        near_eff = near_mask if MIDFAR_ON else near   # MIDFARは統合探索が埋めたnear_mask
+        stale_full = changed & ~updated & ~near_eff   # Nearは取りこぼしではない(意図的スキップ)
+        # Hardware scroll carries every non-updated cell to its correct world
+        # position, so an unfunded want during a scroll frame is scroll reuse
+        # (display category Scrl), not a Miss. Decision-side pressure
+        # (cell_tier, aging, wait) still sees the full set below, so encoder
+        # behavior and the packed stream are unchanged by this split.
+        if scroll_state is not None:
+            scrl_mask = stale_full
+            stale = np.zeros_like(stale_full)
+        else:
+            scrl_mask = np.zeros_like(stale_full)
+            stale = stale_full
+        near_disp = near_eff & ~updated           # 実際に省略したNear(余裕があればRaw済み=除く)
+        # 優先度レイヤー/格上げ用に各セルの現在の劣化度を更新(触れたセルのみ。未変化セルは前値を保持)
+        if MIDFAR_ON:
+            cell_tier[dedup_mask | raw_mask | prg_mask] = 9              # 正確(Same/Raw/Buf)
+            cell_tier[near_eff] = 2                                      # Near(近い近似=格上げ候補)
+            cell_tier[flbk_mask] = 1
+            cell_tier[stale_full] = 0                                     # Miss/Scrl(未供給want)
+            approx_carry = np.where(cell_tier < 9, approx_carry + 1, 0)  # 近似のまま持ち越した連続コマ数
+            upgrade_log.append((upgraded, int((cell_tier < 9).sum())))   # 指標: 格上げ枚数 / まだ近似のセル数
+        # カテゴリ別ユニークタイル数(何枚の別タイルを使い回したか)。同一キーは1枚と数える。
+        no_update = ~changed
+
+        def _uk(mask):
+            return {cur_key[c] for c in np.where(mask)[0] if cur_key[c] is not None}
+        u_same = _uk(no_update | dedup_mask); u_near = _uk(near_eff)
+        u_flbk = _uk(flbk_mask)
+        guniq["same"] |= u_same; guniq["near"] |= u_near
+        guniq["flbk"] |= u_flbk
+        # 飢餓は「内側タイルのMissがある時」だけ。外周2タイルのMissは許容(数えない)。
+        if (stale & ~border_bool).any():
+            starved_frames += 1
+        stale_rows.append(np.packbits(stale))
+        want = int(changed.sum())
+        upd = int(updated.sum())
+        miss = int(stale.sum())
+        scrl_count = int(scrl_mask.sum())
+        raw_count = int(raw_display_mask.sum())
+        source_count = sum(int(mask.sum()) for mask in (
+            prg_source_mask, wr0_source_mask, wr1_source_mask,
+            dic_source_mask))
+        near_count = int(near_eff.sum())
+        flbk_count = int(flbk_mask.sum())
+        same_count = (
+            C_CELLS - raw_count - source_count - near_count
+            - flbk_count - miss - scrl_count)
+        if same_count < 0:
+            raise AssertionError(
+                f"frame {i}: display categories exceed {C_CELLS} cells")
+        if i == 0:
+            if not bool(updated.all()):
+                raise AssertionError("frame 0 did not update every display cell")
+            if (source_count or near_count or flbk_count or miss
+                    or scrl_count):
+                raise AssertionError(
+                    "frame 0 contains a non-Raw/Same display category")
+            if raw_count != len(frame0_keys):
+                raise AssertionError(
+                    f"frame 0 Raw={raw_count} but has "
+                    f"{len(frame0_keys)} exact unique patterns")
+            if raw_count + same_count != C_CELLS:
+                raise AssertionError("frame 0 Raw/Same coverage is incomplete")
+            if (not np.array_equal(disp_idx, plain_idx)
+                    or not np.array_equal(disp_pal, assign)):
+                raise AssertionError("frame 0 display is not the exact target")
+        if EMIT_DEC:
+            dec_miss.append(miss)
+            # デバッグ欄用カテゴリ数: catmap と同一定義(Raw/Buf/Flbk/Near/Miss/Scrl は
+            # 互いに素、残り=Same(不変+Dedup畳み込み))。7種は必ず C_CELLS に合計する。
+            dec_cats.append((
+                raw_count, same_count, near_count, flbk_count,
+                source_count, miss, scrl_count))
+            # Category styling is intentionally a bit set, not one category
+            # ID per cell. A physical cold-load attribution can share a cell
+            # with its Near/Flbk quality result after allocator ordering moves
+            # the load carrier away from the decision that funded it.
+            category_row = np.zeros(C_CELLS, np.uint16)
+            for name, mask in (
+                    ("Raw", raw_display_mask),
+                    ("Near", near_eff),
+                    ("Flbk", flbk_mask),
+                    ("Prg", prg_source_mask),
+                    ("Wr0", wr0_source_mask),
+                    ("Wr1", wr1_source_mask),
+                    ("Dic", dic_source_mask),
+                    ("Miss", stale),
+                    ("Scrl", scrl_mask)):
+                bit = np.uint16(
+                    1 << DISPLAY_CATEGORY_MASK_ORDER.index(name))
+                category_row[mask] |= bit
+            dec_category_rows.append(
+                category_row.astype("<u2", copy=False).tobytes())
+        # waitはTSVのMiss継続観測専用。優先度のage_pressとは独立。
+        carry = int((stale & (wait >= 1)).sum())
+        # 滞留 = 待たされた連続フレーム数(=wait)。今フレームも未更新なので+1
+        age_max = int(wait[stale].max()) + 1 if stale.any() else 0
+        # F = every cold tile forming its own runでもfresh supplyで払える
+        # 最低保証Raw更新数。実runが連結すれば差分はquality budgetへ戻る。
+        f_fixed = budget // (
+            PATTERN_BYTES + update_entry_bytes
+            + stream_schedule.RUN_DESCRIPTOR_BYTES)
+        # The tx column is the mutually-exclusive DISPLAY Raw category. A
+        # scroll guard's Raw-funded load is real payment accounting
+        # (tile_records_log) but shows no display cell this frame.
+        stat_rows.append((
+            i, f_fixed, want, upd, miss, C_CELLS - want, dedup_saved, raw_count, carry, age_max,
+            want / C_CELLS, int(near_eff.sum()), flbk_count, prg_hits,
+            int(prg_source_mask.sum()), int(wr0_source_mask.sum()),
+            int(wr1_source_mask.sum()), int(dic_source_mask.sum()),
+            same_count,
+            len(u_same), len(u_near), len(u_flbk), dma_tiles, dma_runs,
+            len(prefetch_cold_slots), scrl_count))
+
+        # TSV観測用のMiss待ちカウンタを更新。NearはMissではない。
+        wait = np.where(changed & ~updated & ~near_eff, wait + 1, 0)   # Nearは滞留させない
+        if scroll_state is not None:
+            store_logical_plane(scroll_state.primary_cells)
+            previous_scroll_state = scroll_state
+        if _loop_profile:
+            _lp_t = _lp_mark("accounting", _lp_t, _lp_frame)
+
+        if (i + 1) % 200 == 0 or i + 1 == n:
+            print(f"  {i+1}/{n}", flush=True)
+        if _loop_profile:
+            _lp_mark("tail", _lp_t, _lp_frame)
+            for _name in _lp_sections:
+                _lp_totals[_name] += _lp_frame[_name]
+                _lp_frames[_name].append(_lp_frame[_name])
+            for _name in _lp_nested_totals:
+                _lp_nested_frames[_name].append(_lp_nested_frame[_name])
+
+    emit("finalize")
+    if QUALITY_BUDGET_ON and quality_budget < 0:
+        raise SystemExit(
+            "sim: terminal quality drain did not repay its future allowance "
+            f"loan (debt={-quality_budget}B)")
+    if _gc_was_enabled:
+        _gc.enable()
+    _t = _mark("Decide", _t)
+    _loop_total = _phases[-1][1]
+    if _loop_profile:
+        _profiled_total = sum(_lp_totals.values())
+        print("loop profile (exclusive decision-loop sections):", flush=True)
+        for _name in _lp_sections:
+            _values = np.asarray(_lp_frames[_name], np.float64) * 1000.0
+            print(
+                f"  {_name:18s} {_lp_totals[_name]:8.3f}s "
+                f"p50={np.percentile(_values, 50):7.3f}ms "
+                f"p95={np.percentile(_values, 95):7.3f}ms "
+                f"p99={np.percentile(_values, 99):7.3f}ms "
+                f"max={_values.max():7.3f}ms",
+                flush=True,
+            )
+        print(
+            f"  profiled total      {_profiled_total:8.3f}s; "
+            f"loop commit/search={_loop_total:.3f}s",
+            flush=True,
+        )
+        print("loop profile (nested resident search; included in decision_commit):", flush=True)
+        for _name in _lp_nested_totals:
+            _values = np.asarray(_lp_nested_frames[_name], np.float64) * 1000.0
+            print(
+                f"  {_name:18s} {_lp_nested_totals[_name]:8.3f}s "
+                f"p95/frame={np.percentile(_values, 95):7.3f}ms "
+                f"max/frame={_values.max():7.3f}ms",
+                flush=True,
+            )
+        _calls = max(_lp_counts["resident_calls"], 1)
+        print(
+            "loop profile counts: "
+            f"changed={_lp_counts['changed']} ordered={_lp_counts['ordered']} "
+            f"resident_calls={_lp_counts['resident_calls']} "
+            f"candidates={_lp_counts['resident_candidates']} "
+            f"avg_candidates={_lp_counts['resident_candidates'] / _calls:.2f} "
+            f"empty={_lp_counts['resident_empty']} "
+            f"cache_hits={_lp_counts['resident_cache_hits']} "
+            f"cache_builds={_lp_counts['resident_cache_builds']} "
+            f"adjacent_calls={_lp_counts['resident_adjacent_calls']} "
+            f"adjacent_candidates={_lp_counts['resident_adjacent_candidates']} "
+            f"adjacent_empty={_lp_counts['resident_adjacent_empty']} "
+            f"exact_blocked={_lp_counts['exact_blocked']} "
+            f"flbk_no_candidate={_lp_counts['flbk_no_candidate']} "
+            f"flbk_budget_blocked={_lp_counts['flbk_budget_blocked']} "
+            f"flbk_not_improved={_lp_counts['flbk_not_improved']} "
+            f"flbk_absolute_reject={_lp_counts['flbk_absolute_reject']} "
+            f"flbk_accepted={_lp_counts['flbk_accepted']}",
+            flush=True,
+        )
+
+    # Finalize: prove the complete physical schedule and write artifacts.
+    final_control_trace = (
+        np.asarray(body_fixed_control_bytes, np.int64)
+        + np.asarray(name_records_log, np.int64)
+        * np.where(
+            control_frame_types == shadow_updates.FRAME_SCROLL,
+            shadow_updates.LIST_ITEM_BYTES,
+            NAME_BYTES,
+        )
+        + np.asarray(transfer_runs_log, np.int64)
+        * stream_schedule.RUN_DESCRIPTOR_BYTES
+    )
+    final_control_trace[0] = 0
+    if not np.array_equal(
+            final_control_trace,
+            physical_budget_state.realized_control):
+        mismatch = int(np.flatnonzero(
+            final_control_trace
+            != physical_budget_state.realized_control)[0])
+        raise AssertionError(
+            f"frame {mismatch}: final control bytes differ from the "
+            "one-pass physical reservation")
+    physical_budget_plan = physical_budget_state.finish(
+        predicted_prg_demand)
+    print(
+        "physical budget final: route/cadence prefixes exact; "
+        f"Prg actual={int(physical_budget_plan.realized_prg_patterns.sum())} "
+        f"patterns; control="
+        f"{int(physical_budget_plan.realized_control_block_bytes.sum())}B; "
+        f"minimum cumulative spare="
+        f"{int(physical_budget_plan.prefix_margin_sectors[1:].min())} sectors",
+        flush=True,
+    )
+
+    # coldlife計測の集計: 先読み減点ヒューリスティックの効果上限。
+    with open(os.path.join(OUT, "coldlife.json"), "w") as f:
+        json.dump(coldlife, f, indent=1)
+
+    def _cl_line(kind):
+        tot = coldlife["total"][kind]
+        if tot == 0:
+            return f"{kind}: total=0"
+        parts = []
+        for name in ("survive_target", "die_settle", "die_motion", "tail"):
+            v = coldlife[name][kind]
+            parts.append(f"{name}={v}({100.0 * v / tot:.1f}%)")
+        seen = coldlife["disp_seen1"][kind]
+        if seen:
+            a = coldlife["disp_alive1"][kind]
+            cc = coldlife["disp_cell1"][kind]
+            parts.append(
+                f"disp_alive1={a}({100.0 * a / seen:.1f}%) "
+                f"disp_cell1={cc}({100.0 * cc / seen:.1f}%)")
+        return f"{kind}: total={tot} " + " ".join(parts)
+
+    print(f"coldlife {_cl_line('raw')}", flush=True)
+    print(f"coldlife {_cl_line('buf')}", flush=True)
+
+    fb_baseline = np.array(frame_bytes_log, np.float64)
+    tr = np.array(tile_records_log, np.float64)       # encoder Raw funding class
+    ded = np.array(dedup_saved_log, np.float64)        # L1/L2 VRAM常駐ヒット
+    l3h = np.array(l3_hits_log, np.float64)            # L3(PRG-RAM)ヒット
+    prh = np.array(prg_hits_log, np.float64)           # PRG先読みヒット
+    stats = np.array(stat_rows, np.float64)
+    prg_loads = np.asarray(prg_loads_log, np.int64)
+    wr0_loads = np.asarray(wr0_loads_log, np.int64)
+    wr1_loads = np.asarray(wr1_loads_log, np.int64)
+    dic_loads = np.asarray(dic_loads_log, np.int64)
+    control_update_counts = np.asarray(name_records_log, np.int64)
+
+    # The encoder's whole-movie budget above is a quality-allocation model, not the
+    # physical PRG-RAM PrgBuf. Re-run the packer's exact sector schedule
+    # from the frozen update/run counts so the analysis curve shows hardware
+    # occupancy, including prebuffering and final-sector padding.
+    shadow_cells = [[int(item[0]) for item in frame] for frame in dec_frames]
+    shadow_costs = tuple(
+        shadow_updates.frame_cost(
+            cells,
+            shadow_updates.SCROLL_PLANE_CELLS
+            if int(control_frame_types[frame]) == shadow_updates.FRAME_SCROLL
+            else C_CELLS,
+        )
+        for frame, cells in enumerate(shadow_cells)
+    )
+    legacy_lengths = stream_schedule.control_block_lengths(
+        control_update_counts,
+        np.asarray(transfer_runs_log, np.int64),
+        cells=C_CELLS,
+        audio_frame_bytes=AUDIO_CONTROL_BYTES,
+        frame_types=control_frame_types,
+    )
+    prg_limit_over = np.flatnonzero(
+        np.arange(len(prg_loads)) > 0,
+    )
+    prg_limit_over = prg_limit_over[
+        prg_loads[prg_limit_over]
+        > physical_budget_plan.prg_pattern_limits[prg_limit_over]
+    ]
+    if prg_limit_over.size:
+        frame = int(prg_limit_over[0])
+        raise AssertionError(
+            f"frame {frame}: realized Prg loads {int(prg_loads[frame])} "
+            f"exceed construction limit "
+            f"{int(physical_budget_plan.prg_pattern_limits[frame])}")
+    control_limit_over = np.flatnonzero(
+        (np.arange(len(legacy_lengths)) > 0)
+        & (legacy_lengths > physical_budget_plan.control_block_limits))
+    if control_limit_over.size:
+        frame = int(control_limit_over[0])
+        raise AssertionError(
+            f"frame {frame}: realized control block "
+            f"{int(legacy_lengths[frame])}B exceeds construction limit "
+            f"{int(physical_budget_plan.control_block_limits[frame])}B")
+    cold_limit_over = np.flatnonzero(
+        (np.arange(len(transfer_tiles_log)) > 0)
+        & (np.asarray(transfer_tiles_log, np.int64)
+           > physical_budget_plan.cold_pattern_limits))
+    if cold_limit_over.size:
+        frame = int(cold_limit_over[0])
+        raise AssertionError(
+            f"frame {frame}: realized cold tiles "
+            f"{int(transfer_tiles_log[frame])} exceed construction limit "
+            f"{int(physical_budget_plan.cold_pattern_limits[frame])}")
+    try:
+        # Shadow-list selection runs the same exact shared-sector route as the
+        # final pack. Shorter blocks automatically become payload capacity;
+        # the prefix ledger has already proved that such shrinking is safe.
+        shadow_plan = stream_schedule.select_shadow_update_lists(
+            shadow_cells,
+            np.asarray(transfer_runs_log, np.int64),
+            prg_loads,
+            cells=C_CELLS,
+            fps=FPS,
+            ring_capacity_patterns=(
+                PRG_DELIVERY_CAP_KB * 1024 // PATTERN_BYTES),
+            prebuffer_capacity_patterns=(
+                PRG_BUF_CAP_KB * 1024 // PATTERN_BYTES),
+            frame_sectors=cavc_routing.FRAME_SECTORS,
+            audio_frame_bytes=AUDIO_CONTROL_BYTES,
+            fill=av_config.PACK_FORWARD_FILL,
+            control_sector_envelope=None,
+            frame_types=control_frame_types,
+        ) if PATTERN_SUPPLY_ON else None
+        shadow_list_flags = (
+            np.asarray(shadow_plan["selected"], np.bool_)
+            if shadow_plan is not None else np.zeros(len(dec_frames), np.bool_)
+        )
+        control_lengths = (
+            np.asarray(shadow_plan["block_lengths"], np.int64)
+            if shadow_plan is not None else legacy_lengths
+        )
+        exact_body_work = stream_schedule.body_funded_work_bytes(
+            prg_loads,
+            control_update_counts,
+            np.asarray(transfer_runs_log, np.int64),
+            cells=C_CELLS,
+            audio_frame_bytes=AUDIO_CONTROL_BYTES,
+            update_lists=shadow_list_flags,
+            frame_types=control_frame_types,
+        )
+        fb = fb_baseline + control_lengths - legacy_lengths
+        if not np.array_equal(fb.astype(np.int64), exact_body_work):
+            bad = int(np.flatnonzero(fb.astype(np.int64) != exact_body_work)[0])
+            raise AssertionError(
+                f"frame {bad}: encoder BODY accounting {int(fb[bad])}B != "
+                f"exact useful demand {int(exact_body_work[bad])}B")
+        physical_budget.verify_shared_sector_prefix(
+            prg_loads,
+            control_lengths,
+            prebuffer_capacity_patterns=(
+                PRG_BUF_CAP_KB * 1024 // PATTERN_BYTES),
+            frame_sectors=cavc_routing.FRAME_SECTORS,
+            fps=FPS,
+        )
+        physical_schedule = (
+            shadow_plan["schedule"] if shadow_plan is not None
+            else stream_schedule.schedule_payload_ring(
+                np.asarray(prg_loads_log, np.int64),
+                control_lengths,
+                fps=FPS,
+                ring_capacity_patterns=(
+                    PRG_DELIVERY_CAP_KB * 1024 // PATTERN_BYTES),
+                prebuffer_capacity_patterns=(
+                    PRG_BUF_CAP_KB * 1024 // PATTERN_BYTES),
+                frame_sectors=cavc_routing.FRAME_SECTORS,
+                fill=av_config.PACK_FORWARD_FILL,
+                control_sector_envelope=None,
+            )
+        )
+    except (stream_schedule.ScheduleError, ValueError) as exc:
+        raise AssertionError(
+            "construction-time physical budget invariant failed after image "
+            f"decisions: {exc}") from exc
+    if not physical_schedule["feasible"]:
+        raise SystemExit(
+            "sim: physical PrgBuf schedule is infeasible "
+            f"(over={physical_schedule['over']} under={physical_schedule['under']} "
+            f"ready_min={physical_schedule['ready_min']} "
+            f"ctrl_min={physical_schedule['ctrl_min']} "
+            f"rate_lead_peak/end="
+            f"{physical_schedule['rate_lead_peak']}/"
+            f"{physical_schedule['rate_lead_end']})")
+
+    ring_plan = None
+    ring_enabled = False
+    if PATTERN_SUPPLY_ON and n > cavc_routing.WORDBUF_MAX_FRAMES:
+        peak_prg = np.asarray(prg_loads, np.int64).copy()
+        peak_prg[0] -= int(boot_sidecar_requests)
+        wr0_peak, wr1_peak = pattern_supply.output_load_peaks(
+            peak_prg, transfer_runs_log)
+        wordram_layout = pattern_supply.word_ram_layout(
+            n, C_CELLS, MAX_COLD,
+            wr0_load_bytes=wr0_peak.bytes, wr1_load_bytes=wr1_peak.bytes)
+        print("WordBuf: disabled above 65535 frames", flush=True)
+    if PATTERN_SUPPLY_ON and n <= cavc_routing.WORDBUF_MAX_FRAMES:
+        current_supply = pattern_supply.SupplyPlan(
+            sources=tuple(
+                tuple(int(source) for source in frame)
+                for frame in supply_sources_log
+            ),
+            prg_patterns=(),
+            wr0_patterns=(),
+            wr1_patterns=(),
+            dic_patterns=(),
+            prg_loads=prg_loads,
+            wr0_loads=wr0_loads,
+            wr1_loads=wr1_loads,
+            dic_loads=dic_loads,
+            dic_indices=tuple(ring_dic_indices_log),
+        )
+        # O_LOADS and WordBuf share each physical Word-RAM bank. Source
+        # grouping determines the exact 22-byte record peak, while the
+        # sector-rounded residual determines how many WordBuf patterns the
+        # ring planner can select. Iterate those two deterministic decisions
+        # to a fixed point, starting from word_ram_layout's safe envelope.
+        ring_inputs = wordbuf_ring.prepare(
+            per=ring_per_log,
+            prefetch_per=ring_prefetch_log,
+            transfer_orders=ring_transfer_orders_log,
+            current_plan=current_supply,
+            n_updates=control_update_counts,
+            update_lists=shadow_list_flags,
+            frame_types=control_frame_types,
+            fps=FPS,
+            cells=C_CELLS,
+            audio_frame_bytes=AUDIO_CONTROL_BYTES,
+            prg_capacity_patterns=PRG_BUF_CAP_KB * 1024 // PATTERN_BYTES,
+            baseline_occupancy=np.asarray(
+                physical_schedule["ring_occupancy"], np.int64),
+        )
+        seen_layouts = set()
+        for _layout_pass in range(8):
+            layout_key = (
+                wordram_layout.wr0_load_bytes,
+                wordram_layout.wr1_load_bytes,
+                wordram_layout.wr0_patterns,
+                wordram_layout.wr1_patterns,
+            )
+            if layout_key in seen_layouts:
+                raise AssertionError(
+                    "O_LOADS/WordBuf layout entered a capacity cycle")
+            seen_layouts.add(layout_key)
+            ring_plan = ring_inputs.plan(
+                word_capacities=(
+                    wordram_layout.wr0_patterns,
+                    wordram_layout.wr1_patterns,
+                ),
+            )
+            peak_prg = np.asarray(
+                (
+                    ring_plan.prg_loads
+                    if ring_plan.feasible else current_supply.prg_loads
+                ),
+                np.int64,
+            ).copy()
+            peak_runs = np.asarray(
+                (
+                    ring_plan.runs
+                    if ring_plan.feasible else transfer_runs_log
+                ),
+                np.int64,
+            )
+            # Boot-sidecar patterns are copied from the static boot stage and
+            # never appear as inline Prg bytes in frame 0 O_LOADS.
+            peak_prg[0] -= int(boot_sidecar_requests)
+            if peak_prg[0] < 0:
+                raise AssertionError(
+                    "boot sidecar exceeds frame-0 Prg source count")
+            wr0_peak, wr1_peak = pattern_supply.output_load_peaks(
+                peak_prg, peak_runs)
+            exact_layout = pattern_supply.word_ram_layout(
+                n,
+                C_CELLS,
+                MAX_COLD,
+                wr0_load_bytes=wr0_peak.bytes,
+                wr1_load_bytes=wr1_peak.bytes,
+            )
+            if exact_layout == wordram_layout:
+                break
+            wordram_layout = exact_layout
+        else:
+            raise AssertionError(
+                "O_LOADS/WordBuf layout did not converge in eight passes")
+        del ring_inputs
+
+        if ring_plan.feasible:
+            ring_enabled = True
+            supply_sources_log = [
+                np.asarray(frame, np.uint8)
+                for frame in ring_plan.sources
+            ]
+            prg_loads = np.asarray(ring_plan.prg_loads, np.int64)
+            wr0_loads = np.asarray(ring_plan.wr0_loads, np.int64)
+            wr1_loads = np.asarray(ring_plan.wr1_loads, np.int64)
+            transfer_runs_log = [
+                int(value) for value in ring_plan.runs
+            ]
+            control_lengths = stream_schedule.control_block_lengths(
+                control_update_counts,
+                np.asarray(transfer_runs_log, np.int64),
+                cells=C_CELLS,
+                audio_frame_bytes=AUDIO_CONTROL_BYTES,
+                update_lists=shadow_list_flags,
+                frame_types=control_frame_types,
+            )
+            physical_schedule = wordbuf_ring.schedule_dict(
+                ring_plan, control_lengths)
+            physical_schedule["f0_cold"] = int(transfer_tiles_log[0])
+            physical_schedule["f0_ctrl_len"] = int(control_lengths[0])
+            print(
+                "WordBuf ring: enabled; "
+                f"boot={ring_plan.boot_patterns} "
+                f"timed refill={ring_plan.selected_refill_patterns}; "
+                f"runs {ring_plan.current_runs}->{ring_plan.model_runs}; "
+                f"O_LOADS peaks={wordram_layout.wr0_load_bytes}/"
+                f"{wordram_layout.wr1_load_bytes}B; "
+                f"Prg min={physical_schedule['ring_min_evaluation']} patterns",
+                flush=True,
+            )
+        else:
+            print(
+                "WordBuf ring: disabled for this stream because the exact "
+                f"deadline proof failed ({ring_plan.failure})",
+                flush=True,
+            )
+
+    if ring_enabled:
+        apply_postplan_transfer_stats(
+            stats,
+            dma_runs=ring_plan.runs,
+            prefetch_cold=prefetch_cold_log,
+        )
+        source_names = ("Prg", "Wr0", "Wr1", "Dic")
+        source_bits = {
+            name: np.uint16(
+                1 << DISPLAY_CATEGORY_MASK_ORDER.index(name))
+            for name in source_names
+        }
+        source_mask = np.uint16(0)
+        for bit in source_bits.values():
+            source_mask |= bit
+        rewritten_rows = []
+        for frame, (
+            (cells, _entries, colds),
+            frame_sources,
+            raw_flags,
+            category_cells,
+            raw_row,
+        ) in enumerate(zip(
+            ring_per_log,
+            ring_plan.sources,
+            ring_raw_flags_log,
+            ring_category_cells_log,
+            dec_category_rows,
+            strict=True,
+        )):
+            row = np.frombuffer(raw_row, "<u2").copy()
+            for cell, cold, source, is_raw, category_cell in zip(
+                    cells, colds, frame_sources, raw_flags, category_cells,
+                    strict=True):
+                if int(category_cell) < 0:
+                    continue
+                logical_cell = int(category_cell)
+                if (not cold or is_raw
+                        or not (row[logical_cell] & source_mask)):
+                    continue
+                row[logical_cell] &= np.uint16(~source_mask)
+                if source == pattern_supply.SOURCE_PRG:
+                    name = "Prg"
+                elif source == pattern_supply.SOURCE_WR:
+                    name = "Wr1" if frame & 1 else "Wr0"
+                elif source == pattern_supply.SOURCE_DIC:
+                    name = "Dic"
+                else:
+                    raise AssertionError(
+                        f"frame {frame}: invalid ring source {source}")
+                row[logical_cell] |= source_bits[name]
+            counts = [
+                int(np.count_nonzero(row & source_bits[name]))
+                for name in source_names
+            ]
+            if sum(counts) != int(stats[frame, 13]):
+                raise AssertionError(
+                    f"frame {frame}: ring source categories total "
+                    f"{sum(counts)} != Buf {int(stats[frame, 13])}")
+            stats[frame, 14:18] = counts
+            rewritten_rows.append(
+                row.astype("<u2", copy=False).tobytes())
+        dec_category_rows = rewritten_rows
+
+    # Exact Main-to-VDP workload. Physical run boundaries follow the final
+    # WordBuf plan. Keep the one/two-pattern count as a run-shape diagnostic;
+    # every run is transferred by DMA.
+    final_transfer_sources = (
+        ring_plan.sources if ring_enabled else
+        tuple(
+            tuple(int(source) for source in frame_sources)
+            for frame_sources in supply_sources_log
+        )
+    )
+    r2v_short_runs = np.zeros(n, np.int64)
+    r2v_word_cursors = [0, 0]
+    for frame, (
+        (_cells, entries, _colds),
+        frame_sources,
+        frame_prefetch,
+        frame_dic_indices,
+        transfer_order,
+    ) in enumerate(zip(
+        ring_per_log,
+        final_transfer_sources,
+        ring_prefetch_log,
+        ring_dic_indices_log,
+        ring_transfer_orders_log,
+        strict=True,
+    )):
+        order = tuple(int(index) for index in transfer_order)
+        slots = [
+            (int(entries[index]) & 0x07FF) - 1
+            for index in order
+        ]
+        sources = [int(frame_sources[index]) for index in order]
+        dic_indices = [int(frame_dic_indices[index]) for index in order]
+        cold_prefetch = sorted(
+            (item for item in frame_prefetch if bool(item[1])),
+            key=lambda item: int(item[0]),
+        )
+        slots.extend(int(item[0]) for item in cold_prefetch)
+        sources.extend(
+            pattern_supply.SOURCE_PRG for _item in cold_prefetch)
+        dic_indices.extend(-1 for _item in cold_prefetch)
+        runs = pattern_supply.source_runs(slots, sources, dic_indices)
+        parity = frame & 1
+        runs, r2v_word_cursors[parity] = (
+            pattern_supply.split_word_ring_runs(
+                runs,
+                capacity=(
+                    wordram_layout.wr1_patterns
+                    if parity else wordram_layout.wr0_patterns
+                ),
+                cursor=r2v_word_cursors[parity],
+            )
+        )
+        if frame == 0:
+            continue
+        lengths = tuple(
+            count for _slot, count, _source, _dic_index in runs)
+        if len(lengths) != int(transfer_runs_log[frame]):
+            raise AssertionError(
+                f"frame {frame}: R2V runs={len(lengths)} differ from "
+                f"player runs={int(transfer_runs_log[frame])}")
+        if sum(lengths) != int(transfer_tiles_log[frame]):
+            raise AssertionError(
+                f"frame {frame}: R2V patterns={sum(lengths)} differ from "
+                f"player patterns={int(transfer_tiles_log[frame])}")
+        r2v_short_runs[frame] = sum(
+            length <= r2v_model.SHORT_RUN_MAX_PATTERNS
+            for length in lengths
+        )
+    r2v_palette_switch = np.zeros(n, np.int64)
+    if n > 1:
+        r2v_palette_switch[1:] = (
+            (np.asarray(frame_seg[1:]) != np.asarray(frame_seg[:-1]))
+            | (np.asarray(frame_types[1:]) != shadow_updates.FRAME_NORMAL)
+        )
+    r2v_nt_words = r2v_model.name_table_words(TCOLS, TROWS, FPS)
+    r2v_nt_word_counts = np.full(n, r2v_nt_words, np.int64)
+    if scroll_plane_enabled:
+        # A horizontal scroll frame extends the staged band across the full
+        # 64-column last row; a vertical one carries the complete 64x32 plane
+        # so the wrapped incoming rows are delivered. Every scroll frame also
+        # rewrites the Plane A/B HScroll pair and the VSRAM pair.
+        base_band = (TROWS - 1) * scroll_plan.PLANE_COLUMNS + TCOLS
+        r2v_nt_word_counts[scroll_active & ~scroll_vertical] += (
+            TROWS * scroll_plan.PLANE_COLUMNS - base_band + 4)
+        r2v_nt_word_counts[scroll_vertical] += (
+            scroll_plan.PLANE_ROWS * scroll_plan.PLANE_COLUMNS
+            - base_band + 4)
+    r2v_components = r2v_model.calculate_words(
+        np.asarray(transfer_tiles_log, np.int64),
+        np.asarray(transfer_runs_log, np.int64),
+        r2v_palette_switch,
+        r2v_nt_word_counts,
+    )
+    for component in r2v_components.values():
+        component[0] = 0
+
+    prg_remaining = np.asarray(
+        physical_schedule["ring_occupancy"], np.int64)
+    quality_budget_remaining = np.asarray(quality_budget_log, np.int64)
+    quality_budget_balance = np.asarray(
+        quality_budget_balance_log, np.int64)
+    quality_budget_debt = np.asarray(
+        quality_budget_debt_log, np.int64)
+
+    def preload_remaining(loads):
+        total = int(loads.sum())
+        return total - np.cumsum(loads, dtype=np.int64)
+
+    if ring_enabled:
+        word_occupancy = np.asarray(
+            physical_schedule["word_occupancy"], np.int64)
+        wr0_remaining = word_occupancy[:, 0]
+        wr1_remaining = word_occupancy[:, 1]
+    else:
+        wr0_remaining = preload_remaining(wr0_loads)
+        wr1_remaining = preload_remaining(wr1_loads)
+    # DicBuf is persistent: hits never consume dictionary entries. Keep the
+    # schema field for readers while reporting a constant installed count.
+    dic_remaining = np.full(
+        len(dic_loads), supply_budget.dic_patterns, np.int64)
+    body_payload_bytes = np.asarray(
+        physical_schedule["body_useful_payload_bytes"], np.int64)
+    body_control_bytes = np.asarray(
+        physical_schedule["body_useful_control_bytes"], np.int64)
+    body_pad_bytes = np.asarray(
+        physical_schedule["body_pad_bytes"], np.int64)
+    body_physical_bytes = np.asarray(
+        physical_schedule["body_physical_bytes"], np.int64)
+
+    prg_raw_flags = []
+    word_raw_flags = [[], []]
+    for frame, (
+        (_cells, _entries, colds),
+        frame_sources,
+        raw_flags,
+        frame_prefetch,
+        transfer_order,
+    ) in enumerate(zip(
+        ring_per_log,
+        (
+            ring_plan.sources if ring_enabled else
+            tuple(tuple(int(source) for source in frame_sources)
+                  for frame_sources in supply_sources_log)
+        ),
+        ring_raw_flags_log,
+        ring_prefetch_log,
+        ring_transfer_orders_log,
+        strict=True,
+    )):
+        for update in transfer_order:
+            if not colds[update]:
+                raise AssertionError(
+                    f"frame {frame}: transfer order contains a reuse")
+            source = int(frame_sources[update])
+            is_raw = bool(raw_flags[update])
+            if frame == 0 or source == pattern_supply.SOURCE_PRG:
+                prg_raw_flags.append(is_raw)
+            elif source == pattern_supply.SOURCE_WR:
+                word_raw_flags[frame & 1].append(is_raw)
+        prg_raw_flags.extend(
+            False for item in frame_prefetch if bool(item[1]))
+
+    prg_flag_cursor = (
+        int(transfer_tiles_log[0])
+        + int(physical_schedule["prebuf_pat"])
+    )
+    # A short movie can fit wholly in the boot preload. Its last physical
+    # sector is zero-padded; only real patterns have raw-funding flags.
+    preload_pad = prg_flag_cursor - len(prg_raw_flags)
+    if 0 < preload_pad < stream_schedule.PATTERNS_PER_SECTOR and not np.any(body_payload_bytes):
+        prg_flag_cursor -= preload_pad
+    word_flag_cursors = [
+        (
+            int(ring_plan.boot_patterns[parity])
+            if ring_enabled else len(word_raw_flags[parity])
+        )
+        for parity in (0, 1)
+    ]
+    body_raw_payload_bytes = np.zeros(len(prg_loads), np.int64)
+    for frame in range(len(prg_loads)):
+        word_patterns = int(np.asarray(
+            physical_schedule.get(
+                "word_stage_patterns",
+                np.zeros(len(prg_loads), np.int64),
+            ),
+            np.int64,
+        )[frame])
+        if word_patterns:
+            parity = frame & 1
+            start = word_flag_cursors[parity]
+            stop = start + word_patterns
+            flags = word_raw_flags[parity][start:stop]
+            if len(flags) != word_patterns:
+                raise AssertionError(
+                    f"frame {frame}: WordBuf raw-funding trace is truncated")
+            body_raw_payload_bytes[frame] += (
+                sum(flags) * PATTERN_BYTES)
+            word_flag_cursors[parity] = stop
+        prg_patterns = (
+            int(ring_plan.prg_payload_patterns[frame])
+            if ring_enabled else
+            int(body_payload_bytes[frame]) // PATTERN_BYTES
+        )
+        if prg_patterns:
+            start = prg_flag_cursor
+            stop = start + prg_patterns
+            flags = prg_raw_flags[start:stop]
+            if len(flags) != prg_patterns:
+                raise AssertionError(
+                    f"frame {frame}: Prg raw-funding trace is truncated")
+            body_raw_payload_bytes[frame] += (
+                sum(flags) * PATTERN_BYTES)
+            prg_flag_cursor = stop
+    if prg_flag_cursor != len(prg_raw_flags):
+        raise AssertionError(
+            "physical Prg schedule did not consume the complete raw-funding "
+            f"trace ({prg_flag_cursor}/{len(prg_raw_flags)})")
+    if ring_enabled and any(
+            cursor != len(word_raw_flags[parity])
+            for parity, cursor in enumerate(word_flag_cursors)):
+        raise AssertionError(
+            "physical WordBuf schedule did not consume the complete refill "
+            "raw-funding trace")
+    if np.any(body_raw_payload_bytes > body_payload_bytes):
+        raise AssertionError(
+            "Raw-funded payload exceeds useful physical payload")
+
+    body_useful_bytes = body_payload_bytes + body_control_bytes
+    body_useful_bps = stream_schedule.average_body_delivery_rate_bps(
+        body_useful_bytes, body_physical_bytes)
+
+    report = "\n".join([
+        f"resolution={W}x{H} cells/frame={C_CELLS} active_tiles={ACTIVE_TILES} fps={FPS}",
+        f"output_dither={OUTPUT_DITHER}",
+        f"body_gross_bytes_per_frame={body_gross_bytes[1:].mean():.1f} "
+        f"(exact sectors {sorted(set(int(x // stream_schedule.SECTOR_BYTES) for x in body_gross_bytes[1:]))})",
+        f"body_fixed_control_bytes_per_frame={body_fixed_control_bytes[1:].mean():.1f}",
+        f"body_variable_supply_bytes_per_frame={body_variable_supply_bytes[1:].mean():.1f} "
+        f"(updates + runs + Prg payload)",
+        f"identity_run_control_reservation="
+        f"{stream_schedule.RUN_DESCRIPTOR_BYTES}B/cold while selecting; "
+        "exact run bytes are finalized in-frame",
+        "physical_delivery_plan=one-pass cadence-sector prefix ledger; "
+        "exact control savings become the following frame's Prg limit before "
+        "that frame makes image decisions; every exact route keeps CD-rate "
+        "lead at zero; pack repeats the frozen proof",
+        f"PrgBuf_geometry=normal {PRG_BUF_CAP_KB}KiB + "
+        f"jitter {PRG_JITTER_HEADROOM_KB}KiB = "
+        f"delivery {PRG_DELIVERY_CAP_KB}KiB; "
+        f"physical ring {av_config.RING_SIZE_KB}KiB; "
+        f"scheduled jitter peak "
+        f"{int(physical_schedule['ring_jitter_peak']) * PATTERN_BYTES / 1024:.1f}KiB",
+        f"avg_codec_work_bytes_per_frame={fb.mean():.1f}",
+        f"VRAM_tiles={VRAM_TILES}  L3(PRG-RAM)_tiles={L3_TILES}",
+        f"avg_PrgBuf_loads_per_frame={prg_loads.mean():.1f}",
+        f"boot_vram_prefetch={int(BOOT_VRAM_PREFETCH_ON)} "
+        f"boot_loads={int(prefetch_cold_log[0]) if prefetch_cold_log else 0} "
+        f"runtime_raw_vram_prefetch={int(RAW_PREFETCH_ON)} "
+        f"fade_vram_prefetch={int(bool(fade_prefetch_plan))} "
+        f"total_loads={int(np.sum(prefetch_cold_log))} "
+        f"request_events={sum(len(items) for items in prefetch_requests_log)} "
+        f"cache_evictions={alloc.prefetch_cache_evictions} "
+        f"pin_evictions={alloc.prefetch_evictions} "
+        f"fade_pin_reclaims={alloc.mandatory_prefetch_evictions}",
+        f"boot_preload_patterns=Wr0:"
+        f"{int(ring_plan.boot_patterns[0]) if ring_enabled else int(wr0_loads.sum())} "
+        f"Wr1:"
+        f"{int(ring_plan.boot_patterns[1]) if ring_enabled else int(wr1_loads.sum())} "
+        f"Dic:{supply_budget.dic_patterns} hits:{int(dic_loads.sum())}",
+        (
+            f"WordBuf_ring=enabled refill="
+            f"{ring_plan.selected_refill_patterns[0]}/"
+            f"{ring_plan.selected_refill_patterns[1]} patterns "
+            f"stage_sectors={int(ring_plan.word_stage_sectors.sum())} "
+            f"runs={ring_plan.current_runs}->{ring_plan.model_runs}"
+            if ring_enabled
+            else (
+                "WordBuf_ring=disabled "
+                f"reason={ring_plan.failure}"
+                if ring_plan is not None else
+                "WordBuf_ring=disabled"
+            )
+        ),
+        f"avg_L2_dedup_hit_per_frame={ded.mean():.1f} (VRAM常駐で0転送)",
+        f"avg_L3_hit_per_frame={l3h.mean():.1f} (再登場をRAMから0CDで供給)",
+        f"avg_noncurrent_budget_exact_loads={prh.mean():.1f}",
+        f"total_PrgBuf_pattern_bytes={prg_loads.sum()*PATTERN_BYTES:.0f}",
+        f"L3_saved_CD_bytes={l3h.sum()*PATTERN_BYTES:.0f} (L3が無ければCD再読みしていた分)",
+        f"dedup_saved_ratio={ded.sum()/(tr.sum()+prh.sum()+ded.sum()+l3h.sum()+1e-9):.3f}",
+        f"quality_budget={QUALITY_BUDGET_ON} "
+        f"cap={QUALITY_BUDGET_BYTES//PATTERN_BYTES}patterns"
+        + (f" budget: start={quality_budget_remaining[0]} "
+           f"end={quality_budget_remaining[-1]} "
+           f"min={quality_budget_remaining.min()} "
+           f"debt_peak={quality_budget_debt.max(initial=0)}B"
+           if QUALITY_BUDGET_ON else ""),
+        f"PrgBuf: start={prg_remaining[0]} end={prg_remaining[-1]} "
+        f"min={prg_remaining.min()} peak={prg_remaining.max()}patterns "
+        f"(normal={PRG_BUF_CAP_KB * 1024 // PATTERN_BYTES}, "
+        f"delivery={PRG_DELIVERY_CAP_KB * 1024 // PATTERN_BYTES})",
+        f"starved_frames={starved_frames} ({starved_frames/n*100:.1f}%)",
+        f"codec_work_bps={fb.mean()*FPS:.0f} (quality-allocation diagnostic)",
+        f"body_useful_bps={body_useful_bps:.0f} "
+        f"(useful BODY / physical CD read time; HEADER/frame0/pad excluded; "
+        f"CD1x={CD_RATE})",
+        (f"shadow_update_lists={int(shadow_list_flags.sum())}/{len(shadow_list_flags)} "
+         f"safety_rejected={len(shadow_plan['safety_rejected_frames'])} "
+         f"main_saved_avg="
+         f"{sum(cost.saved_cycles for cost, chosen in zip(shadow_plan['costs'], shadow_list_flags) if chosen) / max(1, len(shadow_list_flags)):.1f}cycles/frame "
+         f"control_delta={int((control_lengths - legacy_lengths).sum())}B "
+         f"threshold="
+         f"{'schedule' if shadow_plan['control_growth_enabled'] else 'no-control-growth'} "
+         f"baseline/selected ring_min eval="
+         f"{shadow_plan['baseline_schedule']['ring_min_evaluation']}/"
+         f"{physical_schedule['ring_min_evaluation']} "
+         f"(full {shadow_plan['baseline_schedule']['ring_min']}/"
+         f"{physical_schedule['ring_min']}, "
+         f"tail f{physical_schedule['evaluation_end_frame']}..) "
+         f"ready_min={shadow_plan['baseline_schedule']['ready_min']}/{physical_schedule['ready_min']}"
+         if shadow_plan is not None else "shadow_update_lists=0 (pattern supply disabled)"),
+        (f"upgrade(格上げ): 余剰でRaw化 avg {np.mean([u for u, _ in upgrade_log]):.1f}/コマ, "
+         f"まだ近似のセル avg {np.mean([a for _, a in upgrade_log]):.1f}; "
+         f"upgrade reserve start/peak/end="
+         f"{upgrade_reserve[0]//1024}/{upgrade_reserve.max()//1024}/"
+         f"{upgrade_reserve[-1]//1024}KB; main risk="
+         f"{main_reserve[0]//1024}/{main_reserve.max()//1024}/"
+         f"{main_reserve[-1]//1024}KB; CRAM priority selected="
+         f"{int(np.count_nonzero(cram_quality_priority_frames))}frames"
+         if upgrade_log else "upgrade: (off)"),
+    ])
+    (OUT / "report.txt").write_text(report)
+    print(report)
+
+    # status line 用の per-frame 実測を保存
+    cols = " ".join(STAT_COLUMNS)
+    budget_tiles = int(np.median(
+        stats[:, STAT_COLUMN_INDEX["ffix"]]))
+    # 全編ユニーク(cattotals併記用): same/near/flbk の別タイル総数
+    cat_uniq = np.array([
+        len(guniq["same"]), len(guniq["near"]), len(guniq["flbk"]),
+    ], np.int64)
+    np.savez(OUT / "stats.npz", stats=stats, cols=cols, fps=FPS, cells=C_CELLS,
+             active_tiles=ACTIVE_TILES, max_cold=MAX_COLD,
+             cold_cap_spec=COLD_CAP_SPEC,
+             frame_cold_caps=frame_cold_caps,
+             raw_prefetch=np.asarray(prefetch_cold_log, np.int64),
+             raw_prefetch_cap=np.int64(max(
+                 1, RAW_PREFETCH_MAX_REQUESTS_PER_FRAME)),
+             r2v_words=r2v_components["words"],
+             r2v_pattern_words=r2v_components["pattern_words"],
+             r2v_repair_words=r2v_components["repair_words"],
+             r2v_name_table_words=r2v_components["name_table_words"],
+             r2v_cram_words=r2v_components["cram_words"],
+             r2v_short_runs=r2v_short_runs,
+             r2v_palette_switch=r2v_palette_switch,
+             frame_types=control_frame_types,
+             cd1x=CD_RATE,
+             body_gross_bytes=body_gross_bytes,
+             body_fixed_control_bytes=body_fixed_control_bytes,
+             body_variable_supply_bytes=body_variable_supply_bytes,
+             cat_uniq=cat_uniq,
+             audio_label=AUDIO_LABEL, audio_frame_bytes=AUDIO_CONTROL_BYTES,
+             audio_pcm_bytes=AUDIO_PCM_BYTES,
+             audio_source_file=AUDIO_FILE,
+             audio_playback_file=AUDIO_PLAYBACK_FILE,
+             audio_playback_rate=AUDIO_PLAYBACK_RATE,
+             budget_tiles=budget_tiles)
+    np.save(OUT / "miss_masks.npy", np.array(stale_rows, np.uint8))   # (n,72) packbits
+    if QUALITY_BUDGET_ON:
+        # Schema 4 exposes every physical pattern source independently.  The
+        # encoder's quality budget remains an offline diagnostic and must not
+        # silently drive any of the four hardware meters.
+        np.savez(
+            OUT / "buffer_remaining.npz",
+            schema_version=np.int64(8),
+            remaining_kind=np.array("three_consumptive_plus_dicbuf"),
+            # Compatibility aliases for offline readers predating schema 4.
+            remaining=prg_remaining,
+            total=PRG_DELIVERY_CAP_KB * 1024 // PATTERN_BYTES,
+            prg_remaining=prg_remaining,
+            wr0_remaining=wr0_remaining,
+            wr1_remaining=wr1_remaining,
+            dic_remaining=dic_remaining,
+            prg_capacity=PRG_DELIVERY_CAP_KB * 1024 // PATTERN_BYTES,
+            prg_normal_capacity=PRG_BUF_CAP_KB * 1024 // PATTERN_BYTES,
+            prg_jitter_headroom=(
+                PRG_JITTER_HEADROOM_KB * 1024 // PATTERN_BYTES),
+            wr0_capacity=wordram_layout.wr0_patterns,
+            wr1_capacity=wordram_layout.wr1_patterns,
+            dic_capacity=pattern_supply.DIC_BUF_PATTERNS,
+            prg_loads=prg_loads,
+            wr0_loads=wr0_loads,
+            wr1_loads=wr1_loads,
+            dic_loads=dic_loads,
+            wr0_preloaded=np.int64(
+                ring_plan.boot_patterns[0]
+                if ring_enabled else wr0_loads.sum()),
+            wr1_preloaded=np.int64(
+                ring_plan.boot_patterns[1]
+                if ring_enabled else wr1_loads.sum()),
+            wordbuf_ring_enabled=np.int64(ring_enabled),
+            wordbuf_stage_sectors=np.asarray(
+                (
+                    ring_plan.word_stage_sectors
+                    if ring_enabled else np.zeros(len(prg_loads), np.int64)
+                ),
+                np.int64,
+            ),
+            wr0_boot_patterns=np.int64(
+                ring_plan.boot_patterns[0]
+                if ring_enabled else wr0_loads.sum()),
+            wr1_boot_patterns=np.int64(
+                ring_plan.boot_patterns[1]
+                if ring_enabled else wr1_loads.sum()),
+            dic_preloaded=np.int64(supply_budget.dic_patterns),
+            wordbuf_prg_pressure_start_frame=np.int64(
+                supply_budget.prg_pressure_start),
+            wordbuf_predicted_prg_supply_patterns=(
+                predicted_prg_supply_patterns),
+            quality_budget_remaining=quality_budget_remaining,
+            quality_budget_balance_bytes=quality_budget_balance,
+            quality_budget_debt_bytes=quality_budget_debt,
+            exact_demand_bytes=demand_prediction.exact_bytes,
+            protected_demand_bytes=demand_prediction.protected_bytes,
+            preload_credit_bytes=preload_credit_bytes,
+            upgrade_demand_bytes=upgrade_demand,
+            upgrade_planned_demand_bytes=upgrade_demand,
+            upgrade_unavoidable_shortfall_bytes=np.zeros(
+                len(upgrade_demand), np.int64),
+            upgrade_reserve_bytes=upgrade_reserve,
+            upgrade_base_reserve_bytes=upgrade_base_reserve,
+            upgrade_effective_reserve_bytes=upgrade_reserve_floor,
+            terminal_drain_start_frame=np.int64(
+                terminal_drain_plan.start_frame),
+            terminal_drain_credit_bytes=terminal_drain_credit,
+            main_risk_demand_bytes=main_demand,
+            main_risk_planned_demand_bytes=(
+                main_reserve_plan.planned_demand),
+            main_risk_unavoidable_shortfall_bytes=(
+                main_reserve_plan.shortfall),
+            main_risk_reserve_bytes=main_reserve,
+            main_risk_base_reserve_bytes=main_base_reserve,
+            cram_quality_priority_search_frames=np.int64(
+                CRAM_QUALITY_PRIORITY_SEARCH_FRAMES),
+            cram_quality_priority_mask=cram_quality_priority_frames,
+            cram_quality_risk_bytes=cram_quality_risk_bytes,
+            block_lengths=control_lengths,
+            shadow_update_lists=shadow_list_flags,
+            payload_sectors=np.asarray(
+                physical_schedule["n_pay_sec"], np.int64),
+            control_sectors=np.asarray(
+                physical_schedule["n_ctrl_sec"], np.int64),
+            body_useful_payload_bytes=body_payload_bytes,
+            body_raw_payload_bytes=body_raw_payload_bytes,
+            body_useful_control_bytes=body_control_bytes,
+            body_pad_bytes=body_pad_bytes,
+            body_physical_bytes=body_physical_bytes,
+            body_gross_bytes=body_gross_bytes,
+            body_fixed_control_bytes=body_fixed_control_bytes,
+            body_variable_supply_bytes=body_variable_supply_bytes,
+        )
+    print("wrote stats.npz + miss_masks.npy; analysis PNGs are deferred")
+
+    # 実機CAVCエンコード用の決定ログ(既定off)。品質決定(区間パレット/ディザ/Near/Flbk/画質予算/fill)は
+    # すべてこのログに畳み込まれる=pack_streamは再生するだけでmp4と同じ画を出せる(唯一の真実源)。
+    if EMIT_DEC:
+        import pickle
+        frozen_config = {
+            "schema_version": 1,
+            "profile": profile_identity(CONFIG_PROFILE),
+            "source": {
+                "path": str(SRC), "fps": str(FPS_STR), "duration": str(DURATION),
+                "sar": SOURCE_SAR_OVERRIDE,
+                "preprocess": dict(
+                    CONFIG_PROFILE.section("source").get("preprocess", {})
+                    if CONFIG_PROFILE else {}),
+            },
+            "video": {
+                "mode": MODE, "width": int(W), "height": int(H),
+                "cols": int(TCOLS), "rows": int(TROWS), "cells": int(C_CELLS),
+                "active_tiles": int(ACTIVE_TILES),
+                "tile": int(TILE), "fit": GEOMETRY_FIT,
+                "resize_filter": RESIZE_FILTER,
+                "master_denoise": bool(MASTER_DENOISE),
+                "output_dither": OUTPUT_DITHER,
+                "prioritize_tile_edges": prioritize_tile_edges,
+                "prioritize_motion": prioritize_motion,
+                "smooth_motion_fallback": smooth_motion_fallback,
+                "adaptive_motion": adaptive_enabled,
+                "motion_compensation": compensate_motion,
+            },
+            "timing": {
+                "content_fps": str(FPS_STR), "fps": float(FPS),
+                "vsync_n": int(VSYNC_N), "playback_fps": float(PLAYBACK_FPS),
+            },
+            "audio": {
+                "filter": AUDIO_AF,
+                "rate": int(AUDIO_RATE),
+                "frame_bytes": int(AUDIO_CONTROL_BYTES),
+                "control_bytes": int(AUDIO_CONTROL_BYTES),
+                "pcm_bytes": int(AUDIO_PCM_BYTES),
+                "checkpoint_bytes": int(av_config.IMA_CHECKPOINT_BYTES),
+                "file": AUDIO_FILE,
+                "playback_file": AUDIO_PLAYBACK_FILE,
+                "playback_rate": int(AUDIO_PLAYBACK_RATE),
+            },
+            "stream": {
+                "cd_rate_bps": int(CD_RATE),
+                "body_gross_bytes": body_gross_bytes,
+                "body_fixed_control_bytes": body_fixed_control_bytes,
+                "body_variable_supply_bytes": body_variable_supply_bytes,
+            },
+            "hardware": {
+                "vram_tiles": int(VRAM_TILES),
+                "prg_buf_kb": int(PRG_BUF_CAP_KB),
+                "prg_delivery_cap_kb": int(PRG_DELIVERY_CAP_KB),
+                "prg_jitter_headroom_kb": int(PRG_JITTER_HEADROOM_KB),
+                "prg_physical_ring_kb": int(av_config.RING_SIZE_KB),
+                "quality_budget_kb": int(QUALITY_BUDGET_KB),
+                "max_cold": int(MAX_COLD),
+                "cold_cap_spec": COLD_CAP_SPEC,
+            },
+            "encoder": {
+                "detail_alpha": float(DETAIL_ALPHA),
+                "aging_alpha": float(AGING_ALPHA),
+                "aging_dist_ref": float(AGING_DIST_REF),
+                "aging_step_cap": float(AGING_STEP_CAP),
+                "aging_press_cap": float(WAIT_CAP),
+                "ghost_escalate_sec": float(GHOST_ESCALATE_SEC),
+                "ghost_escalate_frames": int(GHOST_ESCALATE_N),
+                "boot_vram_prefetch": bool(BOOT_VRAM_PREFETCH_ON),
+                "raw_prefetch": bool(RAW_PREFETCH_ON),
+                "raw_prefetch_lookahead": int(RAW_PREFETCH_LOOKAHEAD),
+                "raw_prefetch_max_requests_per_frame": int(
+                    RAW_PREFETCH_MAX_REQUESTS_PER_FRAME),
+                "raw_prefetch_min_batch": int(RAW_PREFETCH_MIN_BATCH),
+                "raw_prefetch_budget_floor_patterns": int(
+                    RAW_PREFETCH_BUDGET_FLOOR_PATTERNS),
+                "cram_quality_priority_search_frames": int(
+                    CRAM_QUALITY_PRIORITY_SEARCH_FRAMES),
+            },
+            "palette": {
+                "algorithm": PAL_ALGO, "seam_weight": float(PAL_SEAM_WEIGHT),
+                "seam_iterations": int(PAL_SEAM_ITERATIONS),
+            },
+        }
+        pickle.dump({
+            "config": frozen_config,
+            "geom": (int(TCOLS), int(TROWS), int(C_CELLS), int(TILE)),
+            "mode": MODE,                                      # header display mode
+            "fps_str": str(FPS_STR),
+            "pal_algo": PAL_ALGO,
+            "pal_stats": palette_stats,
+            "seg_pals": [np.asarray(p, np.uint8) for p in seg_pals],  # list of (4,15,3)
+            "segment_entry_cram": np.asarray(segment_entry_cram, np.uint8),
+            "frame_seg": np.asarray(frame_seg, np.int32),
+            "fade": {
+                "schema_version": 1,
+                "automatic": True,
+                "frame_types": np.asarray(frame_types, np.uint8),
+                "frame_cram": np.asarray(frame_cram, np.uint8),
+                "active_frame_cram": np.asarray(
+                    active_frame_cram, np.uint8),
+                "anchors": np.asarray(fade_layout.anchors, np.uint16),
+                "restorations": np.asarray(
+                    fade_layout.restorations, np.uint16),
+                "shots": [
+                    {
+                        "kind": shot.kind,
+                        "anchor": int(shot.anchor),
+                        "start": int(shot.start),
+                        "end": int(shot.end),
+                        "reference": int(shot.reference),
+                        "peak": int(shot.peak),
+                        "left_black_start": (
+                            int(shot.left_black.start)
+                            if shot.left_black is not None else -1),
+                        "left_black_end": (
+                            int(shot.left_black.end)
+                            if shot.left_black is not None else -1),
+                        "right_black_start": (
+                            int(shot.right_black.start)
+                            if shot.right_black is not None else -1),
+                        "right_black_end": (
+                            int(shot.right_black.end)
+                            if shot.right_black is not None else -1),
+                        "scales": tuple(float(value) for value in shot.scales),
+                        "fit_rmse": tuple(float(value) for value in shot.fit_rmse),
+                        "spatial_correlation": tuple(
+                            float(value)
+                            for value in shot.spatial_correlation),
+                    }
+                    for shot in fade_layout.shots
+                ],
+            },
+            "scroll": {
+                "schema_version": 1,
+                "automatic": True,
+                "active": np.asarray(scroll_active, np.bool_),
+                "positions": np.asarray(scroll_positions, np.int16),
+                "windows": [
+                    {
+                        "anchor": int(window.anchor),
+                        "end": int(window.end),
+                        "axis": window.axis,
+                        "detector_start": int(window.detector_start),
+                        "final_position": int(window.final_position),
+                        "support": float(window.support),
+                        "multiframe_support": float(
+                            window.multiframe_support),
+                        "adoption_gain": float(window.adoption_gain),
+                        "beneficial_fraction": float(
+                            window.beneficial_fraction),
+                        "overlap_rmse_p95": float(
+                            window.overlap_rmse_p95),
+                    }
+                    for window in scroll_windows
+                ],
+            },
+            "frames": dec_frames,                                     # [[(cell,pal,key),...], ...]
+            "display_category_masks": {
+                "schema_version": 1,
+                "bit_order": DISPLAY_CATEGORY_MASK_ORDER,
+                "rows": dec_category_rows,
+            },
+            "pattern_supply": {
+                "schema_version": 5,
+                "enabled": bool(PATTERN_SUPPLY_ON),
+                "policy": (
+                    "deadline-run-sector-refill"
+                    if ring_enabled else "prg-pressure-waterfill"),
+                "prg_pressure_start_frame": int(
+                    supply_budget.prg_pressure_start),
+                "predicted_prg_supply_patterns": np.asarray(
+                    predicted_prg_supply_patterns, np.uint16),
+                "sources": supply_sources_log,
+                "planned_wr": np.asarray(supply_budget.wr, np.uint16),
+                "planned_dic": np.asarray(supply_budget.dic, np.uint16),
+                "dic_dictionary": list(
+                    supply_budget.dic_dictionary_packed),
+                "prg_loads": prg_loads.astype(np.uint16),
+                "wr0_loads": wr0_loads.astype(np.uint16),
+                "wr1_loads": wr1_loads.astype(np.uint16),
+                "dic_loads": dic_loads.astype(np.uint16),
+                "capacities": {
+                    "wr0": wordram_layout.wr0_patterns,
+                    "wr1": wordram_layout.wr1_patterns,
+                    "dic": pattern_supply.DIC_BUF_PATTERNS,
+                },
+                "word_ram_layout": dataclasses.asdict(wordram_layout),
+                "word_ring": {
+                    "enabled": bool(ring_enabled),
+                    "policy": "prg-first-complete-run-sector-refill",
+                    "boot_patterns": (
+                        tuple(int(value) for value in ring_plan.boot_patterns)
+                        if ring_enabled else (
+                            int(wr0_loads.sum()), int(wr1_loads.sum())
+                        )
+                    ),
+                    "boot_end_frames": (
+                        tuple(
+                            int(value)
+                            for value in ring_plan.boot_end_frames
+                        )
+                        if ring_enabled else (0, 0)
+                    ),
+                    "selected_refill_patterns": (
+                        tuple(
+                            int(value)
+                            for value in ring_plan.selected_refill_patterns
+                        )
+                        if ring_enabled else (0, 0)
+                    ),
+                    "stage_sectors": np.asarray(
+                        (
+                            ring_plan.word_stage_sectors
+                            if ring_enabled else
+                            np.zeros(len(prg_loads), np.int64)
+                        ),
+                        np.uint8,
+                    ),
+                },
+            },
+            "physical_budget": {
+                "schema_version": 5,
+                "policy": (
+                    "wordbuf-ring-cadence-sector-prefix"
+                    if ring_enabled else "online-cadence-sector-prefix"),
+                "planning_passes": int(
+                    physical_budget_plan.planning_passes),
+                "desired_prg_patterns": np.asarray(
+                    physical_budget_plan.desired_prg_patterns, np.uint16),
+                "prg_pattern_limits": np.asarray(
+                    physical_budget_plan.prg_pattern_limits, np.uint16),
+                "shortfall_patterns": np.asarray(
+                    physical_budget_plan.shortfall_patterns, np.uint16),
+                "cold_pattern_limits": np.asarray(
+                    physical_budget_plan.cold_pattern_limits, np.uint16),
+                "control_block_limits": np.asarray(
+                    physical_budget_plan.control_block_limits, np.int64),
+                "cumulative_prg_pattern_limits": np.asarray(
+                    physical_budget_plan.cumulative_prg_pattern_limits,
+                    np.int64),
+                "cumulative_control_byte_limits": np.asarray(
+                    physical_budget_plan.cumulative_control_byte_limits,
+                    np.int64),
+                "cumulative_useful_sector_capacity": np.asarray(
+                    physical_budget_plan.cumulative_useful_sector_capacity,
+                    np.int64),
+                "realized_prg_patterns": np.asarray(
+                    prg_loads, np.int64),
+                "construction_prg_patterns": np.asarray(
+                    physical_budget_plan.realized_prg_patterns, np.int64),
+                "realized_word_stage_patterns": np.asarray(
+                    (
+                        ring_plan.word_stage_patterns
+                        if ring_enabled else
+                        np.zeros(len(prg_loads), np.int64)
+                    ),
+                    np.int64,
+                ),
+                "realized_cold_patterns": np.asarray(
+                    physical_budget_plan.realized_cold_patterns, np.int64),
+                "realized_control_block_bytes": np.asarray(
+                    physical_budget_plan.realized_control_block_bytes,
+                    np.int64),
+            },
+            "adaptive_hold_frames": np.flatnonzero(hold_frames).tolist(),
+            "raw_prefetch": {
+                "schema_version": 6,
+                "enabled": bool(
+                    BOOT_VRAM_PREFETCH_ON
+                    or RAW_PREFETCH_ON
+                    or fade_prefetch_plan
+                    or motion_prefetch
+                ),
+                "boot_enabled": bool(BOOT_VRAM_PREFETCH_ON),
+                "runtime_enabled": bool(RAW_PREFETCH_ON),
+                "fade_enabled": bool(fade_prefetch_plan),
+                "fade_pin_reclaims": int(
+                    alloc.mandatory_prefetch_evictions),
+                "boot_capacity": int(boot_prefetch_capacity),
+                "boot_requests": int(len(boot_prefetch_plan)),
+                "boot_inline_capacity": int(boot_inline_capacity),
+                "boot_sidecar_capacity": int(boot_sidecar_capacity),
+                "boot_inline_requests": int(boot_inline_requests),
+                "boot_sidecar_requests": int(boot_sidecar_requests),
+                "lookahead": int(RAW_PREFETCH_LOOKAHEAD),
+                "max_requests_per_frame": int(
+                    RAW_PREFETCH_MAX_REQUESTS_PER_FRAME),
+                "min_batch": int(RAW_PREFETCH_MIN_BATCH),
+                "budget_floor_patterns": int(
+                    RAW_PREFETCH_BUDGET_FLOOR_PATTERNS),
+                "requests": prefetch_requests_log,
+                "cold": np.asarray(prefetch_cold_log, np.uint16),
+                "forecast_protected_cold": np.asarray(
+                    prefetch_forecast.protected_cold, np.uint16),
+                "forecast_requested": np.asarray(
+                    prefetch_forecast.requested_patterns, np.uint16),
+            },
+            # simが決めた値をpackで全frame再計算し、descriptor/HUD cold_runsとのズレを即時検出する。
+            "pattern_transfers": {
+                "schema_version": 3,
+                "tiles": np.asarray(transfer_tiles_log, np.uint16),
+                "runs": np.asarray(transfer_runs_log, np.uint16),
+                "prg": prg_loads.astype(np.uint16),
+                "wr0": wr0_loads.astype(np.uint16),
+                "wr1": wr1_loads.astype(np.uint16),
+                "dic": dic_loads.astype(np.uint16),
+                "word_stage_sectors": np.asarray(
+                    (
+                        ring_plan.word_stage_sectors
+                        if ring_enabled else
+                        np.zeros(len(prg_loads), np.int64)
+                    ),
+                    np.uint8,
+                ),
+            },
+            # Analysis and pack must show the same physical PrgBuf trace.
+            # The packer compares this frozen trace with its built control data.
+            "stream_schedule": {
+                "schema_version": stream_schedule.STREAM_SCHEDULE_SCHEMA_VERSION,
+                "block_lengths": control_lengths,
+                "ring_occupancy": prg_remaining,
+                "ring_occupancy_before_consume": np.asarray(
+                    physical_schedule["ring_occupancy_before_consume"],
+                    np.int64),
+                "payload_sectors": np.asarray(
+                    physical_schedule["n_pay_sec"], np.int64),
+                "evaluation_end_frame": int(
+                    physical_schedule["evaluation_end_frame"]),
+                "ring_min_evaluation": int(
+                    physical_schedule["ring_min_evaluation"]),
+                "ring_min_full": int(physical_schedule["ring_min"]),
+                "control_sectors": np.asarray(
+                    physical_schedule["n_ctrl_sec"], np.int64),
+                "word_stage_sectors": np.asarray(
+                    physical_schedule.get(
+                        "word_stage_sectors",
+                        np.zeros(len(prg_loads), np.int64),
+                    ),
+                    np.int64,
+                ),
+                "word_occupancy": np.asarray(
+                    physical_schedule.get(
+                        "word_occupancy",
+                        np.zeros((len(prg_loads), 2), np.int64),
+                    ),
+                    np.int64,
+                ),
+                "body_useful_payload_bytes": body_payload_bytes,
+                "body_raw_payload_bytes": body_raw_payload_bytes,
+                "body_useful_control_bytes": body_control_bytes,
+                "body_pad_bytes": body_pad_bytes,
+                "body_physical_bytes": body_physical_bytes,
+            },
+            "shadow_updates": {
+                "schema_version": 1,
+                "selected": shadow_list_flags,
+                "legacy_cycles": np.asarray(
+                    [cost.legacy_cycles for cost in shadow_costs], np.int64),
+                "list_cycles": np.asarray(
+                    [cost.list_cycles for cost in shadow_costs], np.int64),
+                "added_bytes": np.asarray(
+                    [cost.added_bytes for cost in shadow_costs], np.int64),
+                "cutoff_numerator": (
+                    int(shadow_plan["cutoff_numerator"]) if shadow_plan is not None else 0),
+                "cutoff_denominator": (
+                    int(shadow_plan["cutoff_denominator"]) if shadow_plan is not None else 1),
+                "baseline_ring_min": (
+                    int(shadow_plan["baseline_schedule"]["ring_min"])
+                    if shadow_plan is not None else int(physical_schedule["ring_min"])),
+                "baseline_ring_min_evaluation": (
+                    int(shadow_plan["baseline_schedule"]["ring_min_evaluation"])
+                    if shadow_plan is not None
+                    else int(physical_schedule["ring_min_evaluation"])),
+                "baseline_ready_min": (
+                    int(shadow_plan["baseline_schedule"]["ready_min"])
+                    if shadow_plan is not None else int(physical_schedule["ready_min"])),
+                "selected_ring_min": int(physical_schedule["ring_min"]),
+                "selected_ring_min_evaluation": int(
+                    physical_schedule["ring_min_evaluation"]),
+                "evaluation_end_frame": int(
+                    physical_schedule["evaluation_end_frame"]),
+                "selected_ready_min": int(physical_schedule["ready_min"]),
+                "control_growth_enabled": (
+                    bool(shadow_plan["control_growth_enabled"])
+                    if shadow_plan is not None else False),
+            },
+            "miss": dec_miss,                                         # per-frame Miss数(overlay用)
+            "cats": dec_cats,                                         # per-frame [raw,same,near,flbk,buf,miss,scrl]
+            "body_gross_bytes": body_gross_bytes,
+            "body_fixed_control_bytes": body_fixed_control_bytes,
+            "body_variable_supply_bytes": body_variable_supply_bytes,
+            "audio_rate": int(AUDIO_RATE),
+            "audio_frame_bytes": int(AUDIO_CONTROL_BYTES),
+            "audio_pcm_bytes": int(AUDIO_PCM_BYTES), "fps": float(FPS),
+            "vram_tiles": int(VRAM_TILES),
+            # エンコード時の実効パラメータを焼き込む(pack/解析が同一値を使い二重管理を防ぐ)。
+            "max_cold": int(MAX_COLD),
+            "cold_cap_spec": COLD_CAP_SPEC,
+            "prg_buf_kb": int(PRG_BUF_CAP_KB),
+            "prg_delivery_cap_kb": int(PRG_DELIVERY_CAP_KB),
+            "prg_jitter_headroom_kb": int(PRG_JITTER_HEADROOM_KB),
+            "prg_physical_ring_kb": int(av_config.RING_SIZE_KB),
+            "quality_budget_kb": int(QUALITY_BUDGET_KB),
+            "cram_quality_priority_search_frames": int(
+                CRAM_QUALITY_PRIORITY_SEARCH_FRAMES),
+        }, open(EMIT_DEC, "wb"), protocol=4)
+        print(f"  実機決定ログ: {EMIT_DEC} ({len(dec_frames)} frames)")
+
+    _mark("Finalize", _t)
+    emit("encoded")
+    total = time.perf_counter() - _t_all
+    import gpu_quant
+    gpu_on = gpu_quant.enabled()
+    print("\n==== Encode timing ("
+          f"{n} frames {W}x{H} {C_CELLS} cells "
+          f"gpu={'ON' if gpu_on else 'off'}) ====")
+    for name, dt in _phases:
+        print(f"  {name:<22s} {dt:8.1f}s  ({dt / n * 1000:7.1f} ms/frame  {dt / n:8.4f} s/frame)")
+    print(f"  {'Total':<22s} {total:8.1f}s  "
+          f"({total / n * 1000:7.1f} ms/frame  "
+          f"{total / n:8.4f} s/frame)")
+
+
+_SIM_CACHE_IDENTITY = None
+
+
+def _sim_cache_identity():
+    global _SIM_CACHE_IDENTITY
+    if _SIM_CACHE_IDENTITY is None:
+        _SIM_CACHE_IDENTITY = sim_artifact_cache.build_identity(
+            source=SRC,
+            emit_decisions=bool(EMIT_DEC),
+        )
+    return _SIM_CACHE_IDENTITY
+
+
+def _tmpfs_key():
+    return sim_artifact_cache.readable_key(
+        _sim_cache_identity(),
+        mode=MODE,
+        width=W,
+        height=H,
+        fps=FPS_STR,
+        fit=GEOMETRY_FIT,
+        cold_cap=av_config.cold_cap_key(_COLD_CAP_REQUEST),
+    )
+
+
+def _estimated_frame_count():
+    if SOURCE_RANGE is not None:
+        return SOURCE_RANGE[1] - SOURCE_RANGE[0]
+    return max(1, int(math.ceil(float(DURATION) * FPS)) + 2)
+
+
+def _sim_tmpfs_required_bytes():
+    # PNG compression varies substantially by source. This estimate covers the
+    # two extracted inputs and ordinary sidecars while retaining fixed headroom
+    # for palettes, decisions, and audio. Analysis panels have their own render
+    # reservation and do not belong to the mandatory sim stage.
+    pixels = _estimated_frame_count() * W * H
+    return pixels * 6 + 1024 ** 3
+
+
+def _activate_sim_tmpfs():
+    if os.environ.get("CBRSIM_TMPFS_PREPARED") == "1":
+        return None
+    identity = _sim_cache_identity()
+    token = sim_artifact_cache.identity_sha256(identity)
+    force_reencode = os.environ.get(
+        "CBRSIM_FORCE_REENCODE", "0").strip().lower() in {
+            "1", "true", "yes", "on",
+        }
+    reuse_token = (
+        None if force_reencode or not EMIT_DEC else token
+    )
+    lease = tmpfs_workspace.activate_directory(
+        kind="sim",
+        key=_tmpfs_key(),
+        required_bytes=_sim_tmpfs_required_bytes(),
+        reuse_token=reuse_token,
+    )
+    if lease.reused:
+        try:
+            marker = json.loads(
+                (lease.entry / ".complete.json").read_text(encoding="utf-8"))
+            result = sim_artifact_cache.validate_completed_data(
+                lease.entry / "data", identity, marker=marker)
+            _rebind_cached_profile(lease.entry / "data")
+        except Exception as exc:
+            print(
+                f"sim artifact cache: rejected incomplete/corrupt entry: {exc}",
+                flush=True,
+            )
+            lease.release()
+            lease = tmpfs_workspace.activate_directory(
+                kind="sim",
+                key=_tmpfs_key(),
+                required_bytes=_sim_tmpfs_required_bytes(),
+            )
+        else:
+            print(
+                f"sim artifact cache: hit {result['frames']} frames "
+                f"identity={token[:12]}",
+                flush=True,
+            )
+    if OUT.resolve() != (lease.entry / "data").resolve():
+        lease.release()
+        raise RuntimeError(
+            f"managed sim path mismatch: {OUT} != {lease.entry / 'data'}")
+    print(f"tmpfs sim workspace: {OUT}", flush=True)
+    return lease
+
+
+def _rebind_cached_profile(data):
+    """Authenticate output-neutral profile renames without re-encoding."""
+
+    if CONFIG_PROFILE is None or not EMIT_DEC:
+        return
+    import pickle
+
+    decision_path = Path(data) / "decisions.pkl"
+    with decision_path.open("rb") as source:
+        log = pickle.load(source)
+    config = log.get("config")
+    if not isinstance(config, dict):
+        raise sim_artifact_cache.CacheValidationError(
+            "decision log has no frozen config")
+    config["profile"] = profile_identity(CONFIG_PROFILE)
+    source_config = config.get("source")
+    if isinstance(source_config, dict):
+        source_config["path"] = str(SRC)
+    temporary = decision_path.with_name(
+        f".{decision_path.name}.{os.getpid()}.tmp")
+    with temporary.open("wb") as output:
+        pickle.dump(log, output, protocol=4)
+    temporary.replace(decision_path)
+
+
+def _mark_sim_tmpfs_complete(lease):
+    if not EMIT_DEC:
+        return
+    identity = _sim_cache_identity()
+    result = sim_artifact_cache.validate_completed_data(
+        lease.entry / "data", identity)
+    token = sim_artifact_cache.identity_sha256(identity)
+    tmpfs_workspace.mark_directory_complete(
+        lease,
+        reuse_token=token,
+        details={
+            "schema_version": sim_artifact_cache.CACHE_SCHEMA_VERSION,
+            "identity_sha256": token,
+            "identity": identity,
+            "frames": result["frames"],
+        },
+    )
+    print(
+        f"sim artifact cache: completed {result['frames']} frames "
+        f"identity={token[:12]}",
+        flush=True,
+    )
+
+
+def _handoff_sim_tmpfs_lease(lease):
+    """Keep the sim entry leased until a pipeline parent has pinned it."""
+
+    handoff_value = os.environ.get("SEGACD_TMPFS_HANDOFF")
+    if not handoff_value or lease is None:
+        return
+    handoff = Path(handoff_value)
+    handoff.mkdir(parents=True, exist_ok=True)
+    ready = handoff / "ready.json"
+    temporary = handoff / f".ready.{os.getpid()}.tmp"
+    temporary.write_text(json.dumps({
+        "entry": str(lease.entry),
+        "path": str(OUT),
+    }, sort_keys=True) + "\n", encoding="utf-8")
+    os.replace(temporary, ready)
+    acknowledgement = handoff / "ack"
+    deadline = time.monotonic() + 60.0
+    while not acknowledgement.is_file():
+        if time.monotonic() >= deadline:
+            raise RuntimeError(
+                f"tmpfs pipeline lease handoff timed out: {handoff}")
+        time.sleep(0.05)
+
+
+if __name__ == "__main__":
+    try:
+        _stem_lease = resource_tokens.acquire_stem(CONFIG_PROFILE.sim_stem)
+    except resource_tokens.ResourceBusyError as exc:
+        print(str(exc), file=sys.stderr)
+        raise SystemExit(75) from exc
+    try:
+        _standalone_lease = _activate_sim_tmpfs()
+        _standalone_completed = False
+        try:
+            if _standalone_lease is None or not _standalone_lease.reused:
+                _demoted_fade_anchors = set()
+                while True:
+                    try:
+                        with ArrayStorage() as _arrays:
+                            main(demoted_fade_anchors=frozenset(
+                                _demoted_fade_anchors), arrays=_arrays)
+                        break
+                    except FadeDeadlineInfeasible as exc:
+                        if exc.anchor in _demoted_fade_anchors:
+                            raise
+                        _demoted_fade_anchors.add(exc.anchor)
+                        import gc as _retry_gc
+                        _retry_gc.enable()
+                        print(
+                            f"fade preparation infeasible at f{exc.anchor}; "
+                            "re-planning without that fade",
+                            flush=True,
+                        )
+                _standalone_completed = True
+            else:
+                print(
+                    "sim artifact cache: complete matching encode reused; "
+                    "simulation skipped",
+                    flush=True,
+                )
+        finally:
+            if _standalone_lease is not None:
+                if _standalone_completed:
+                    _mark_sim_tmpfs_complete(_standalone_lease)
+                _handoff_sim_tmpfs_lease(_standalone_lease)
+                _standalone_lease.release()
+    finally:
+        _stem_lease.release()

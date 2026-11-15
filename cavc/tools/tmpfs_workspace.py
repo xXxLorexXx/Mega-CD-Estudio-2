@@ -1,0 +1,640 @@
+#!/usr/bin/env python3
+"""Manage disposable codec artifacts on a user-selected filesystem.
+
+Callers read and write the managed paths directly. Eviction is
+limited to this project's entries and never removes a live lease owned by
+another encoder/render process.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+import argparse
+from contextlib import contextmanager
+import ctypes
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import platform
+import re
+import shutil
+import subprocess
+import time
+import uuid
+
+from runtime_paths import DEFAULT_WORKSPACE, workspace_root
+
+
+DEFAULT_ROOT = DEFAULT_WORKSPACE
+DEFAULT_MIN_FREE_BYTES = 4 * 1024 ** 3
+
+# Linux assigns the same quotactl_fd syscall number on the architectures used
+# by this project. Keep the table explicit so an unknown architecture falls
+# back to filesystem-wide free-space checks instead of calling the wrong ABI.
+_QUOTACTL_FD_SYSCALLS = {
+    "aarch64": 443,
+    "riscv64": 443,
+    "x86_64": 443,
+}
+_Q_GETQUOTA = 0x800007
+_SUBCMD_SHIFT = 8
+_USRQUOTA = 0
+_QIF_BLIMITS = 1 << 0
+_QIF_SPACE = 1 << 1
+_QIF_DQBLKSIZE = 1024
+
+
+class TmpfsWorkspaceError(RuntimeError):
+    pass
+
+
+def managed_root() -> Path:
+    return workspace_root()
+
+
+def _decode_mount_path(value: str) -> str:
+    return (value.replace("\\040", " ").replace("\\011", "\t")
+            .replace("\\012", "\n").replace("\\134", "\\"))
+
+
+def filesystem_type(path: Path) -> str | None:
+    """Return the closest Linux mount's filesystem type."""
+
+    path = path.resolve()
+    mountinfo = Path("/proc/self/mountinfo")
+    if not mountinfo.is_file():
+        return None
+    best: tuple[int, str] | None = None
+    for line in mountinfo.read_text(encoding="utf-8").splitlines():
+        left, separator, right = line.partition(" - ")
+        if not separator:
+            continue
+        fields = left.split()
+        post = right.split()
+        if len(fields) < 5 or not post:
+            continue
+        mount = Path(_decode_mount_path(fields[4]))
+        try:
+            path.relative_to(mount)
+        except ValueError:
+            continue
+        candidate = (len(str(mount)), post[0])
+        if best is None or candidate[0] > best[0]:
+            best = candidate
+    return best[1] if best else None
+
+
+def ensure_root(root: Path | None = None) -> Path:
+    root = (root or managed_root()).resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    for name in ("artifacts", "leases"):
+        (root / name).mkdir(exist_ok=True)
+    return root
+
+
+@contextmanager
+def _workspace_lock(root: Path):
+    """Serialize eviction, allocation, lease publication, and alias changes."""
+
+    descriptor = os.open(
+        root / ".workspace.lock", os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(descriptor)
+
+
+def _slug(value: str, limit: int = 72) -> str:
+    clean = re.sub(r"[^A-Za-z0-9._-]+", "-", value).strip("-._")
+    return (clean or "artifact")[:limit]
+
+
+def _entry_key(kind: str, key: str) -> str:
+    digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:12]
+    # Sim keys intentionally spell out geometry, fps, fit and caps. Preserve
+    # enough of that human-readable identity to make workspace inspection useful.
+    return f"{_slug(kind, 20)}-{_slug(key, 180)}-{digest}"
+
+
+def _pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _lease_records(root: Path) -> list[tuple[Path, dict]]:
+    records = []
+    for marker in (root / "leases").glob("*.json"):
+        try:
+            record = json.loads(marker.read_text(encoding="utf-8"))
+            pid = int(record.get("pid", 0))
+            entry = Path(record["entry"]).resolve()
+        except (OSError, ValueError, KeyError, json.JSONDecodeError):
+            marker.unlink(missing_ok=True)
+            continue
+        if not _pid_alive(pid):
+            marker.unlink(missing_ok=True)
+            continue
+        record["entry"] = str(entry)
+        records.append((marker, record))
+    return records
+
+
+def _active_entries(root: Path) -> set[Path]:
+    return {Path(record["entry"]) for _marker, record in _lease_records(root)}
+
+
+def _allocated_bytes(entry: Path) -> int:
+    total = 0
+    try:
+        paths = [entry, *entry.rglob("*")]
+    except FileNotFoundError:
+        return 0
+    for path in paths:
+        try:
+            if not path.is_symlink():
+                stat = path.stat()
+                total += (stat.st_blocks * 512 if hasattr(stat, "st_blocks")
+                          else stat.st_size)
+        except FileNotFoundError:
+            continue
+    return total
+
+
+def _active_reservation_bytes(root: Path) -> int:
+    required_by_entry: dict[Path, int] = {}
+    for _marker, record in _lease_records(root):
+        entry = Path(record["entry"])
+        required = max(0, int(record.get("required_bytes", 0)))
+        required_by_entry[entry] = max(
+            required_by_entry.get(entry, 0), required)
+    return sum(
+        max(0, required - _allocated_bytes(entry))
+        for entry, required in required_by_entry.items()
+    )
+
+
+def _remove_entry(entry: Path) -> None:
+    if entry.is_dir():
+        shutil.rmtree(entry)
+    else:
+        entry.unlink(missing_ok=True)
+
+
+def _minimum_free_bytes() -> int:
+    raw = os.environ.get("CAVC_WORKSPACE_MIN_FREE_GB", os.environ.get(
+        "SEGACD_TMPFS_MIN_FREE_GB"))
+    if raw is None:
+        return DEFAULT_MIN_FREE_BYTES
+    return max(0, int(float(raw) * 1024 ** 3))
+
+
+class _QuotaBlock(ctypes.Structure):
+    _fields_ = [
+        ("dqb_bhardlimit", ctypes.c_uint64),
+        ("dqb_bsoftlimit", ctypes.c_uint64),
+        ("dqb_curspace", ctypes.c_uint64),
+        ("dqb_ihardlimit", ctypes.c_uint64),
+        ("dqb_isoftlimit", ctypes.c_uint64),
+        ("dqb_curinodes", ctypes.c_uint64),
+        ("dqb_btime", ctypes.c_uint64),
+        ("dqb_itime", ctypes.c_uint64),
+        ("dqb_valid", ctypes.c_uint32),
+    ]
+
+
+def _user_quota_available_bytes(root: Path) -> int | None:
+    """Return this user's remaining hard-quota bytes, when Linux exposes it."""
+
+    if platform.system() != "Linux":
+        return None
+    syscall_number = _QUOTACTL_FD_SYSCALLS.get(platform.machine())
+    if syscall_number is None:
+        return None
+    descriptor = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        quota = _QuotaBlock()
+        command = (_Q_GETQUOTA << _SUBCMD_SHIFT) | _USRQUOTA
+        libc = ctypes.CDLL(None, use_errno=True)
+        result = libc.syscall(
+            syscall_number,
+            descriptor,
+            command,
+            os.getuid(),
+            ctypes.byref(quota),
+        )
+    finally:
+        os.close(descriptor)
+    if result != 0:
+        return None
+    valid = quota.dqb_valid
+    if not (valid & _QIF_BLIMITS and valid & _QIF_SPACE):
+        return None
+    limit_blocks = quota.dqb_bhardlimit or quota.dqb_bsoftlimit
+    if limit_blocks == 0:
+        return None
+    limit_bytes = limit_blocks * _QIF_DQBLKSIZE
+    return max(0, limit_bytes - quota.dqb_curspace)
+
+
+def _available_bytes(root: Path) -> int:
+    """Return usable bytes, honoring both filesystem space and user quota."""
+
+    filesystem_free = shutil.disk_usage(root).free
+    quota_free = _user_quota_available_bytes(root)
+    if quota_free is None:
+        return filesystem_free
+    return min(filesystem_free, quota_free)
+
+
+def _evict_old_entries_locked(
+    required_bytes: int = 0,
+    *,
+    root: Path,
+    exclude: tuple[Path, ...] = (),
+) -> list[Path]:
+    """Locked implementation of inactive-entry eviction."""
+
+    required = max(0, int(required_bytes))
+    target_free = (
+        required + _active_reservation_bytes(root) + _minimum_free_bytes())
+    usage = shutil.disk_usage(root)
+    quota_free = _user_quota_available_bytes(root)
+    available = (
+        usage.free if quota_free is None else min(usage.free, quota_free)
+    )
+    if target_free > usage.total:
+        raise TmpfsWorkspaceError(
+            f"workspace request exceeds capacity: need {target_free / 1024**3:.1f} GiB, "
+            f"total {usage.total / 1024**3:.1f} GiB")
+    if available >= target_free:
+        return []
+
+    active = _active_entries(root)
+    excluded = {path.resolve() for path in exclude}
+    candidates = []
+    for entry in (root / "artifacts").iterdir():
+        resolved = entry.resolve()
+        if resolved in active or resolved in excluded:
+            continue
+        try:
+            stamp = entry.stat().st_mtime_ns
+        except FileNotFoundError:
+            continue
+        candidates.append((stamp, entry))
+    candidates.sort(key=lambda item: (item[0], item[1].name))
+
+    removed = []
+    for _stamp, entry in candidates:
+        _remove_entry(entry)
+        removed.append(entry)
+        print(f"workspace eviction: removed {entry}", flush=True)
+        if _available_bytes(root) >= target_free:
+            break
+    if _available_bytes(root) < target_free:
+        raise TmpfsWorkspaceError(
+            "workspace filesystem/quota space is still short after deleting every "
+            "inactive project artifact; leased artifacts were preserved")
+    return removed
+
+
+def evict_old_entries(
+    required_bytes: int = 0,
+    *,
+    root: Path | None = None,
+    exclude: tuple[Path, ...] = (),
+) -> list[Path]:
+    """Delete oldest inactive entries while preserving concurrent reservations."""
+
+    root = ensure_root(root)
+    with _workspace_lock(root):
+        return _evict_old_entries_locked(
+            required_bytes, root=root, exclude=exclude)
+
+
+@dataclass
+class Lease:
+    entry: Path
+    marker: Path
+    reused: bool = False
+
+    def release(self) -> None:
+        root = self.marker.parent.parent
+        root.mkdir(parents=True, exist_ok=True)
+        with _workspace_lock(root):
+            self.marker.unlink(missing_ok=True)
+            try:
+                os.utime(self.entry, None)
+            except FileNotFoundError:
+                pass
+
+
+def _acquire_lease_locked(
+    entry: Path,
+    *,
+    root: Path,
+    required_bytes: int = 0,
+) -> Lease:
+    entry = entry.resolve()
+    token = f"{os.getpid()}-{time.time_ns()}-{uuid.uuid4().hex[:8]}"
+    marker = root / "leases" / f"{token}.json"
+    temporary = marker.with_suffix(".tmp")
+    temporary.write_text(json.dumps({
+        "pid": os.getpid(),
+        "entry": str(entry),
+        "created_ns": time.time_ns(),
+        "required_bytes": max(0, int(required_bytes)),
+    }, sort_keys=True) + "\n", encoding="utf-8")
+    os.replace(temporary, marker)
+    return Lease(entry=entry, marker=marker)
+
+
+def acquire_lease(
+    entry: Path,
+    *,
+    root: Path | None = None,
+    required_bytes: int = 0,
+) -> Lease:
+    root = ensure_root(root)
+    with _workspace_lock(root):
+        return _acquire_lease_locked(
+            entry, root=root, required_bytes=required_bytes)
+
+
+def managed_directory_path(
+    *,
+    kind: str,
+    key: str,
+    root: Path | None = None,
+) -> Path:
+    """Return the deterministic direct path for one managed directory."""
+
+    root = ensure_root(root)
+    return root / "artifacts" / _entry_key(kind, key) / "data"
+
+
+def activate_directory(
+    *,
+    kind: str,
+    key: str,
+    required_bytes: int = 0,
+    root: Path | None = None,
+    reuse_token: str | None = None,
+) -> Lease:
+    """Expose a managed directory, reusing only an authenticated completion."""
+
+    root = ensure_root(root)
+    with _workspace_lock(root):
+        entry = root / "artifacts" / _entry_key(kind, key)
+        active = _active_entries(root)
+        if entry.resolve() in active:
+            raise TmpfsWorkspaceError(
+                f"artifact directory is already active: {entry}")
+        complete_path = entry / ".complete.json"
+        if entry.is_dir() and reuse_token is not None and complete_path.is_file():
+            try:
+                complete = json.loads(complete_path.read_text(encoding="utf-8"))
+                metadata = json.loads(
+                    (entry / ".managed.json").read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                complete = {}
+                metadata = {}
+            if (complete.get("reuse_token") == reuse_token
+                    and metadata.get("kind") == kind
+                    and metadata.get("key") == key
+                    and (entry / "data").is_dir()):
+                lease = _acquire_lease_locked(
+                    entry, root=root, required_bytes=required_bytes)
+                lease.reused = True
+                return lease
+        if entry.exists():
+            _remove_entry(entry)
+        _evict_old_entries_locked(required_bytes, root=root)
+        entry.mkdir(parents=True)
+        data = entry / "data"
+        data.mkdir()
+        (entry / ".managed.json").write_text(json.dumps({
+            "kind": kind, "key": key,
+        }, sort_keys=True) + "\n", encoding="utf-8")
+        return _acquire_lease_locked(
+            entry, root=root, required_bytes=required_bytes)
+
+
+def mark_directory_complete(
+    lease: Lease,
+    *,
+    reuse_token: str,
+    details: dict | None = None,
+) -> None:
+    """Atomically mark a leased managed directory safe for later reuse."""
+
+    root = lease.marker.parent.parent
+    with _workspace_lock(root):
+        if not lease.marker.is_file():
+            raise TmpfsWorkspaceError("cannot complete an unleased artifact")
+        payload = {
+            "reuse_token": reuse_token,
+            "completed_ns": time.time_ns(),
+        }
+        if details:
+            payload.update(details)
+        target = lease.entry / ".complete.json"
+        temporary = lease.entry / f".complete.{os.getpid()}.tmp"
+        temporary.write_text(
+            json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
+        temporary.replace(target)
+
+
+def allocate_file(
+    requested_path: Path,
+    *,
+    kind: str,
+    key: str | None = None,
+    required_bytes: int = 0,
+    root: Path | None = None,
+) -> tuple[Path, Lease]:
+    """Allocate and return a direct workspace target for one disposable file."""
+
+    root = ensure_root(root)
+    requested_path = Path(requested_path)
+    identity = key or str(requested_path.absolute())
+    with _workspace_lock(root):
+        entry = root / "artifacts" / _entry_key(kind, identity)
+        active = _active_entries(root)
+        if entry.resolve() in active:
+            raise TmpfsWorkspaceError(f"artifact file is already active: {entry}")
+        if entry.exists():
+            _remove_entry(entry)
+        _evict_old_entries_locked(required_bytes, root=root)
+        entry.mkdir(parents=True)
+        actual = entry / requested_path.name
+        (entry / ".managed.json").write_text(json.dumps({
+            "kind": kind, "key": identity,
+        }, sort_keys=True) + "\n", encoding="utf-8")
+        return actual, _acquire_lease_locked(
+            entry, root=root, required_bytes=required_bytes)
+
+
+def lease_managed_path(
+    path: Path,
+    *,
+    required_bytes: int = 0,
+    root: Path | None = None,
+) -> Lease | None:
+    """Lease an existing direct managed path and reserve derived space."""
+
+    root = ensure_root(root)
+    with _workspace_lock(root):
+        try:
+            target = Path(path).resolve(strict=True)
+        except FileNotFoundError:
+            return None
+        artifacts = (root / "artifacts").resolve()
+        try:
+            relative = target.relative_to(artifacts)
+        except ValueError:
+            return None
+        if not relative.parts:
+            return None
+        entry = artifacts / relative.parts[0]
+        if not (entry / ".managed.json").is_file():
+            return None
+        _evict_old_entries_locked(
+            required_bytes, root=root, exclude=(entry,))
+        return _acquire_lease_locked(
+            entry, root=root, required_bytes=required_bytes)
+
+
+def run_file_command(
+    requested_path: Path,
+    *,
+    kind: str,
+    required_bytes: int,
+    command: list[str],
+    input_paths: list[Path] | tuple[Path, ...] = (),
+) -> Path:
+    """Run a producer against a leased direct workspace target and return it."""
+
+    if not command:
+        raise TmpfsWorkspaceError("workspace file producer command is empty")
+    if all("{output}" not in part for part in command):
+        raise TmpfsWorkspaceError(
+            "workspace file producer command must contain {output}")
+    input_leases = []
+    output_lease = None
+    try:
+        for input_path in input_paths:
+            input_lease = lease_managed_path(input_path)
+            if input_lease is not None:
+                input_leases.append(input_lease)
+        actual, output_lease = allocate_file(
+            requested_path, kind=kind, required_bytes=required_bytes)
+        expanded = [part.replace("{output}", str(actual)) for part in command]
+        subprocess.run(expanded, check=True)
+        if not actual.is_file():
+            raise TmpfsWorkspaceError(
+                f"workspace artifact was not produced: {actual}")
+        return actual
+    finally:
+        if output_lease is not None:
+            output_lease.release()
+        for input_lease in reversed(input_leases):
+            input_lease.release()
+
+
+def run_directory_command(
+    *,
+    kind: str,
+    key: str,
+    required_bytes: int,
+    command: list[str],
+    input_paths: list[Path] | tuple[Path, ...] = (),
+) -> Path:
+    """Run a producer with one leased disposable workspace directory."""
+
+    if not command:
+        raise TmpfsWorkspaceError("workspace directory producer command is empty")
+    if all("{output}" not in part for part in command):
+        raise TmpfsWorkspaceError(
+            "workspace directory producer command must contain {output}")
+    input_leases = []
+    output_lease = None
+    try:
+        for input_path in input_paths:
+            input_lease = lease_managed_path(input_path)
+            if input_lease is not None:
+                input_leases.append(input_lease)
+        output_lease = activate_directory(
+            kind=kind,
+            key=key,
+            required_bytes=required_bytes,
+        )
+        actual = output_lease.entry / "data"
+        expanded = [part.replace("{output}", str(actual)) for part in command]
+        subprocess.run(expanded, check=True)
+        return actual
+    finally:
+        if output_lease is not None:
+            output_lease.release()
+        for input_lease in reversed(input_leases):
+            input_lease.release()
+
+
+def _parse_cli() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    subparsers = parser.add_subparsers(dest="action", required=True)
+    run_file = subparsers.add_parser(
+        "run-file", help="run a producer against one direct workspace file")
+    run_file.add_argument("--output", required=True, type=Path)
+    run_file.add_argument("--kind", required=True)
+    run_file.add_argument("--required-gb", type=float, default=1.0)
+    run_file.add_argument("--input", action="append", type=Path, default=[])
+    run_file.add_argument("command", nargs=argparse.REMAINDER)
+    run_directory = subparsers.add_parser(
+        "run-directory",
+        help="run a producer inside one leased disposable workspace directory",
+    )
+    run_directory.add_argument("--kind", required=True)
+    run_directory.add_argument("--key", required=True)
+    run_directory.add_argument("--required-gb", type=float, default=1.0)
+    run_directory.add_argument(
+        "--input", action="append", type=Path, default=[])
+    run_directory.add_argument("command", nargs=argparse.REMAINDER)
+    return parser.parse_args()
+
+
+def _main() -> None:
+    args = _parse_cli()
+    if args.action == "run-file":
+        command = args.command[1:] if args.command[:1] == ["--"] else args.command
+        actual = run_file_command(
+            args.output,
+            kind=args.kind,
+            required_bytes=max(0, int(args.required_gb * 1024 ** 3)),
+            command=command,
+            input_paths=args.input,
+        )
+        print(actual, flush=True)
+    elif args.action == "run-directory":
+        command = args.command[1:] if args.command[:1] == ["--"] else args.command
+        actual = run_directory_command(
+            kind=args.kind,
+            key=args.key,
+            required_bytes=max(0, int(args.required_gb * 1024 ** 3)),
+            command=command,
+            input_paths=args.input,
+        )
+        print(actual, flush=True)
+
+
+if __name__ == "__main__":
+    _main()

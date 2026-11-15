@@ -1,0 +1,104 @@
+#!/usr/bin/env python3
+"""Regression tests for safe sim multiprocessing selection."""
+from __future__ import annotations
+
+import os
+import unittest
+import numpy as np
+
+# Import sim with a valid fps-derived cold cap. The module resolves playback
+# geometry at import time even though these tests exercise only helper functions.
+_sim_env = {
+    "CBRSIM_FPS": "30",
+    "CBRSIM_W": "256",
+    "CBRSIM_H": "224",
+    "CBRSIM_ACTIVE_TILES": "896",
+}
+_old_env = {name: os.environ.get(name) for name in _sim_env}
+os.environ.update(_sim_env)
+import sim
+for _name, _value in _old_env.items():
+    if _value is None:
+        os.environ.pop(_name, None)
+    else:
+        os.environ[_name] = _value
+
+
+class SimMultiprocessingTests(unittest.TestCase):
+    def test_gpu_loader_pool_never_forks_cuda_parent(self) -> None:
+        self.assertEqual(sim.quant_pool_start_method(True), "spawn")
+
+    def test_pattern_cache_owns_compact_rgb(self) -> None:
+        rgb_frame = np.zeros((4, 8, 8, 3), np.uint8)
+        rgb = sim.own_pattern_cache_rgb(rgb_frame[2])
+        self.assertEqual(rgb.shape, (8, 8, 3))
+        self.assertTrue(rgb.flags.c_contiguous)
+        self.assertFalse(np.shares_memory(rgb, rgb_frame))
+
+    def test_rendered_colour_keys_round_trip_all_rgb333_colours(self) -> None:
+        keys = sim.rendered_color_keys(sim._MD_RGB888.astype(np.uint8))
+        np.testing.assert_array_equal(keys, np.arange(512, dtype=np.uint16))
+
+    def test_distance_aging_excludes_near_and_exact_cells(self) -> None:
+        diff = np.full(4, 8 * 8 * 3 * 24)
+        pressure = sim.update_age_pressure(
+            np.full(4, 4.0), np.array([0, 1, 2, 9]), diff)
+        np.testing.assert_array_equal(
+            pressure, np.array([5.0, 5.0, 0.0, 0.0]))
+
+    def test_postplan_runs_do_not_overwrite_raw_prefetch(self) -> None:
+        stats = np.zeros((3, len(sim.STAT_COLUMNS)), np.float64)
+        stats[:, sim.STAT_COLUMN_INDEX["prefetch"]] = [0, 4, 7]
+        sim.apply_postplan_transfer_stats(
+            stats,
+            dma_runs=[9, 8, 6],
+            prefetch_cold=[0, 4, 7],
+        )
+        np.testing.assert_array_equal(
+            stats[:, sim.STAT_COLUMN_INDEX["dma_runs"]],
+            [9, 8, 6],
+        )
+        np.testing.assert_array_equal(
+            stats[:, sim.STAT_COLUMN_INDEX["prefetch"]],
+            [0, 4, 7],
+        )
+
+    def test_postplan_rejects_a_changed_raw_prefetch_trace(self) -> None:
+        stats = np.zeros((2, len(sim.STAT_COLUMNS)), np.float64)
+        stats[:, sim.STAT_COLUMN_INDEX["prefetch"]] = [0, 3]
+        with self.assertRaisesRegex(
+                AssertionError, "raw-prefetch trace"):
+            sim.apply_postplan_transfer_stats(
+                stats,
+                dma_runs=[1, 2],
+                prefetch_cold=[0, 0],
+            )
+
+    def test_resident_distance_luts_match_direct_f3_math(self) -> None:
+        rng = np.random.default_rng(7)
+        candidates = sim.MD_LEVELS[
+            rng.integers(0, 8, (24, 8, 8, 3))]
+        target = sim.MD_LEVELS[rng.integers(0, 8, (8, 8, 3))]
+
+        direct_y = np.abs(candidates @ sim._LWv - target @ sim._LWv)
+        direct_ym = direct_y.reshape(24, -1).mean(1)
+        direct_yp = direct_y.reshape(24, -1).max(1)
+        direct_cm = np.sqrt(
+            (candidates @ sim._CBv - target @ sim._CBv) ** 2
+            + (candidates @ sim._CRv - target @ sim._CRv) ** 2
+        ).reshape(24, -1).mean(1)
+
+        candidate_keys = sim.rendered_color_keys(candidates).reshape(24, 64)
+        target_keys = sim.rendered_color_keys(target).reshape(64)
+        table_y = sim._F3_DY_LUT[candidate_keys, target_keys]
+        table_ym = table_y.mean(1)
+        table_yp = table_y.max(1)
+        table_cm = sim._F3_DC_LUT[candidate_keys, target_keys].mean(1)
+
+        np.testing.assert_array_equal(table_ym, direct_ym)
+        np.testing.assert_array_equal(table_yp, direct_yp)
+        np.testing.assert_array_equal(table_cm, direct_cm)
+
+
+if __name__ == "__main__":
+    unittest.main()

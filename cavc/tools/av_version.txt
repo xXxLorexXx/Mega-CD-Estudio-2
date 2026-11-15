@@ -1,0 +1,1391 @@
+# Encoder/Player build version for YouTube titles: format YYYYMMDD.eN.pM
+#
+# - e = encoder version. Bump when shared sim.py / pack_stream.py behavior or
+#   defaults change in a way that alters output. Do not bump for source-specific
+#   profile settings; their settings identity tracks those changes.
+# - p = player version. Bump when the shared on-disc player
+#   (boot/movieplay_*.s) changes in a way that alters output.
+# - Bump one or both as appropriate; never decrease either.
+# - When bumping, if today's date differs from `date` below, set `date` to today.
+# - This is the YouTube-title build version only. HEADER.DAT has no independent
+#   format-version field.
+#
+# The title version string = <date>.e<e>.p<p>, e.g. 20260710.e2.p2
+#
+# History:
+#   e194: Allow zero-capacity WordBuf banks in final transfer-run accounting
+#         and packing when all runs use PrgBuf or DicBuf. Reject any WordBuf
+#         source or nonzero cursor when that bank is disabled.
+#   e193/p157: Support 1..83,520 frames in the full 320x224 aperture. Keep
+#         one-byte routes and fixed header/control/PALIDX sizes; store frame
+#         bit 16 in the header high byte and PALIDX segment bit 15. Use full
+#         Main/Sub counters, retain the four-digit HUD, and disable every
+#         WordBuf preload/refill/quality credit above 65,535 frames.
+#   e192/p156: Support 1..65,535 frames with unchanged u16 header/control
+#         fields. Long routes load into Word RAM and mirror through 2 KiB
+#         boot scratch. Zero-extend route indices beyond signed-word range;
+#         retain actual-length WordBuf allocation and the four-digit HUD.
+#         Long specialized streams alternate adjacent PCM deltas against
+#         the physical NTSC clock to bound cumulative audio-buffer drift.
+#   e191/p155: Keep up to 64 segment palettes and 63 switches resident in Main
+#         RAM. PALTAB occupies 0xFF9940..0xFFB93F and PALIDX occupies
+#         0xFFB940..0xFFBA3F; the 512-pattern DicBuf retains its fixed range.
+#         The encoder merges detected ranges only above 64 segments, and
+#         the player embeds/copies the complete 256-byte switch table.
+#   e188: Require bright-tile evidence to be absent before classifying a
+#         frame as fade black. A faint title card on a black background
+#         passes the whole-frame conditions (98% dark pixels, mean at most
+#         16) because its text covers almost no pixels, so the detector
+#         swallowed the card into a black run and the hidden fade
+#         preparation displayed it as pure black. A black frame now also
+#         needs every tile sample at luminance 48 or below; measured title
+#         text sits at 69-92 while true black and fade-tail glow stay at
+#         0-31. Such a card becomes content beside the black runs and its
+#         own brightness ramps form an ordinary complete fade shot.
+#   e187: Prove fade feasibility in the decision replay and re-plan without
+#         an infeasible shot instead of aborting. A fade-out whose reference
+#         sits at the end of a detailed moving shot cannot park its reference
+#         in VRAM (visible updates keep reclaiming the advance pins), and no
+#         static planning estimate separates that from a survivable window,
+#         so a failed preparation deadline now demotes its shot to ordinary
+#         frames and the encode restarts without it. Palette segment tables
+#         keep the demoted shot's boundaries with an unscaled entry palette;
+#         every fade whose preparation completes is byte-identical to e186.
+#   p152: Make the player H40-only. The resident code drops the runtime
+#         display-mode branch, its md_mode state, and the per-mode VBlank word
+#         budget, and it sizes the DEBUG HUD spill sprite table for the three
+#         records a 40-cell row leaves rather than the eleven a 32-cell row
+#         did. HEADER.DAT offset 36 stays the display-mode field and must
+#         name H40; a stream naming anything else is refused at pack and at
+#         player-constant generation.
+#   e186: Graded per-tile cost in the scroll adoption model (issue #29). A
+#         motion-compensated residual just above the change threshold is a
+#         subpixel approximation the codec carries as Near-band reuse, not a
+#         mandatory reload, so adoption prices each tile with a linear ramp
+#         from RMSE 8 (free) to 16 (full reload) on both the fixed-grid and
+#         scroll paths. Fractional-speed pans (for example 3.4 px/frame on
+#         integer HScroll) are no longer rejected by half their frames'
+#         subpixel blur being priced as hard changes.
+#   e185/p151: Allow horizontal rolling-plane scroll on every full-width H40
+#         grid (issue #29). HScroll shifts every scanline, so a letterboxed
+#         40xN grid keeps its uniform border rows invisible while the player
+#         DMAs the same PC_ROW0-offset TROWS-row 64-column band; the encoder,
+#         header validation, and player build gate now require only the
+#         40-column width. Vertical windows still require the full-screen
+#         28-row grid (they roll all 32 plane rows); the packer rejects a
+#         vertical control on a letterboxed grid.
+#   p150: Fix the DEBUG-build Window horizontal strip (reg17 0x9180 -> 0x9100).
+#         The right-side strip from x=0 made the Window plane cover every
+#         line below the HUD row, and Window row 24 col 0..1 aliases the
+#         HScroll table at 0xFC00, so nonzero horizontal scroll values
+#         rendered as two garbage name-table entries fixed at screen
+#         (24,0)-(24,1) during scroll windows. Release builds were
+#         unaffected.
+#   e184/p149: VRAM layout compaction (+80 resident tiles). The HUD font
+#         moves to 0xDA00 and the 640-byte sprite table to 0xDC00 (the
+#         highest 0x400-aligned base below the name table), so the resident
+#         pool grows from 1,663 to 1,743 contiguous tiles with only a
+#         384-byte tail gap left below the 0xE000 movie NT.
+#   p148: Fix the boot-VRAM sidecar loader's stale TTRC header offsets
+#         (issue #112). The CAVC rename moved the fixed fields two bytes
+#         earlier, but load_boot_vram_sidecar still tested the features low
+#         byte at 63 and read pool/base at 14/16, so the whole BVRM load
+#         silently skipped and every backside pattern displayed as an empty
+#         slot (startup black tiles) until churn replaced it.
+#   e183: Fix the pack raw-prefetch replay divergence (issue #113). The sim's
+#         organic prefetch-slot choice consults its full-frame quantized
+#         target keys, which the decision log does not carry; the pack now
+#         applies the recorded slot as the frozen decision (display-safety
+#         verified) instead of re-deriving the choice from the log's smaller
+#         key set. Forced non-relocated placement leaves the clock hand one
+#         past the chosen slot, exactly like the organic scan.
+#   e182: World-mosaic guard sampling (issue #29). Guard edges are quantized
+#         once from the first window frame that fully reveals the edge, so a
+#         guard key no longer depends on runtime plane state or the reveal
+#         phase. Repeating edges skip their already-committed cells and the
+#         WordBuf guard reserve funds only the crossing frames.
+#   e181/p147: Vertical scroll adoption and playback (issue #29). The encoder
+#         adopts axis-only vertical windows; the FRAME_SCROLL position item
+#         carries (HScroll, VScroll) with exactly one nonzero axis. Vertical
+#         windows roll through all 32 plane rows, so those frames stage the
+#         complete 64x32 band. The player writes the negated VScroll to the
+#         VSRAM pair in the flip blank and rebases vertical exits with a
+#         wrapped row copy.
+#   e180: Automatic horizontal-scroll adoption (issue #29). The encoder
+#         detects axis-only integer pans on the output raster, adopts strict
+#         tile-phase-safe windows, and encodes them as FRAME_SCROLL controls
+#         with an absolute HScroll position list item plus rolling 64x32
+#         Plane A cell updates (world-aligned quantization, incoming-guard
+#         reserve). Non-adopted frames are unchanged.
+#   p146: Boot-time silence initialization for real hardware (issue #81).
+#         Main parks the Z80 on di+halt, mutes all four PSG channels, pulses
+#         the Z80/YM2612 reset and forces the YM2612 registers silent before
+#         streaming starts; Sub clears the complete 64 KiB RF5C164 wave RAM
+#         (rewriting the 0x8000 ring loop-end marker) and parks ch1..ch7
+#         registers at known-silent values.
+#   e179/p145: Rename the on-disc identifier from TTRC to CAVC and remove the
+#         independent header version word. Shift the fixed fields two bytes
+#         earlier while preserving the signature and PSUP offsets at 192/196.
+#         The runtime player treats magic as data and validates the specialized
+#         signature or generic field bounds instead of branching on magic.
+#   e178: Sector-align the WordBuf-ring schedule's Prg prebuffer. The 24 fps
+#         389 KiB ceiling produced a 12,448-pattern (194.5-sector) prebuffer;
+#         the player prefills exactly that many bytes and continues BODY
+#         payload from the same offset, leaving ring_tail half-sector
+#         misaligned so every ring lap lost 1,024 bytes past RING_END and the
+#         pop stream gained a permanent +32-pattern lead (scrambled cold
+#         tiles). The prebuffer now floors to whole sectors; pack and the
+#         header reader reject fractional-sector prebuffers.
+#   e177: Add the dither-free output mode `none` (issue #111): every pixel
+#         rounds to its nearest RGB333 level with no Bayer pattern. Selected
+#         per profile via video.output_dither.
+#   e176: Allow a per-VBlank-interval cold cap spec ("2:170,3:250") so a
+#         multi-interval display cadence gives each frame the decode ceiling
+#         of its own slot. The 24 fps 2/3 cadence schedules 2-VBlank frames
+#         at the lower cap while 3-VBlank frames keep the higher one; layout
+#         and reservation envelopes use the largest cap.
+#   e175: Add opt-in whole-movie automatic black/white dynamic-range expansion
+#         (source.preprocess.auto_range). One combined RGB histogram over the
+#         extracted master detects a dominant near-endpoint level spike and
+#         one shared linear LUT stretches master and raw so the effective
+#         black/white reach exactly 0/255, removing large-area dither between
+#         the lowest/highest MD levels.
+#   e174: Record the displayed fallback pattern, not the ideal target, as the
+#         committed content of a Flbk cell. Static cells that settled for an
+#         approximation stay "changed" every frame, so spare cold budget on
+#         later frames replaces them with the exact pattern instead of leaving
+#         them crushed until the end of the shot.
+#   e173: Make output dithering a per-profile choice. Standard Bayer remains
+#         the default; edge-attenuated-bayer is selected only by the Bad Apple
+#         profile and spreads strong-edge attenuation one pixel into the
+#         resampled fringe to suppress moving boundary dots.
+#   e172: Fade the position-fixed Bayer output dither continuously toward
+#         nearest-colour rounding around strong 3x3 luma edges. Gentle
+#         gradients retain the complete ordered pattern, while resize-created
+#         antialias pixels no longer become alternating boundary dots.
+#   p144: Move the DEBUG HUD sprite table from Window-map row 16 at 0xF800
+#         into the free 0xD400 VRAM range. This removes the three duplicated
+#         H40 spill glyphs from the movie while preserving the intended sprite
+#         row and the complete 1,663-tile resident pattern pool.
+#   e171: Reserve the preceding display's live pattern slots while selecting
+#         the next frame. Reject optional cache reuse that would overflow the
+#         temporary old-plus-new VRAM union before the final name-table DMA.
+#   e170/p143: Publish one statically trimmed movie-name-table band by DMA in
+#         the cadence-final VBlank for every player mode and cadence. Route the
+#         DEBUG HUD through the Window row plus sprites, remove NT0/NT1 flips,
+#         and reclaim the former 0xC000 table as 128 resident pattern tiles.
+#   e169: Include every distinct one-sided fade reference key in the automatic
+#         mandatory prefetch plan. Do not assume that the bright anchor can
+#         receive a fixed baseline batch before earlier control blocks have
+#         fixed its exact physical Prg ceiling.
+#   e168: Store the forced-vs-safe-search replay flag in raw-prefetch schema 6
+#         while retaining the independent O_LOADS-v2 pattern-supply schema 5.
+#         Pack reconstructs the same protected deadline-key set before replay
+#         and verifies every resulting physical slot.
+#   e167: Record whether each fade-reference prefetch used a forced block slot
+#         or the allocator's normal safe search. Pack replay now repeats that
+#         exact operation and verifies the resulting physical slot.
+#   e166: Keep already-resident one-sided fade-reference keys in place instead
+#         of turning warm pins into redundant cold relocations. New keys prefer
+#         the shared contiguous block and spill only to another display-safe
+#         slot while every block target is live.
+#   e165: Assign one-sided fade-reference keys to whichever safe unassigned
+#         slot is available inside their shared contiguous VRAM block instead
+#         of freezing one destination per key, and choose the block using
+#         current plus preceding display occupancy.
+#   e164: Keep mandatory fade-reference prefetch out of both the current and
+#         preceding display's VRAM slots. Pattern transfers may span multiple
+#         VBlanks, so the preceding name table remains live until the whole
+#         transfer and flip complete.
+#   e163: Extend automatic static black-fade detection to fade-in-only and
+#         fade-out-only shots at source and cut boundaries. Require correlated
+#         tile-grid edge positions to reject moving brightness ramps, and
+#         reserve catch-up VRAM prefetch for an exact fade-out endpoint while
+#         preserving the paired path and typed inline-CRAM controls.
+#   e162/p142: Advance to TTRC v25. Detect static shots that fade in and out
+#         through black without timeline/profile hints, freeze each reference
+#         image, and carry exact 128-byte CRAM replacements in typed controls.
+#         The player keeps audio and cold-run prefetch active while applying
+#         each inline CRAM image atomically with the display flip.
+#   p141: Keep the periodic 24 fps display clock phase-locked after a missed
+#         target. Whole-VBlank debt is repaid only by shortening a later
+#         nominal three-VBlank step to two, preventing permanent reader lead
+#         without introducing one-VBlank display intervals.
+#   p140: Add an authoritative periodic 24 fps display cadence. Main alternates
+#         two- and three-VBlank flip deadlines from frame 1 while preserving
+#         the compile-time fixed-N hot paths and binary sizes at 15/30 fps.
+#   e161: Add the matching 24 fps physical CD schedule with phase-specific
+#         2002/800 and 3003/800 steps, use the 24000/1001 effective playback
+#         rate for audio, and introduce TTRC v24 cadence semantics.
+#   p139: On specialized fixed-N H40 playback, issue CMD_SWAP immediately after
+#         the final Word-RAM pattern repair and status snapshot, then finish the
+#         handshake at the next Main loop head. This returns the consumed bank
+#         while Main continues with NT DMA, CRAM, and flip. Frame 0 and the
+#         final STAT_END request keep their original post-flip ordering.
+#   p134-p138: Diagnostic Main-side ordering experiments. These builds were
+#         measured and discarded; p139 starts from the retained p133 path.
+#   p133: Move the H40 name-table V-counter sample before the cadence-final
+#         VBlank wait. Rename it from NT DMA start to NT readiness so the HUD
+#         can measure pressure toward the second VBlank head at 30 fps rather
+#         than reporting the post-wait DMA trigger inside that VBlank.
+#   p132: Move the pattern V-counter sample to the Main-ready point before
+#         bf_start_vbudget waits for a fresh blank head. Rename the diagnostic
+#         from DMA start to pattern readiness and advance the HUD gate schema
+#         so the value expresses pre-VBlank lead rather than post-wait entry.
+#   p131: Add raw V-counter samples for the first pattern run-loop entry and
+#         the fixed-N H40 name-table DMA trigger. Extend the DEBUG HUD to 43
+#         hexadecimal cells and carry its wrapped second row through the
+#         staged name-table DMA.
+#   e160: Split compact WordBuf source descriptors at each parity ring end
+#         before writing the stream. Account for the extra descriptor in
+#         control delivery, O_LOADS v2 peaks, and Main-to-VDP repair work so
+#         no linear DMA can cross from the generated WordBuf into its tail.
+#   e159: Size each parity's Word-RAM O_LOADS v2 region from its exact
+#         independently recomputed 22-byte-record peak, then sector-round the
+#         residual into WordBuf capacity. Move all ADPCM lookup tables to
+#         Sub PRG-RAM, reduce the physical PrgBuf to 420 KiB, and limit timed
+#         Word staging to the three checked pending destinations.
+#   p130: Have Sub expand every cold run into an interleaved VDP-ready O_LOADS
+#         v2 record and own both parity WordBuf read cursors. Main consumes the
+#         records in place, removing its run-staging pass and Main-RAM run
+#         table. Repack the 5 KiB resident Sub map around the qualified
+#         0x7400 tail and boot-only extension.
+#   e158: Enable one-frame timed Raw VRAM prefetch by default. Profiles may
+#         explicitly opt out with raw_prefetch=false; remove redundant true
+#         settings from the canonical Bad Apple, Lunar H32, and Machi OP
+#         profiles.
+#   p129: Make residual-boundary VBlank splitting and all-DMA pattern transfer
+#         unconditional. Remove both build switches and the split-off and
+#         one/two-pattern CPU-transfer player paths; retain the mandatory
+#         first-word CPU repair after every pattern DMA.
+#   p128: Add a build-time VBLANK_RUN_SPLIT switch. The diagnostic off mode
+#         keeps every run whole; an individually oversized run may enter
+#         active display instead of retaining a hidden safety split.
+#   p127: Compact the DEBUG HUD to 39 hexadecimal digits, pack VBlank spill
+#         with transfer ticks, pack reader lead with slot position, remove
+#         retired diagnostics, and expose descriptive OCR/gate field names.
+#   e157: Enable one-frame timed Raw VRAM prefetch for the Lunar SSS OP
+#         H32/24 profile at its 225 baseline cold cap.
+#   e156: Replace the analysis DMA-tile status meter with exact Main-to-VDP
+#         words: patterns, long-run first-word repairs, mode/grid/cadence-aware
+#         name-table and DEBUG HUD writes, and palette-switch CRAM. Preserve
+#         the tile count as a TSV compatibility field and add the R2V timeline.
+#   p126: Use a conservative 3,200 DMA-word-equivalent H40 VBlank budget.
+#         Charge every CPU-written VDP word four units, including short direct
+#         runs, DMA first-word repair, and CRAM. Split DMA runs at residual
+#         boundaries and withhold NT/HUD/CRAM/flip capacity from cadence budget
+#         N before pattern work. Keep HUD shares as separate logical words.
+#         Move the Main codegen/state boundary by 0x100 while preserving the
+#         17.5 KiB codegen capacity and its 128-byte worst-case guard.
+#   p125: Keep ordinary DMA runs whole. A run that does not fit the residual
+#         word budget spills intact to a fresh VBlank as an overload fallback;
+#         only a run longer than one complete budget uses chunk splitting.
+#         Preserve the v22 controls and exact VB1--VB4/T diagnostics.
+#   p124: Consume TTRC v22 controls without the removed encoder VBlank plan,
+#         restore the compact O_PALW/O_NLOAD/O_LOADS Word-RAM header, and keep
+#         p112's runtime residual-budget splitting as the sole transfer policy.
+#   e155: TTRC v22 removes the unused 18-byte fixed-width encoder VBlank plan
+#         from every control block. The stream now stores n_runs immediately
+#         followed by source-aware run descriptors; cadence splitting is live.
+#   p123: Restore p112's runtime residual-budget run splitting on the current
+#         TTRC v21 stream. Preserve the first VBlank tail, share the guarded
+#         fixed-N deadline with the final name-table/HUD/CRAM/flip work, derive
+#         the cadence limit from N=2/N=4, and expose exact runtime VB1--VB4
+#         pattern words plus transfer-window overrun warnings in the DEBUG HUD.
+#   p122: Preserve the hidden name-table base across each compact final DEBUG
+#         HUD address command. The VDP command helper clobbers d2, so keep the
+#         base in d3 and restore accurate M/U/O/Y/Z/T/I values after group 2.
+#   p121: Move the fixed-N H40 hidden name-table copy into active display time
+#         between encoder-authored pattern groups 1 and 2. Keep both pattern
+#         shares at fresh VBlank heads, patch only final HUD values in group 2,
+#         and leave CRAM plus the atomic display flip in that final blank.
+#   e154: Balance fixed-N H40 pattern runs across exactly the nominal VBlank
+#         group count using a measured usable-work ceiling. Remove the hidden
+#         full-name-table transfer from final-group accounting while retaining
+#         the ideal raw capacity as a separate diagnostic bound.
+#   p120: Read the TTRC v21 fixed-width per-frame VBlank pattern plan from
+#         Word RAM and execute every encoded group at a fresh VBlank head.
+#         Split long runs exactly at group boundaries, preserve empty final
+#         groups for their planned cadence, and perform name-table/HUD/CRAM/
+#         flip work only in the final encoded group.
+#   e153: TTRC v21: encode eight per-VBlank pattern-count words in every
+#         control block. Plan each frame with explicit payload, run/chunk,
+#         HUD/name-table/CRAM, and flip work so cold quality remains unchanged
+#         while physically unsafe work gains a warning-level extra VBlank.
+#   p119: Replace HUD O's redundant flip-interval estimate with the exact
+#         V-counter immediately after pattern-transfer VBlank 1. Keep V for
+#         the accepted flip and I for the final pattern exit, so Y/O and Z/I
+#         directly expose whether either scheduled share ran into active
+#         display without changing release playback decisions.
+#   p118: Use the specialized HUD tile-pair table for every deadline-side
+#         P/M/U/Y/Z/I stage patch. Keep the staged-HUD design from p117 while
+#         reducing the remaining second-VBlank patch work.
+#   p117: Move fixed-N H40 DEBUG HUD formatting out of the second pattern
+#         VBlank, merge its final values into the Main-RAM name-table stage,
+#         and carry picture plus HUD through the existing one NT DMA. Remove
+#         the post-DMA 63-cell VDP republish from the flip deadline while
+#         preserving the Y/Z/T/I split diagnostics.
+#   p116: Add DEBUG Y/Z/T/I diagnostics for exact pattern words transferred in
+#         the first and second transfer VBlanks, the number of transfer
+#         VBlanks, and the V-counter at pattern exit. Extend H32/H40 OCR,
+#         gate evidence, and hudline so cold280 split behavior can be measured
+#         without changing release transfer decisions.
+#   e152: Remove the separate Main-transfer cold ceiling so encoder quality
+#         decisions and physical Main-to-VRAM cold work are one value again.
+#         Keep the issue-74 Bad Apple qualification point fixed at cold280;
+#         deadline stability must come from the player path, not hidden work
+#         reduction.
+#   e151: Diagnostic trial, not retained: round the separate Main-transfer
+#         ceiling from 239 to 230. The trial was stopped before completion
+#         because its effective quality was cold230 rather than cold280.
+#   e150: Diagnostic trial, not retained: add a separate per-source
+#         Main-to-VRAM construction ceiling. The split made a cold280 target
+#         select only cold239 physical work, so it did not qualify cold280.
+#   p115: Restore the single 64x28 name-table DMA after the p114 row-DMA A/B.
+#         Repeating DMA setup for all 28 rows slowed every displayed frame,
+#         drove the reader 25 slots ahead, and reached S2F/R0E by frame 218.
+#         The measured result rejects compact row DMA as a deadline fix.
+#   p114: Replace the fixed-N H40 flip's 1,792-word 64x28 name-table DMA and
+#         active-time staging copy with direct compact row DMAs from shadow.
+#         The shared-deadline reserve now covers only the encoded grid plus a
+#         per-row setup allowance, HUD, CRAM, and the existing timing guard.
+#   p113: Add persistent H/X DEBUG diagnostics for the exact per-frame
+#         physical PrgBuf peak and CD reader lead. Extend the common H32/H40
+#         values-only HUD, OCR, gate evidence, and hudline without changing
+#         release playback or the encoded stream.
+#   p112: Split every DMA run at the residual VBlank word-budget boundary
+#         instead of deferring the whole crossing run. This preserves enough
+#         of the fixed-N target blank for the guarded name-table DMA and flip.
+#   p111: Preserve the n_runs zero flag while clearing the shared-VBlank budget
+#         origin. The p110 instruction order made the empty-frame branch
+#         unconditional and skipped every timed cold transfer.
+#   p110: Let fixed-N H40 share its display-deadline VBlank between the final
+#         cold-transfer tail and the complete name-table DMA, optional CRAM
+#         replacement, DEBUG HUD republish, and flip. Start each 3,400-word
+#         budget only at a proven VBlank head, require a guarded residual
+#         reserve before sharing, and retain a fresh-VBlank fallback.
+#   e149: TTRC v20: move the full segment-palette table (PALTAB) and the
+#         switch table (PALIDX) off the disc into player build inputs
+#         (paltab.bin / palidx.bin). Drop the header seg0 field (offset 64
+#         becomes pad), remove PALTAB/PALIDX from BOOT_STAGE, and fix the
+#         BVRM sidecar regions at +0000/+1000/+5000 with no palette
+#         carve-out (region B capacity grows to a fixed 0x2000 bytes).
+#   p109: Embed paltab.bin/palidx.bin in the transient .startup section and
+#         copy both to M-PALTAB/M-PALIDX at ip_entry before codegen reuse.
+#         Load the initial CRAM from M-PALTAB[0], drop the boot-stage
+#         palette/PALIDX copies and the header n_seg clamp, and restore the
+#         segment-0 CRAM when loop playback restarts (previously the final
+#         segment's palette leaked into the next loop's first frames).
+#   e148: TTRC v19: drop the per-frame pal word from every control block and
+#         ship palette switches as the boot-loaded PALIDX table (frame.u16 +
+#         segment.u16, 15 switches + sentinel) inside BOOT_STAGE. Cap palette
+#         segmentation at the fixed 16-segment PALTAB, grow DicBuf to 512
+#         patterns via run-descriptor source 3 (Dic index bit 8), split Dic
+#         runs at the 256-entry block boundary, and extend DIC_PRELOAD
+#         staging to 16 KiB.
+#   p108: Fixed Main-RAM map for TTRC v19: M-STATE 8.5 KiB at 0xFF6600,
+#         RUN_TABLE 0xFF8800, PALTAB 16x128B at 0xFFB200, PALIDX at 0xFFBA00,
+#         DicBuf 512x32B at 0xFFBA40. Decode run-descriptor source 3 as Dic
+#         index 256..511, trigger CRAM switches from M-PALIDX (advance while
+#         next_switch <= frame_no) instead of the control pal word, and copy
+#         the PALIDX table during the boot-stage handoff.
+#   p107: Accept a Word refill sector whose frame is at or ahead of the
+#         expanding frame instead of demanding equality. A mid-stream refill
+#         turn arrives with residual drain lead, and the equality gate stalled
+#         both CDC service paths until sectors slipped (Machi ED frame 451,
+#         S=1..2 MSF-gap recoveries in every run). Late sectors whose frame
+#         already began expanding remain rejected.
+#   p106: Keep PCM stopped through the first timed ROM_READN startup interval.
+#         Start it when frame 1's first control sector arrives, then finish that
+#         physical slot before releasing Main. The remaining slot time restores
+#         the ordinary frame-0 audio/display interval without moving timed BODY
+#         service into player-only frame -1 or changing encoded image settings.
+#   e147: Keep the final source-aware run trace in the named dma_runs analysis
+#         column and prove that WordBuf replanning cannot overwrite the
+#         independent timed raw-prefetch trace shown by Pre.
+#   p105: Preserve the pending Word-sector index after adding the fourth
+#         scratch destination. The first sector now remains in WORD_PENDING0
+#         for the matching post-swap flush instead of being redirected to the
+#         fourth slot and flushing stale bytes into WordBuf.
+#   e146: Treat WordBuf as a forward-moving backup for predicted Prg low-water
+#         points. Place the boot turn at the first pressure suffix, refill only
+#         when Prg cannot accept a complete sector, replay every accepted
+#         sector exactly, and encode a fourth Word-prefix sector through the
+#         routing control-field escape. Reserve its 2 KiB pending destination
+#         by reducing the physical PrgBuf ring from 424 to 422 KiB.
+#   p104: Decode the fourth-Word-sector routing escape, queue up to four
+#         not-yet-owned-bank sectors, and use the boot-only extension tail as
+#         the fourth pending destination. Match the 422 KiB physical PrgBuf
+#         ring and its fps-derived normal ceiling.
+#   e145: Keep the refill planner's useful payload plus control within the
+#         routing byte's five-sector ceiling even when a 15 fps physical CD
+#         slot lasts six sectors. Preserve the sixth sector as rate padding
+#         and prove that distinction again when materializing the stream.
+#   e144: Select timed WordBuf0/1 refill runs from proven per-slot spare
+#         capacity instead of fixing one refill turn at startup. Reserve only
+#         complete future runs that also finish inside the current refill
+#         sector, keep Prg delivery first, and let exact Prg/Word deadline
+#         replays determine the useful refill count for streams of any length.
+#   p103: Consume v18 WordBuf0/1 as refillable parity rings. Drain routed Word
+#         sectors continuously into up to three bounded Sub-PRG pending slots
+#         while the target physical bank is not owned, then commit them after
+#         the swap. Retire occupancy per complete source run and wrap Main's
+#         parity cursor only at a proven ring end.
+#   e142: Plan WordBuf0/1 as refillable parity rings. Assign complete physical
+#         runs so Word sourcing does not add Main transfer runs, charge timed
+#         refill sectors as ordinary BODY payload, and freeze independent Prg
+#         and Word occupancy/deadline proofs in the decision log.
+#   p102: Give specialized H32 DEBUG playback the same 46-cell Q/V/O/E/G/K
+#         diagnostics as H40. The logical HUD stream wraps after 32 cells on
+#         H32 and 40 cells on H40, and OCR selects the matching two-row layout
+#         from either profile. Release playback and encoded image settings are
+#         unchanged.
+#   p101: Make player-only frame -1 physically untimed. Hand the completed
+#         frame-0 bank to Main with the timed BODY suffix stopped, then use the
+#         original CMD_STREAM clear after the visible frame-0 flip to start
+#         both PCM and the one continuous timed read. Pre-drain frame 1 behind
+#         the ordinary CMD_SWAP wait. This removes unmodeled startup producer
+#         lead without changing TTRC bytes, sim decisions, or image settings.
+#   e141/p100: Advance the stream to TTRC v17. Move decoded startup PCM and
+#        exact frame-0 control/pattern sectors from HEADER.DAT into a finite
+#        untimed BODY arm while keeping every timed BODY byte and sim decision
+#        identical. Keep the required BOOT_STAGE ownership acknowledgement,
+#        remove the second frame-0/BODY-start handshake, and let one
+#        CMD_STREAM command span startup through the visible frame-0 flip.
+#        The player exposes the preceding black frame -1 as DEBUG F=FFFF for
+#        exact OCR head selection, then keeps the timed BODY suffix under one
+#        continuous read while Main builds frame 0.
+#   e140: Raise the fully qualified nominal-30fps shared cold baseline from 180
+#         to 200 while preserving the 15/24/60fps baselines, and raise the
+#         standard Sonic Jam H40 profile from 190 to its qualified cap 210.
+#         Resolution, source filtering, palette settings, fps, and player code
+#         remain unchanged.
+#   p99: Make the qualified two-row layout standard for every specialized H40
+#        DEBUG build and select it automatically from H40 profiles during OCR.
+#        The BIOS now initial-loads the complete resident SP from disc-system
+#        offset 0x6000 with an 8 KiB build bound. Move the boot-only 64 KiB ISO
+#        scratch from directly after the old 4 KiB layout to 0x67000..0x76FFF,
+#        where it is overwritten before timed PrgBuf/APPLY ownership begins.
+#        Keep G measurement inline; the HEADER extension returns to 216 bytes
+#        and 0x0CC20..0x0CFFF is free. Timed CD delivery, PrgBuf/APPLY capacity,
+#        resolution, fps, cold cap, image settings, stream decisions and sim
+#        output remain unchanged.
+#   p98: Add an experimental opt-in two-row H40 DEBUG HUD that preserves the
+#        complete
+#        Q/V/O/E row and appends G/K on row 1. Q and G now use separate Word-RAM
+#        status words, so one full recording captures signed PrgBuf minimum,
+#        flip phase, Sub pump gap, APPLY back-pressure, and MSF-gap cause
+#        together. Release playback and encoded image-quality settings remain
+#        unchanged.
+#   e139: Make fixed-cadence CD time a construction constraint rather than a
+#         whole-movie average. Every online control/Prg prefix now fits both
+#         the routing-byte useful-sector ceiling and the fps-derived cumulative
+#         CD-1x allowance, and the exact finite-PrgBuf route must keep
+#         rate_lead_peak at zero. A heavy slot can no longer borrow time from
+#         later light slots, because elapsed display delay is irreversible and
+#         otherwise becomes producer lead into the finite APPLY queue.
+#   p97: Move boot-only ring, APPLY and frame-0 queue initialization into the
+#        existing HEADER-preloaded Sub extension, which grows from 176 to 216
+#        bytes while remaining inside the ADPCM sector padding. The H40/15fps
+#        G diagnostic resident image is now 4,080 bytes and fits the
+#        then-current project 4 KiB layout guard. PrgBuf capacity, timed player
+#        work, resolution, fps,
+#        cold cap, image settings, stream decisions and simulated output stay
+#        unchanged.
+#   p96: Add the opt-in H40 DEBUG SUB_POLL_GAP_DIAG player. It replaces Q
+#        with G, the maximum time spent outside the Sub CDC pump between
+#        service opportunities in 30.72 us stopwatch ticks, while retaining
+#        O/E and the 40-cell geometry. G excludes blocking sector transfer and
+#        slip-recovery time. K replaces V and counts MSF sequence-gap
+#        recoveries; S remains the total recovery count, so S-K identifies
+#        CDC_TRN retry-exhaustion recoveries. G bit 15 carries B when APPLY
+#        back-pressure rejects a control-sector pump. The diagnostic excludes Q
+#        bookkeeping so the resident Sub image remains within the 4 KiB limit.
+#        Release/default DEBUG playback, resolution, fps, cold cap, image
+#        settings, stream decisions, and simulated output remain unchanged.
+#   p95: Add H40 DEBUG Q, the signed per-frame minimum logical PrgBuf balance
+#        in exact 32-byte patterns. Move boot-only routing validation and
+#        two-bank duplication into the existing HEADER-preloaded Sub extension
+#        (now 176 bytes) so the resident Sub base remains within 4 KiB. The
+#        qualified 88-byte ADPCM entry remains byte-identical. Up-to-8-KiB
+#        routing leaves the second entry intact at staged address 0x7D2B8 and
+#        runs it only after prebuffer; longer routes use the copied 0x76858
+#        entry. The proven startup read path before prebuffer remains unchanged.
+#        Resolution, fps, cold cap, image settings, stream decisions, and
+#        simulated output remain unchanged.
+#   e138/p94: Preload the 88-byte ADPCM table-copy extension in the existing
+#        five-sector table padding and execute it from the unused timed-ring
+#        tail. Keep signed deltas in both physical Word-RAM banks, reserve the
+#        former first 4 KiB of PrgBuf for persistent next-index/output tables,
+#        and move the ring/boot scratches up by 4 KiB. Physical PrgBuf becomes
+#        424 KiB; resolution, fps, cold cap, lookup bytes, and generated
+#        Word-RAM capacities remain unchanged.
+#   p93: Move the live 1,536-byte decoded PCM scratch from each physical
+#        Word-RAM bank to marker-verified Sub PRG-RAM at 0x8000. Keep the
+#        generated Word-RAM reserve and all stream decisions unchanged for an
+#        exact player-only A/B while reducing shared Word-RAM traffic.
+#   e137: Keep the exact scheduled PrgBuf ceiling at the fps-derived normal
+#         382/397/402 KiB capacity. The full 40/25/20 KiB cadence reserve is
+#         now live sector-arrival headroom instead of encoder Supply, so the
+#         shared-sector planner removes infeasible work before image decisions.
+#   e136: Diagnostic fixed-N2 control lead, not retained. Full Bad Apple HUD
+#         still failed at cap 180, proving that control deadline placement was
+#         not the regression source.
+#   p92: Make the boot-stage handoff an explicit HEADER read boundary. Stop
+#        before Main copies the temporary bank and restart at the exact first
+#        unread sector, so planned boot work cannot increment the slip counter.
+#   e135/p91: Derive a compact per-movie Word-RAM layout from frame count,
+#         geometry, and cold cap. Routing now occupies only its sector-rounded
+#         bytes, Wr0/Wr1 use parity-specific preload capacities, and a separate
+#         boot-stage handoff lets frame 0 reuse the palette/Dic staging range.
+#   e134: Keep the H40/15 Machi ED profile at cold cap 380 and lower only the
+#         15fps scheduled Prg delivery ceiling from 422 to 418 KiB. The normal
+#         382 KiB PrgBuf cap, 428 KiB physical ring, 424 KiB back-pressure,
+#         player code, and other cadences remain unchanged.
+#   e133: Set the full-raster H40/15 Machi ED profile's timed cold cap to the
+#         15fps baseline of 360 for playback qualification. Physical CD,
+#         PrgBuf, jitter, and memory limits remain unchanged.
+#   e132: Set the full-raster H40/15 Machi ED profile's timed cold cap to 380
+#         for playback qualification. Physical CD, PrgBuf, jitter, and memory
+#         limits remain unchanged.
+#   e131: Validate every optional shadow-update list selection against the
+#         exact rate-shaped payload schedule. Roll back the least valuable
+#         lists when shorter control data moves a required Prg sector into a
+#         slot without enough ring space.
+#   e130: Water-fill each parity WordBuf only inside the predicted PrgBuf
+#         pressure suffix, preserving the delayed start without stranding
+#         credits on one overpredicted frame.
+#   e129: Trial greedy front-loading from the predicted PrgBuf pressure frame.
+#   e128: Lend the proven unused allowance from the permanently self-funded
+#         movie suffix to earlier Raw/Buf upgrades. The signed quality ledger
+#         tapers this terminal-drain credit to zero and requires full repayment.
+#   e127: Limit each selected CRAM-priority frame's reserve reduction to its
+#         predicted protected-demand deficit over fresh frame supply. This
+#         funds the forecast shortage without emptying the complete future
+#         reserve target or moving a large Miss cliff to the following frame.
+#   e126: Inspect the existing Miss-risk forecast at each CRAM switch and its
+#         next three frames, then let only the highest-risk frame spend without
+#         retaining a later quality reserve. Zero-risk regions select none;
+#         physical sector, cold, PrgBuf, and jitter limits remain unchanged.
+#   e125: Trial a four-frame CRAM quality-priority window.
+#   e124: Keep mandatory sim output to encoded decisions and numeric traces.
+#         Store compact per-cell display categories in the decision log and
+#         generate preview/category PNGs only during analysis rendering.
+#   e122: Keep each CRAM switch's full name-table bytes as a mandatory floor
+#         while balancing unavoidable future-demand shortage. Ordinary risk
+#         may be thinned, but palette-boundary refresh work cannot be diluted.
+#   e121: Reserve every CRAM segment switch as a mandatory full name-table
+#         refresh in both future-demand traces. Earlier optional updates can no
+#         longer spend the quality allowance needed by switch-frame control
+#         entries and exact cold patterns.
+#   e120: Replace the per-frame worst-run control-sector envelope with a
+#         one-pass shared-sector prefix ledger. Exact control bytes through
+#         frame i set frame i+1's Prg deadline limit before its image decisions;
+#         sim and pack independently prove every rounded control/payload prefix.
+#   e119: Jointly derive per-frame cold/run and Prg payload limits before image
+#         decisions. Replace the profile-wide worst-case descriptor reservation
+#         with the self-consistent cold work that the physical route can admit,
+#         returning former BODY pad to payload without a post-encode retry.
+#   e118: Keep the construction-time control-sector envelope as payload
+#         reservation, but route only the final just-in-time control sectors.
+#         Unused reservation becomes pad instead of pulling future control
+#         blocks into the finite APPLY ring.
+#   e117: Construct a conservative physical BODY/PrgBuf envelope before image
+#         decisions. Reserve worst-case identity-slot run control sectors,
+#         project predicted Prg demand into the remaining sector route, and
+#         freeze that route so later stages can only shrink proven work.
+#   e115: Apply a newly trained CRAM palette on the frame after the selected
+#         dark/uniform transition frame. This lets the transition display once
+#         under the old CRAM and removes Machi OP H40/15 frame 0x03DB's
+#         one-frame-early palette corruption.
+#   e114/p90: Generalize header feature bit 1 from fixed N2 to authoritative
+#        fixed N. Machi OP H40/15 now flips every four NTSC VBlanks and uses
+#        the matching 1001/200 CD-sector accumulator in sim, packer, Sub, and
+#        Main; 24fps remains delivery-paced with its 2/3-VBlank loop. Model
+#        BODY arrival before same-frame cold consumption so the scheduled
+#        PrgBuf peak matches the live continuous pump.
+#   e113: Keep the exact PrgBuf delivery schedule one physical 2KiB CD
+#         sector below the player's 424KiB pump back-pressure boundary. The
+#         e112 Sonic H40 stream reproducibly reached equality and entered
+#         slip/re-seek recovery (S01); scheduled delivery is now capped at
+#         422KiB and the 15/24/30fps normal ceilings are 382/397/402KiB.
+#   e112: Remove Sonic Jam H40's source-side checkerboard dither with a
+#         radius-1 guided filter before the normal position-fixed Bayer output
+#         dither. The filter uses the source as its own guide to retain drawn
+#         edges and gentle gradients while preventing isolated sky pixels from
+#         mapping to the segment palette's globally brightest colour.
+#   p89: Keep BODY.DAT stopped while Main initializes, builds, and displays
+#        frame 0. Delay the existing COMCMD1 BODY-start acknowledgement until
+#        build_frame returns, then pre-drain frame 1 and enter timed playback.
+#   p88: Center sub-aperture H40 fixed-N2 streams in the fast name-table DMA
+#        path. Stage the encoded grid at PC_COL0/PC_ROW0 inside a zeroed 40x28
+#        visible aperture instead of copying 40 columns from the top-left.
+#   e111: Derive the shared cold-cap baseline only from content fps as
+#        round(5400/fps): 360 at 15fps, 225 at 24fps, and 180 at 30fps.
+#        Display mode and encoded/active tile counts no longer select separate
+#        baseline tuples; profiles may still raise the common baseline.
+#   e110: Enable one-frame timed Raw VRAM prefetch for the cropped Machi OP
+#        H40/15 profile at cold cap 480, targeting the two scene-cut frames
+#        whose DEBUG playback reached C=5 with the option disabled.
+#   e109: Raise the cropped Machi OP H40/15 profile cold cap from its 360
+#        baseline to 480 for the requested full sim, playback-gate, and
+#        visual-quality comparison.
+#   p87: Restore mid-expansion CDC service for low-rate pattern-supply streams.
+#        Poll every four packed run descriptors at 15fps instead of waiting
+#        until every run has completed; the 24/30fps sparse-poll path is
+#        unchanged.
+#   p86: Publish completed PrgBuf pops before the post-cold refill poll. The
+#        first dense frame after a cold-free startup plateau can now refill
+#        from its newly freed space instead of seeing the previous frame's
+#        stale full-ring head until the end of expansion.
+#   p85: Make opportunistic CDC back-pressure follow the next routed sector's
+#        actual destination. Payload checks PrgBuf, control checks APPLY, and
+#        padding checks neither, so a full PrgBuf can no longer block unrelated
+#        control/pad draining and cause an avoidable continuous-read slip.
+#   e108/p84: Advance the stream format to TTRC v16 and word-align bitmap
+#        entry arrays. Odd bitmap sizes such as H40 40x19 (95 bytes) now carry
+#        one zero byte before their 16-bit entries, preventing a 68000 address
+#        error while preserving the complete control length and BODY schedule.
+#   e107/p83: Scale PrgBuf delivery jitter with the content frame interval:
+#        20 KiB at 30fps, 25 KiB at 24fps, and 40 KiB at 15fps. Keep the
+#        physical 424 KiB delivery
+#        ceiling fixed while reducing normal prebuffer/quality capacity to
+#        404/399/384 KiB respectively. HUD J and its recording gate now use
+#        the generated per-stream normal ceiling. Physical scheduling failure
+#        stops the sim unchanged instead of feeding local cold/Prg caps back
+#        into another encoder pass.
+#   e106: Lower the cropped 760-tile Machi OP H40/15 baseline and explicit
+#        profile cap from 500 to 380 for the delivery experiment. The result
+#        was not adopted as the measured baseline; e107 restores the baseline
+#        to 360 and keeps 380 only as Machi OP's explicit profile request.
+#   e105: Bound physical-delivery refinement at four whole-envelope accounting
+#        passes. Each pass freezes the complete remaining congestion interval;
+#        the former one-causal-frame retry loop is not used.
+#   e104: Make automatic physical-delivery feedback Prg-specific. Freeze
+#        rejected cells plus a physical cumulative catch-up ceiling, retain a
+#        one-sector planning reserve, and bound exact residency refinement to
+#        two accounting passes. Preserve effective local Prg caps in analysis
+#        TSV/timelines. This replaces the over-conservative e103 cumulative
+#        selected-demand experiment.
+#   e103: Replace per-frame physical-delivery retry passes with a one-shot
+#        whole-congestion envelope. The logical seed projects rejected Prg/cold
+#        work forward in physical 64-pattern sectors, freezes every causal
+#        local cap at once, and runs the stateful accounting pass only once.
+#        Preserve those local caps in analysis TSV/timelines. Authenticate sim
+#        artifact reuse by source/settings plus this encoder version rather
+#        than individual code-file hashes.
+#   e102: Simplify schema-v3 profiles to source geometry, output identity,
+#        optional timed Raw prefetch/source-qualified cold cap, and palette
+#        algorithm. Fix the resident VRAM pool, core encoder features, palette
+#        training constants, forward fill, and startup audio in shared code.
+#        Enable the existing Prg/Wr0/Wr1/Dic supply path at 15fps and add H40/15
+#        baselines for the cropped 760-tile Machi OP (500, requalified by the
+#        current full run) and the full 1120-tile raster (360).
+#   e101 : Add optional profile-bound encoder.cold_cap. Omission uses the exact
+#        mode/fps/active-tile baseline, a lower value is rejected before sim,
+#        and pack authenticates the same effective cap against frozen
+#        decisions. Consolidate Sonic Jam H40 on its qualified cap-190 crop
+#        profile.
+#   e100/p82: Remove the legacy direct-audio codec and profile selector. TTRC
+#        v15 always stores checkpointed 22.05 kHz IMA ADPCM controls, always
+#        boots the full decoder tables, and always decodes on the Sub CPU.
+#   e99 : Centralize analysis category, source, status-bar, and timeline colours
+#        in tools/analysis_style.py. Render Flbk borders in canonical yellow
+#        without blending, and render Prg/Wrd/Dic as thin colour-and-black
+#        dashed borders consistently in sim maps and legends.
+#   e98 : Give Flbk a bounded adjacent mean-colour search when the target
+#        bucket's best resident cannot improve the display. Compare the newest
+#        eligible pattern from each of the 26 neighbouring buckets and retain
+#        the existing improve-only acceptance rule. This fills colour coverage
+#        gaps immediately after hard cuts and CRAM switches.
+#   e97 : Make the unified exact/fallback decision explicitly three-phase:
+#        commit free or two-byte Same/Near results, select exact cold loads
+#        while reserving one two-byte name entry for every deferred cell, then
+#        fill the remainder from resident Flbk candidates. This keeps early
+#        exact loads from exhausting the frame budget before the fallback pass.
+#   e96 : Accept only Near before an exact cold load attempt; if that load
+#        cannot fit, the same best resident may be
+#        used as Flbk. Narrow future Miss-risk protection to the Near boundary,
+#        renumber approximation severity, and keep mean-colour resident buckets
+#        solely as search acceleration.
+#   e95 : Qualify cold cap 500 for the exact H40/15fps/720-active-tile
+#        geometry. Its full pack and cadence-aware DEBUG gate pass with useful
+#        phase margin; higher probes are not adopted after cap680 reached M=5
+#        and 67.37 ms despite neighboring values passing non-monotonically.
+#   e94 : Keep the contiguous identity slot map automatically for specialized
+#        plain-Prg streams below 24fps, matching the legacy Sub-CPU walker's
+#        cell/update-order run construction. Require its real execution-run
+#        count to equal the packed suffix and expose the selected player path
+#        in the frozen decisions. This prevents suffix payload ordering from
+#        turning a compact low-rate stream into hundreds of runtime runs.
+#   e92/p80 : Move the control-block palette reference from an 8-bit field
+#        paired with an unused debug flag to one 16-bit field, and remove the
+#        optional 22-byte diagnostic block from TTRC v14. The DEBUG HUD remains
+#        a player build feature with no stream payload. Lower the qualified
+#        H40/30fps/1,120-active-tile cold cap from 185 to 180 for the Bad Apple
+#        phase-robustness check.
+#   e91 : Replace fixed-frame priority aging with RGB-distance-weighted
+#        pressure for Miss/Flbk, exclude Near, and use the same pressure as
+#        the approximation-upgrade tie-break. Disable detail weighting by
+#        default, shorten persistent-approximation rescue to floored 0.2-second
+#        thresholds, and remove the retired MissCarry/compose diagnostic path.
+#   e90 : Retain the analysis timeline/TSV diagnostics and required positional
+#        profile CLI while restoring the e87 encoder allocation behavior after
+#        the e88/e89 comparisons were not adopted. Advance the public build
+#        sequence without retaining either experimental output behavior.
+#   e89 : Experimental comparison (not retained on main): stop reserving one
+#        worst-case four-byte run descriptor for every cold tile during
+#        selection. Charge only exact source-aware runs after placement and use
+#        a per-cold upper bound solely as a current-frame solvency check.
+#        Preserve this result on its WIP branch.
+#   e88 : Experimental comparison (not retained): derive one future reserve
+#        from the completed encoder's actual update, Prg-pattern, and
+#        source-aware run work, shared by Main decisions and optional exact
+#        upgrades. The comparison exposed a drain/refill shape and was not
+#        self-consistent, so e89 restores the forecast-pair reserve.
+#   p79 : Move the DEBUG HUD font from directly above the resident pool to the
+#        fixed unused VRAM gap at 0xD000 (tiles 1664..1679). The pool may now
+#        run right up to NT0, and DEBUG and release share one pool shape.
+#   e87 : Raise the resident VRAM pool ceiling from 1,518 to 1,535 slots; the
+#        relocated HUD font and the removed guard tile free 17 tiles between
+#        the pool and the first movie name table.
+#   p78 : Add a boot-only Word-RAM handoff before BODY.DAT starts. Main installs
+#        the v13 backside-VRAM sidecar while no timed CD read exists, then Sub
+#        starts the unchanged continuous BODY path. This prevents the sidecar's
+#        startup VDP writes from consuming PrgBuf jitter headroom. DEBUG HUD M
+#        reports 00 for untimed frame 0 while retaining ordinary-frame waits.
+#   e86 : Make frame 0 an exact boot construction instead of passing it through
+#        the timed-frame Near/Flbk decision path. Its displayed categories
+#        are now strictly Raw for each first exact pattern load and Same for
+#        duplicate exact references. Fill the remaining 1,518-slot resident
+#        pool with deterministic future patterns, split between the existing
+#        inline frame-0 path and a v13 boot sidecar for backside VRAM. Timed
+#        visible work can reclaim speculative slots.
+#   p77 : Add the v13 fixed 24 KiB Word-RAM boot stage and have Main copy its
+#        optional sidecar patterns directly to final backside-VRAM slots before
+#        frame 0 and on movie restart. Preserved holes coexist with palettes,
+#        O_HDR, diagnostics and Dic staging. The Sub playback loop is unchanged
+#        and its specialized DEBUG binary remains 4,094 bytes.
+#   p76 : Two Main-side transfer-path changes for the cold-cap work.
+#        (1) Pre-swizzle the cold-run RUN_TABLE in Pass1: each record carries
+#        ready 0x93-0x97 register words (+2-adjusted Word-RAM source) and the
+#        VRAM command, so Pass2 pops them straight into the control port;
+#        whole runs issue per VBlank with the old chunk split kept for runs
+#        above one full budget. (2) NT_DMA_FLIP (specialized fixed-N2 H40):
+#        re-stage the 40-pitch shadow into a 64-entry-pitch buffer in active
+#        time (~1.5 ms RAM copy) and copy the complete back name table with
+#        ONE linear Main-RAM DMA inside the flip VBlank (~14 blank lines),
+#        replacing the ~8 ms FIFO-throttled data-port blit; the DEBUG HUD row
+#        is republished after the DMA. Pre-transfer phase (HUD E) median
+#        drops 12.7 ms -> 7.1 ms. Measured rejections: a build_frame reorder
+#        (Pass2 first) and CPU_DIRECT_MAX_WORDS=128 were both strictly worse
+#        (transfer time is VRAM-slot bound, not issue-mechanism bound).
+#   p75 : Rebase HUD O to the flip-to-flip interval excess over 1024 ticks
+#        (the arm-point base of p74 saturated on every normal frame) and add
+#        E, the Pass2 entry delay since the previous flip in 4-tick units,
+#        sampled before the transfer VBlank wait. E measures the pre-transfer
+#        Main phase against the field-1 VBlank deadline that decides cadence
+#        slips. H40 DEBUG row is now 36 cells (V/O/E).
+#   p74 : Append two H40 DEBUG HUD flip-phase fields: V = V-counter at the
+#        accepted display flip, O = that flip's lateness past the fixed-N2 arm
+#        point in 30.72 us ticks (clamped FF). Captured after the flip write,
+#        off the critical path; H32 and release builds are unchanged. They
+#        expose the flip-phase ratchet behind cold-cap cadence breaks.
+#   e82/p73 : Separate 20 KiB of timed-delivery jitter headroom from the 4 KiB
+#        physical ring guard, setting the PrgBuf and quality-budget ceiling to
+#        404 KiB. Move boot-only frame-0/routing staging accordingly and rebase
+#        HUD J plus its recording gate to the 404/424 KiB boundaries.
+#   e81/p72 : Raise the scheduled PrgBuf and matching quality budget from 388
+#        to 408 KiB, leaving a 20 KiB physical jitter tail. Relocate the
+#        boot-only maximum frame-0 staging so it spans that tail and unused
+#        APPLY space without reducing H40 support. Rebase HUD J to 408 KiB.
+#   p71 : Use one common 30-cell DEBUG HUD in H32 and H40. Expose U/N in both
+#        modes and add J, the sticky ceil-KiB high-water occupancy above the
+#        388 KiB streamed PrgBuf scheduling ceiling, excluding frame-0 staging.
+#        Skip the offline-only packed debug counts instead of copying them to
+#        an unread Word-RAM area, keeping the H40/30 Sub boot image within 4 KiB.
+#   e80 : Balance Main-risk demand that exceeds the complete whole-movie
+#        quality-budget capacity across each continuous burst. Build its
+#        backwards reserve from feasible demand so unavoidable loss is no
+#        longer concentrated at the burst's first frame, while optional exact
+#        upgrades retain their strict complete-demand reserve. Expose planned
+#        Main-risk demand and shortfall traces. Reserve run
+#        control incrementally per selected cold tile instead of withholding
+#        the complete cold-cap worst case before the frame makes any choice.
+#   e79 : Refine analysis category rendering: combine Wr0/Wr1 as Wr in the
+#        legend, unify their visible colour, and use thin colour/transparent
+#        dashes for Dic/Prg/Wr.
+#   e78/p70 : Replace the consumptive MainBuf preload with persistent DicBuf.
+#        Select up to 256 whole-movie dictionary entries before allocating the
+#        residual Wr0/Wr1 credits, encode an 8-bit DicBuf index in each existing
+#        four-byte run descriptor, and address DicBuf directly from Main RAM.
+#        Move RUN_TABLE to 0xFF8600 without changing its record size.
+#   e77 : Replace the analysis-only Buf funding class with mutually-exclusive
+#        Prg/Wr0/Wr1/Dic physical-source categories. Resolve Raw/source cells
+#        from the allocator's actual cell-ordered cold transfer, add successful
+#        VRAM prefetch activity, and update the canonical analysis layout.
+#   e76/p69 : Replace the profile preload panel with a four-digit hexadecimal
+#        loaded-PrgBuf KiB counter using the shared 16-glyph font in DEBUG and
+#        release builds. Make 1518 the common even resident-pool maximum for
+#        H32 and H40: tiles 1519-1534 hold the font, tile 1535 is a guard, and
+#        the first movie name table starts at tile 1536.
+#   e75/p68 : Add optional one-frame raw-pattern VRAM prefetch. The encoder
+#        targets only protected cold demand above the measured cap, uses exact
+#        spare per-frame BODY/cold capacity after visible work, requires a
+#        four-pattern minimum batch, and freezes every request for exact pack
+#        replay. TTRC v11 feature bit 5 permits Prg cold runs
+#        without same-frame name updates; the Sub player retains bounded run
+#        validation against the full cell count. Bad Apple H40 enables it while
+#        every other profile defaults off.
+#   e74 : Make ADPCM22 and the qualified 1440-pattern resident VRAM pool the
+#        standard across every checked-in profile and direct sim defaults.
+#        Cache palette frame features, resident colour-distance data, and
+#        same-frame bucket candidate windows; keep decision and packed-stream
+#        output byte-identical while substantially reducing encoder time.
+#   e73 : Raise the Bad Apple H40 resident VRAM pool from the legacy 1400
+#        profile value to the qualified 1440-tile H40 limit enabled by the
+#        16-pattern playback HUD font.
+#   e72 : Lower the H40/30/full-raster cold cap from the previously qualified
+#        178 to 175 as a conservative headroom step while qualifying the TTRC
+#        v11 mixed shadow-update path toward a future cold-190 retry.
+#   e71/p67 : Add TTRC v11 mixed shadow updates. The encoder chooses per frame
+#        between the existing bitmap/entry representation and completed
+#        (shadow byte offset, final name-table entry) pairs only when the real
+#        Main-CPU path is faster and the whole-stream PrgBuf/control-readiness
+#        minima do not decrease. The Main player applies the bounded list
+#        directly; the Sub player locates audio from either layout and retains
+#        the authoritative source-aware cold-run suffix.
+#   p66 : Inline the specialized DEBUG HUD conversion through a 256-entry
+#        byte-to-name-table lookup. Each two-digit value is now one indexed
+#        longword read with no formatter call; release builds carry no table.
+#   p65 : Center the fixed 32-column preload status panel in H40 by applying a
+#        four-tile offset to every startup line and live progress/status target.
+#        H32 retains its existing zero-offset layout.
+#   p64 : Re-enable VDP timing on a cleared black front name table after the
+#        hidden startup-font replacement. A disabled display can keep VBlank
+#        status asserted and stall frame-0 construction; the black transition
+#        preserves clean startup-to-playback visuals while VBlank advances.
+#   p63 : Replace the playback HUD with 16 dual-readable hexadecimal glyphs:
+#        a four-bit barcode row plus a compact 6x7 human glyph. Embed only the
+#        occupied HUD cells into the inactive Plane A movie table so the right
+#        side cannot expose stale Plane B data. Blank the VDP while replacing
+#        the SGDK startup font so its replacement is never visible.
+#   e70 : Raise the H40 Sonic resident VRAM pool from 1400 to the exact safe
+#        1440-tile limit. Profile and HEADER validation reserve the temporary
+#        95-tile SGDK startup font below the first movie name table.
+#   p62 : Prioritize an already-arrived or already-cleared Main CMD_SWAP before
+#        opportunistic CD pumping on the Sub CPU. This removes a deterministic
+#        extra sector pump from the frame handoff deadline while preserving
+#        continuous pumping during genuine Main wait time.
+#   p61 : Remove the encoder allowance from the boot preload screen. It is not
+#        a stream bitrate or an output specification.
+#   e69 : Derive encoder supply from the exact SEGA-CD 1x BODY sector cadence.
+#        Reserve fixed control before charging update entries, run descriptors,
+#        and Prg pattern payload. Retire the per-profile encoder-rate setting
+#        and its legacy environment override.
+#   p60 : Frame-pace the boot preload monitor instead of polling the gate array
+#        without a bound. Show Sub-CPU acknowledgement, exact BADx startup
+#        failures, and the live PrgBuf count/bar reliably before playback.
+#   p59 : Add a profile-specific boot preload screen using SGDK's default 8x8
+#        font in temporary VRAM. It shows stream metadata and cold cap, marks
+#        completed HEADER regions, and animates the live PrgBuf KiB count and
+#        progress bar without reducing any streaming buffer.
+#   e68 : Make video.fit="crop" a complete HAR-aware object-fit-cover path:
+#        centre-crop to the mode's displayed aperture, then scale to the full
+#        coded raster. The explicit crop mode may discard active edge pixels;
+#        pad remains the source-preserving default.
+#   e67 : Introduce TTRC v10 four-source pattern supply. Predict exact and
+#        Miss-risk cold demand, water-fill distinct WordBuf0/WordBuf1/MainBuf
+#        boot credits, freeze every realized Prg/Wr/Main source, and verify the
+#        source-aware stream against packing and independent replay. Replace
+#        the old Tank/Buf gauges with Prg/Wr0/Wr1/Main meters and a four-source
+#        stacked timeline. Bad Apple H40 now uses the default ADPCM22 profile.
+#   p58 : Preformat the values-only DEBUG HUD in Main RAM, publish it into the
+#        inactive one of two Window name tables, and switch picture reg2 plus
+#        Window reg3 with one precomputed control-port longword. Direct digit
+#        formatting and a final VBlank guard that rejects V-counter FC..FF
+#        close the deadline races. Full Bad Apple H40 kept all 6,575 timed
+#        intervals at exactly two scanouts; unused H40 width remains
+#        transparent.
+#   p57 : Load distinct WordBuf0/WordBuf1 pattern regions and a staged MainBuf
+#        at boot, then build source-aware Main transfer runs with the correct
+#        Word-RAM versus Main-RAM DMA paths. Make the DEBUG HUD values-only and
+#        leave unused H40 Window width transparent.
+#   e66 : Normalize BODY Band by each delivery slot's actual physical CD read
+#        time. Pad is unused bandwidth, every valid slot is capped naturally at
+#        CD 1x (150 KiB/s), and the reported average is physical-time weighted.
+#   e65 : Define analysis Band from useful BODY.DAT bytes in each physical
+#        delivery slot. Save and pack-verify payload/control/pad traces, expose
+#        payload/control separately, and remove legend number fills.
+#   e64 : Require an exact measured mode/fps/active-tile tuple for cold-cap
+#        selection. Measurements from larger active areas are no longer reused
+#        for smaller profile areas; every distinct tuple must be qualified.
+#   e63 : Select cold caps only from full-length-qualified mode/fps/active-tile
+#        tuples. A measurement covers smaller active pictures at the same mode
+#        and fps; uncovered tuples now stop with a measurement-required error.
+#   e62 : Replace the encoder's fixed 40%/70% optional-upgrade reserves, 40%
+#        recovery holdback, and separate terminal ramp with a whole-movie
+#        reserve plan. A dry run of the quantized exact target through the
+#        shared VRAM allocator predicts future demand; a backwards pass keeps
+#        only the bytes future bursts require and ends at zero reserve. The
+#        optional-upgrade plan uses complete exact demand. Normal exact updates
+#        use a narrower approximation-risk trace, deferring work only where
+#        resident reuse can degrade gracefully while protecting future
+#        Flbk/Miss bursts.
+#   e61 : Qualify the H40/30fps/1,120-active-tile Sonic cold cap at 178.
+#        All 2,713 timed intervals stayed at exact N=2 with S/D/R/C=0; 179
+#        inserted one extra scanout, and 200 exhausted delivery margin.
+#   e60 : Qualify the H40/15fps/1,040-active-tile Machi ED cold cap at 400.
+#        The full-length recording kept S/D/R=0, Main VBlank waits <=2, and
+#        pattern-update time <=50.63 ms; pack under=0 and decoded exactly.
+#   e59 : Add a 375 cold-cap qualification candidate for Machi ED's
+#        H40/15fps/1,040-active-tile raster. Keep the qualified 720-tile value
+#        at 400 and full 1,120-tile H40 at 350.
+#   e58 : Scope the H40/15fps 400 cold cap to the qualified 720-active-tile
+#        raster. Full 1,120-tile H40 and every other active-tile count retain
+#        350. Freeze active_tiles into sim stats and the decision log so the
+#        pack validates the same mode/fps/tile-count tuple.
+#   e57 : Raise the Machi OP H40/15fps/720-active-tile cold cap from 375 to the
+#        full-length-qualified limit of 400. S/D/R stayed zero, Main VBlank
+#        waits <=2, pack under=0, and every decoded frame matched exactly.
+#   e56 : Raise the H40/15fps cold cap from 350 to 375 after the low-rate
+#        ADPCM decoder gained periodic CDC service. Keep H32, mode4, H40/24,
+#        and H40/30 limits unchanged until they have their own measurements.
+#   p56 : Service the CDC during low-rate ADPCM decode. An N4 decode can run
+#        for about 16 ms, longer than one 13.3 ms CD-sector interval, so the
+#        Sub CPU now polls at most every 512 packed bytes. Specialized 24/30
+#        fps players emit none of this counter or call overhead.
+#   e55 : Make ADPCM22 the encoder default for new profiles and direct sim
+#        runs. The direct-audio path remained available at that revision.
+#   e54 : Make sim audio reproduce the current ADPCM22 signal. Analysis and
+#        straight sim videos now use the shared continuous checkpointed IMA
+#        encode/decode path followed by RF5C164 8-bit output conversion; the
+#        clean signed-16 WAV remains the packer's source only.
+#   e53 : Introduce TTRC v9 checkpointed continuous IMA ADPCM. ADPCM22 controls
+#        carry a four-byte predictor/index checkpoint plus two samples per byte;
+#        HEADER startup audio remains reconstructed PCM. Header offset 58 now
+#        stores an RF5C164 frequency delta derived from fixed chunk cadence, and
+#        the full 8,800-byte decoder table image follows PALTAB.
+#   p55 : Decode ADPCM22 directly on the Sub CPU through full lookup tables
+#        duplicated at boot into both physical 1M Word-RAM banks. Reuse the PCM
+#        wave writer and export decoder time as DEBUG Axx. H40 Sonic completes
+#        S=0/D=0/R=0/C=0.
+#   e52 : Separate the encoder's virtual VBV budget from physical payload-RING
+#        occupancy in analysis. Sim and pack now share the exact sector
+#        scheduler and cross-check every frame, so Tank follows prebuffer,
+#        delivery, consumption and final-sector padding instead of unused
+#        virtual budget.
+#   p54 : Bind Main/Sub frame, geometry, audio, polling, DMA and CD-rate hot
+#        values to generated HEADER constants. Verify the per-profile header
+#        signature at startup and retain PLAYER_SPECIALIZE=0 as the generic A/B
+#        build. Existing Main runtime codegen remains the bitmap/blitter fast path.
+#   e51 : Store a CRC-32 signature of HEADER.DAT's fixed 64-byte player
+#        contract and generate deterministic per-profile assembler constants.
+#        The signature occupies previously reserved bytes in header sector 0;
+#        BODY.DAT and the TTRC v8 field layout are unchanged.
+#   p53 : Replace fixed-N2 VBlank edge sampling with a flip-to-flip stopwatch
+#        deadline. The 24.576ms midpoint cannot miss VBlank 1 during long Main
+#        work and always arms the following VBlank 2; 24/15fps remain unchanged.
+#   p52 : Count a fixed-N2 VBlank when the pattern-transfer pass enters after
+#        VBlank has already started. This removes a false third-VBlank hold
+#        without changing the transfer workload or the 24/15fps paths.
+#   p51 : Honor v8 FEATURE_FIXED_N2 as the authoritative two-VBlank
+#        flip-to-flip cadence. Count VBlanks crossed while waiting for the Sub
+#        CPU, pace immediately before reg2, and publish the DEBUG F row with the
+#        matching picture. Feature-clear 24fps and 15fps remain delivery-paced.
+#   e50 : Introduce TTRC v8 and header feature bit 1 (FEATURE_FIXED_N2). Its
+#        BODY slots use the exact 1001/400 CD-sector allowance matching
+#        30000/1001fps, preventing the old 75/30 stream from running ahead when
+#        display pacing is restored. The one-byte routing layout remains v7's.
+#   p50 : Re-check VBlank immediately before every non-palette name-table flip.
+#        Reuse-only frames and the DEBUG Window write can otherwise reach reg2
+#        during active display and splice two adjacent movie frames at one
+#        horizontal scanline.
+#   p49 : Require TTRC v7 and validate the exact routing-sector count, frame
+#        limit, frame-0 zero, reserved bits, total and control bounds once at
+#        boot. Hot paths decode total/control directly from one resident byte.
+#        Remove the obsolete nonzero startup-audio skip path required to fit
+#        the guards while also avoiding its per-frame branches and copies.
+#   e49 : Introduce TTRC v7 packed routing. Each frame stores control sectors
+#        and total sectors in one validated byte, doubling the 16 KiB resident
+#        table limit to 16384 frames while preserving every BODY boundary and
+#        payload/control byte. This intentionally bumps the disc format to v7.
+#   e48/p48 : Extend the payload ring from the hardware-used 420 KiB waypoint
+#        to the PRG memory-map limit at 428 KiB. The 40 KiB jitter reserve and
+#        36 KiB gap below pump back-pressure stay unchanged, giving sim/pack a
+#        388 KiB usable tank while the player stops draining at 424 KiB.
+#   e47/p47 : Restore the previously hardware-used 420 KiB physical payload
+#        ring now that routing no longer occupies adjacent PRG RAM. Preserve
+#        the 40 KiB delivery-jitter reserve: sim/pack cap and tank become
+#        380 KiB, while the player back-pressure threshold becomes 416 KiB.
+#   p46 : Keep the v6 routing table resident in both 1M Word-RAM banks. Frame 0
+#        temporarily uses the physical ring's jitter tail, while the boot-only
+#        routing source borrows APPLY after HEADER has drained. Delivery may run
+#        ahead of display without selecting a route from the inaccessible bank.
+#   e46 : Show analysis DMA in pattern tiles and record the exact packed
+#        cold-run count per frame. Add a Run fragmentation meter whose scale is
+#        the one-run-per-DMA-tile worst case and whose four digits cover H40.
+#   p45 : Reduce Main-CPU cold-run fixed cost. One- and two-tile runs write
+#        Word RAM directly to the VDP; longer DMA runs reuse their destination
+#        command for the required first-word repair. H40 DEBUG adds a low-cost
+#        Mega-CD stopwatch/readout and packed run count for matched-frame A/B.
+#        Bad Apple H40 measured 12.0% lower pattern-transfer time over 3093
+#        matched frames and 13.0% at its 47-run peak, with identical pixels.
+#   p44 : Keep the 30fps cold-run MOVEM fast path from loading its own
+#        postincrement source register a4. The 68000 substituted the updated
+#        pointer for one 4-byte pattern row, producing a horizontal dash in the
+#        same row of every fresh 8x8 tile. A seven-register MOVEM plus one long
+#        copy preserves a4 and the exact 32 pattern bytes.
+#   e45 : Select area resampling as the final Bad Apple H40 source resize while
+#        retaining source endpoint snapping, no master denoise/blur, and normal
+#        ordered dithering.
+#   e44 : Add profile-level resize_filter and master_denoise controls. The Bad
+#        Apple H40 direct-Lanczos analysis disables the master-only upscale,
+#        denoise, and blur pass after source endpoint snapping.
+#   e43 : Remove the experimental encoder-side endpoint-fill path. Add optional
+#        [source.preprocess.endpoint_snap] RGB888 preprocessing before both the
+#        master and analysis Source paths; Bad Apple H40 snaps 0-2 to 0 and
+#        253-255 to 255 while retaining normal ordered dithering.
+#   e42 : Experimental Bad Apple H32 encoder-side endpoint-fill analysis build;
+#        retired by e43.
+#   e41 : Disable output dithering in the Bad Apple H40 profile for a direct
+#        nearest-RGB333 comparison. H32 and every other source profile remain
+#        unchanged.
+#   e40 : Experimental Bad Apple H40 encoder-side endpoint-fill analysis build;
+#        retired by e43.
+#   e39 : Restrict the measured 200-cold H40 limit to exactly 24fps, whose
+#        two/three-VBLANK cadence produced Lunar's slips. Restore the common
+#        scaled limits for unmeasured H40 rates, including 175 at 30fps.
+#   e38 : Freeze analysis-panel arrays before threaded PNG encoding, validate
+#        each completed PNG, and atomically replace the old frame. Parallel
+#        rendering can no longer leave a corrupt or cross-frame preview file.
+#   e37 : Make the physical cold cap display-mode aware. H32 remains 350 at
+#        15fps (219 at 24fps); full-raster H40 uses 320 at 15fps and 200 at
+#        24fps, where Lunar playback changes from repeatable S=2 to S=0.
+#   e36 : Reduce every resident-candidate F3 metric to one scalar explicitly.
+#        Accelerated cached tiles with a singleton dimension no longer make
+#        low-cold simulations fail while selecting the best approximation.
+#   p43 : Select the packed cold-run fast path from nominal fps so 24fps N2
+#        streams no longer fall through future N-based cadence changes. Copy
+#        each descriptor pattern with one 32-byte MOVEM pair instead of eight
+#        separate long moves, reducing Sub-CPU work without changing output.
+#   p42 : Generate 256 straight bitmap handlers plus fixed NT0/NT1 blitters once
+#        after stream-header setup. Runtime code removes the per-bit bitmap loop
+#        and per-row name-table address/loop work while retaining exact zero/full
+#        paths and geometry/range fallbacks. Full Lunar H32/H40 DEBUG playback
+#        matches the reference S/D/R behavior; measured Main-CPU savings average
+#        3.534 ms/frame at H32 and 4.031 ms/frame at H40 with no regressed frame.
+#   e35/p41 : Keep non-integer-VBlank content rates such as 24 fps delivery-
+#        paced instead of rounding their PCM chunk sizing to N2/29.97 fps.
+#        24 fps now uses 555 B/frame while existing 15/30 fps output is unchanged.
+#   e34/p41 : Add strict per-source TOML encode profiles. sim.py resolves a
+#        profile before encoder constants are initialized and freezes the exact
+#        geometry, timing, audio, hardware, palette and pack settings plus the
+#        profile hash in decisions.pkl. pack_stream.py no longer imports sim.py
+#        or reads per-source CBRSIM values; it reconstructs its contract from
+#        that decision log and rejects a TOML edited after simulation.
+#   e33/p41 : Add spatially coherent MOSAIC-GM tile assignment. A deterministic
+#        two-pass checkerboard optimizer compares quantization residuals only
+#        across shared 8x8 edges, reducing palette-created boundary seams while
+#        leaving real source edges unpenalized. The CPU reference and vectorized
+#        CuPy path are bit-identical; the visual-quality default weight is 8.
+#   e32/p41 : Refine a one-line MOSAIC-GM candidate against the complete
+#        flattened RGB333 movie histogram. Full-error-decreasing slot swaps
+#        fill spare duplicates with sample-missed colours (Bad Apple becomes
+#        exact) and use the same bounded search for sources over 15 colours.
+#   e31/p41 : Add the optional MOSAIC-GM palette selector. It starts with one
+#        global RGB333 line, grows shared-core specialist lines only when a
+#        held-out sample improves, prunes redundant lines, and keeps local CRAM
+#        segments only when they beat the global palette. RGB333 LUT scoring is
+#        bit-identical for the legacy STL4 path and GPU accelerated.
+#   e30/p41 : Round fixed PCM chunks up against the actual NTSC cadence: 444 B
+#        at N2 and 888 B at N4. FD=0x0345 consumes about 13303.76 samples/s;
+#        either schedule supplies about 13306.69 samples/s, retaining a small
+#        2.94 B/s surplus. The source WAV is retimed evenly across the full
+#        movie instead of ending in padded silence.
+#   e29/p41 : Keep the startup PCM reserve for the full movie. HEADER queues the
+#        first 30 chunks and live control frame 0 starts at chunk 30 instead of
+#        duplicating chunk 0 and skipping 30 writes. Playback sample order and
+#        frame-0 A/V alignment stay unchanged; the writer remains about 30
+#        frames ahead, preventing the low-lead glitches seen near Bad Apple
+#        F06E5 and the eventual R01 at F080F.
+#   e28/p41 : Reserve P0 index1/index15 for the globally darkest/brightest
+#        existing CRAM colours so the DEBUG Window has an opaque dark background
+#        and bright text. DEBUG now blits every video row behind the Window;
+#        it no longer saves one name-table row of work at full H32/H40 height.
+#   e27/p40 : Expand the Sub-CPU routing table from 8 KiB/4096 frames to
+#        16 KiB/8192 frames. Long 30fps streams previously wrote routing bytes
+#        into the adjacent APPLY control ring; after that ring wrapped, valid
+#        controls were replaced by routing data and the picture collapsed with
+#        S=0/D=0. The physical payload ring gives 8 KiB to routing (412 KiB),
+#        preserving the 34 KiB APPLY ring and 40 KiB jitter margin; sim/pack
+#        tank and cap derive to 372 KiB. The packer rejects longer streams.
+#   e26/p39 : Shape useful BODY payload to the CD-1x per-frame allowance instead
+#        of refilling an already-full startup ring with all five routing slots.
+#        A backwards deadline proof still permits necessary future bursts; the
+#        Sonic first 30 BODY frames fall from 102 to the exact 75-sector budget.
+#        Header feature bit 0 appends cold-slot run descriptors after the legacy
+#        audio position, with entry-scan fallback for old streams and uncovered
+#        frame sizes. The Sub consumes those runs directly at 30 fps and waits
+#        for real DMNA bank-switch completion instead of a fixed 0x400 delay.
+#        Main adds exact zero/full bitmap and eight-word name-table fast paths.
+#        The 32-cell DEBUG Window HUD adds C/W/M/A startup-pipeline counters.
+#   p38 : Keep the DEBUG Window HUD's 22-cell backing black without another
+#        tile, palette colour, per-frame branch, or DMA. Startup preselects a
+#        blit that keeps the full-width top Window row clear; a full-height H32
+#        or H40 movie therefore saves 32/40 CPU NT writes per frame. DEBUG omits
+#        the redundant CRAM0 red slip border; Sxx remains the indicator.
+#   e25/p37 : Canonicalize each segment's existing 60 usable CRAM colours so a
+#        globally brightest colour is always P0/index15. Whole-row and slot
+#        swaps are mirrored in tile palette attributes and pixel indices, with
+#        RGB333 identity asserted for every quantized pixel; pack rejects stale
+#        logs and writes the matching initial palettes.bin beside HEADER/BODY.
+#        DEBUG uploads its index-1 font once as index15, removes all palette-
+#        switch font recolouring/DMA, and moves the HUD to an independent top-
+#        row Window plane. The compact FxxxxPxxSxxDxxRxxLxxxx row takes one
+#        address setup plus 22 writes; P/S/D/R show the low byte and naturally
+#        wrap from FF to 00. A scanline guard avoids racing the visible row.
+#   e24/p36 : Split the on-disc TTRC stream into HEADER.DAT and BODY.DAT.
+#        HEADER contains every startup dependency, including the complete
+#        frame-0 control/pattern data, routing and frame-1 prebuffer; BODY starts
+#        at frame 1 and is the only continuous timed read. BODY stores control
+#        sectors before future payload sectors, so the player can begin a frame
+#        as soon as its complete control block arrives. The packer proves that
+#        every current-frame cold pattern was delivered by the previous frame
+#        and keeps MOVIE.DAT only as an offline concatenated compatibility file.
+#   p35 : Remove duplicate Sub-CPU work from the 30fps hot path. Expansion now
+#        iterates the existing n_upd entry stream directly instead of scanning
+#        every bitmap cell a second time; the Main CPU remains the sole bitmap
+#        consumer. The 75Hz CDC path caches routing, unrolls the 2KB stage copy,
+#        removes dead register saves and replaces the per-frame DIVU with an
+#        exact precomputed quotient/remainder accumulator. Valid streams produce
+#        the same entries, sector schedule and decoded frames.
+#   e23/p34 : Keep the startup PCM origin aligned while giving the Sub CPU a
+#        30-frame boot-prefix queue. The player starts RF5C164 playback
+#        at SYNC_LEAD, where the boot-prefix audio is written, instead of
+#        playing the 0x0000..SYNC_LEAD ring silence first. Thirty startup chunks
+#        are duplicated so the live writer resumes promptly after frame 0; the
+#        queue uses the safe 30-frame window and SYNC_LEAD is
+#        0x3000, avoiding the measured 1.386-second A/V lead.
+#   p32 : Compact the DEBUG HUD to a 5-cell pitch in H32 so all F/P/S/D/R/L
+#        fields fit in the native 32-column plane; H40 retains 6-cell pitch.
+#   p31 : Select H32/H40 from the MOVIE.DAT mode byte. The previous branch
+#        tested the frame pacing N value, so every v4 stream switched to H40.
+#   e21 : mode-aware source geometry harness. Preserve full source pixels with
+#        HAR-aware fit/pad conversion; explicit input SAR overrides support
+#        anamorphic 4:3 sources for H32/H40 encodes.
+#   e1 : Flbk improve-mode default; baseline encoder.
+#   e2 : streaming ring fixes — TANK below RING_SIZE (jitter margin), pack
+#        forward-fill (use all 5 sectors, prefetch the ring reserve), RING_CAP
+#        tied to the player's real RING_SIZE. Enables full-screen H40 (1120-cell).
+#   e3 : full-screen H40 desync fix — root cause = back-pressure ratchet. pack
+#        RING_CAP lowered well below the player's pump_poll back-pressure
+#        threshold (416KB) via CBRSIM_RING_CAP_KB=300 so pump never stalls (no
+#        CDC sector drop). Plus per-frame cold cap CBRSIM_PACK_MAXCOLD. Full ED
+#        now completes clean on hardware (GPGX).
+#   e4 : full-screen H40 quality+stability — RING_CAP raised to 350KB (still below
+#        the 416KB back-pressure threshold) so the ring holds a larger jitter
+#        buffer, letting the per-frame cold cap rise to 260 (from 192). Verified:
+#        the deterministic ring model can NOT predict the collapse (collapse
+#        frames show full occ); RING_CAP is the empirical jitter-margin lever.
+#        Much higher tile-update density; full ED completes clean on hardware.
+#   e5 : per-frame sync marker (frame_seq at the head of each control block) so
+#        the player can detect stream desync. Enables robust slip recovery.
+#   e6 : audio fix — the PCM WAV is pcm_u8 (unsigned, center 128) but the pack
+#        had converted it as signed 8-bit AND fed the WAV header in as samples,
+#        scrambling the waveform (~15% of samples flipped). Now strips the header
+#        (wave module) and converts u8(center 128) -> RF5C164 sign-magnitude
+#        correctly (silence 128 -> 0x00). Audio garble gone.
+#   p1 : baseline PCM player.
+#   p2 : graceful ring underrun (drained scene shows stale/residual, not garbage).
+#   p3 : full-screen H40 completes clean. Fixes: frame0 header loaded via staged
+#        CD->Word-RAM->copy (direct CDC_TRN slips); pump during frame0 decode
+#        (CDC-overflow drop desynced frame1+); f0pat in Word-RAM scratch (no ring
+#        hole); per-frame frame_seq check (detect desync); CD-slip recovery = on
+#        MSF gap, re-seek and re-read the lost sector (exact, no quality loss);
+#        debug HUD S=slip/re-seek count, D=desync count.
+#   p4 : audio glitch fix (the earlier FD-follow / big-lead attempt was REVERTED —
+#        it added growing audio lag — so p4 never shipped until now). Shipped p4 =
+#        SYNC_MIN lowered (0xC00->0x400): the audio write/play lead may dip briefly
+#        at a heavy scene-cut cluster WITHOUT triggering a re-sync. The old re-sync
+#        jumped the write ahead and replayed stale loud data = an audible glitch
+#        (machi_op F1056). Root-caused with an on-HUD instrument (R=audio re-sync
+#        count, L=current lead): the lead troughs ~1467, staying above SYNC_MIN
+#        (1024) and overtake (0), so R stays 1 (no re-sync) and no play-overtake.
+#        Glitch gone at FULL quality (uncapped) with no A/V lag.
+#   e7 : streaming jitter margin — pack RING_CAP raised 350->380 (more prebuffer
+#        for the heavy scene-cut cluster; still below the 416KB back-pressure
+#        threshold, under=0). Fewer CD-sector drops (38->32) with no quality
+#        change (same decisions/cold cap).
+#   e8 : clean stream (zero CD-sector drops) — pack per-frame cold cap
+#        (CBRSIM_PACK_MAXCOLD=200, frame0 excluded so it stays a full load) caps
+#        new-tile load at heavy scene-cut frames so the Sub never overruns the
+#        CDC. S(slip)=0 all the way, steady 15fps, so the fixed-rate PCM stays
+#        A/V-synced (no re-seek pauses, no rewind, no lag). Capped cells hold the
+#        previous frame 1 frame (residual). Resolution/audio unchanged.
+#   e9 : cap moved into the encoder + one source of truth. The cold cap now
+#        lives only in the sim (CBRSIM_MAX_COLD=185, smart reuse), NOT the pack,
+#        so the analysis (from the sim) matches the disc exactly (frame-aligned
+#        corr 1.000; the old pack cap dropped bottom cells stale, corr 0.814).
+#        av_config.py is the single source for ring (RING_SIZE->RING_CAP/TANK,
+#        was drifted 420/380/440) and the drop-safe realized-cold ceiling; the
+#        pack ASSERTS realized cold <= ceiling and refuses a pack-side cap; the
+#        build asserts the player RING_SIZE matches. Result: S=0, analysis==disc.
+#   p5 : Sub-CPU throughput -> higher cold ceiling (better quality). The expand loop
+#        called pump_poll every bitmap byte (~140x/frame on full-screen), each a 15-reg
+#        save + BIOS_CDC_STAT; that fixed overhead made heavy scene-cut frames overrun
+#        the CD (sector slip) above realized cold ~200, forcing a low cap (quality loss).
+#        Now pump_poll runs every 8 bytes (~18x/frame, still ample: 1 CD sector per ~166k
+#        cycles). Measured on full-screen machi_ed: slips vanish up to realized 429 (S=0),
+#        so the cap rises from 195 to 362 (sim cap 350), lifting mean cold 167->230 (+37%)
+#        = the Tank/CD-bandwidth is now spent on fresh tiles instead of wasted. Verified
+#        S=0, R=1, D=0. Also improves machi_op (faster Sub = shallower audio-lead dips).
+#   p6 : debug HUD reposition — the on-screen readout (F/P/S/D/R/L) is now a single
+#        row in the top-left corner with 1-tile gaps (was 2 rows, indented), so it
+#        covers less picture and every value reads on one line. Positions are named
+#        constants (HUD_ROW/HUD_PITCH/HUD_COL_* in movieplay_ip.s), kept in sync with
+#        the capture OCR (tools/read_frameno.py: read_hud). DEBUG-only overlay; the
+#        shipped (non-debug) codec/stream output is unchanged.
+#   e10: CRAM pre-load (MOVIE.DAT v3). All segment palettes ship once in a PALTAB
+#        region after the header; the per-frame control block carries only a 1-byte
+#        segment reference (pal = seg+1) instead of a 128-byte in-stream CRAM payload.
+#        pack_stream.py writes the PALTAB + paltab_sec header field and drops the
+#        in-stream CRAM; sim.py stops deducting the 128-byte palette write from the
+#        switch frame's budget. The rendered pixels are byte-identical to e9 (verified:
+#        machi_op + machi_ed decode_verify diff=0), so this is a delivery/robustness
+#        change, not a look change. Payoff: palettes no longer depend on stream timing
+#        (a CD slip/re-seek can't corrupt a segment's colours) and the heavy scene-cut
+#        switch frame's byte budget is freed — the base for adding more switch points.
+#   p7 : player side of CRAM pre-load. At boot the Sub stages the PALTAB into Word-RAM
+#        and the Main CPU copies it once into a Main-RAM table (PALTAB_MAX_SEG=64, 8 KB);
+#        bf_flip now indexes that table by the 1-byte segment ref instead of reading a
+#        per-frame in-stream CRAM block (CPU CRAM write, same as before — only the source
+#        moves to Main-RAM). av_config.PALTAB_MAX_SEG is the single source, build-asserted
+#        against the player equ. Verified on emulator: full machi_ed plays S=0 D=0 with all
+#        14 segments (P0->P0D) switching to correct colours.
+#   e11: CRAM-switch trigger generalized from "deep black" to "uniform screen" (any flat
+#        colour). A deep blackout is just one case of the screen being one flat colour, so
+#        tile reuse is maximal and a CRAM swap is cheap and its colour pop hidden; a
+#        white-out or any flat-colour fade is an equally cheap switch point. sim.py now
+#        detects uniform frames (fraction of pixels near the frame's mean colour) as a
+#        separate, independent clustering and merges those boundaries in (so it never
+#        bridges/merges the existing dark clusters). machi_op gains 3 switch points it
+#        missed before (two white-outs + a flat stretch, deep mid-segment): 7 -> 10
+#        switches, each giving 48-83% quantization-error reduction on the scene it opens.
+#        machi_ed is unchanged (its long segment 12 has no uniform moment; that needs the
+#        hard-cut path — issue #14, Phase 2). Env: CBRSIM_SEG_UNIFORM / _TOL / _NEAR.
+#   e12: MOVIE.DAT v4(可変フレーム)。5セクタ固定padding廃止(各frame=n_pay+n_ctrl sec)。AUDIO
+#        をfps由来(15=887,30=443)に=旧887固定が30fpsでdiscをCD 1x 8%超過させていた主因。
+#        cold cap基準を15fps=350に(cap(fps)=350*15/fps, 30->175)。真の30fps(N2=29.97)がCD 1x内。
+#   p8 : player v4対応。ヘッダのN(vsync/コマ)/AUDIO読込、pump1を可変フレーム化(0セクタは
+#        read無しでスキップ, (n_pay+n_ctrl)で前進)、音声可変、stream_totalはファイルサイズ。
+#        Sonic H32 30fpsは実機でD=0完走するが Sub pump律速で実効~16fps(スリップ多発)=issue#15待ち。
+#   e13: v4レートマッチpadding。各コマを CD 1x(75 sec/s)の1コマ配送レート(=75/fps セクタ)まで
+#        padding(累積器で整数割当: 15fps→5固定=v3と同一, 30fps→2/3平均)。paddingを外したv4は
+#        ディスクが表示より速く読まれ過剰配送→バッファ溢れ→CDCスリップ(ed実機S=689)していた。
+#        レートマッチで「ディスク読み速度=表示速度」に一致=スリップ根絶。header offset56=名目fps。
+#   p9 : player レートマッチ対応。pump1が fsec=max(n_pay+n_ctrl, ratedelta) セクタで1コマ前進
+#        (padセクタは読んで捨て、累積器sec_accでpackと同期)。h_fps_int@56読込。ip.sのvsync明示
+#        ペーシングは撤去(ディスクがレートマッチ=旧来のデータ律速で正しいfps)。ed実機 S=0 D=0
+#        R=1 15.0fps=v3同等を確認。30fpsも同枠組みで過剰配送ぶんのスリップが減る見込み。
+#   p10: Sub高速化 第1次(issue#15)。律速はcoldでなくSub固定費+per-cellデコードと診断(cap半減でも
+#        16→18.5fpsのみ)。pump_poll頻度削減(expand毎バイト系を64B毎, 音声0x100B毎)、write_wave_chunk
+#        を走行ポインタ化(毎バイトのアドレス再計算廃止)、fetch_control冗長movem削除。Sonic H32 832セル
+#        30fpsが実機16→24fps(+50%)、スリップ168→68、全編D=0。効果は非線形(Sub時間解放→CDC溢れ/再シーク減)。
+#   e14: sim/pack でタイル割り当てを共有(tools/tile_alloc.py, 二段パス連続)。realized cold が
+#        sim cap と厳密一致(旧: LRU vs contig で pack が数枚多く再ロード=realized>cap)。二段パスが
+#        このコマの流用タイルを先に保護→coldスロット割当が追い出さない→再ロード消滅=realized=cap。
+#        cap は cold_cap_for_fps 自動導出・全ソース共有(手動env/uncapped/COLD_CAP_REALIZED廃止)。
+#        画質は op/ed とも旧と同一(Miss不変)、Sonic 30fps は realized 200→175 で ~25→27fps に改善。
+#   p11: Sub-CPU 29.97 fps completion. opt4 tightens the per-cell decode path;
+#        opt5 batches RF5C164 writes as MOVE.L + MOVEP.L (four interleaved PCM
+#        samples per operation). On the same e14 Sonic H32 832-cell disc, a
+#        lossless GPGX capture rises from 26.75 fps to the 29.97 display limit.
+#        Startup is armed in two phases: load the boot prefix, stop while frame
+#        0 is expanded, then continuously read FRAMES after pre-draining frame
+#        1. This removes the one startup sector slip: full loop S=0, D=0 (old
+#        baseline ended S=65), with audio clip/jump gates at zero.
+#   e15/p12: MOVIE.DAT v5 startup PCM arming. The first 17 audio chunks are
+#        duplicated in the boot prefix and queued before PCM starts; matching
+#        control writes are skipped. This preserves the first-sample position
+#        while absorbing the startup phase dip, so R can remain zero.
+#   e16/p13: Extend startup PCM arming to 32 chunks and reduce Sub-CPU fixed
+#        copy cost. The 75 Hz CDC stage copy uses 48-byte MOVEM batches, and
+#        variable control blocks use longword batches instead of word copies.
+#        The stream content and decoded output are unchanged.
+#   p14: Tighten the 896-cell bitmap walk. Shift one bitmap bit per iteration
+#        and advance the cell cursor directly, replacing indexed BTST plus the
+#        add/cmp/branch loop tail. Entry order and O_UPDS output are unchanged.
+#   p15: Reduce redundant CDC readiness polls only at 30fps: one per 128 bitmap
+#        bytes and 512 PCM bytes. The <=20fps path retains its proven 8/256-byte
+#        cadence. Required sectors are still drained synchronously per frame.
+#   p16: Split pump1 into preserving wrapper and non-preserving core. Steady
+#        process_frame/pump_poll callers already save all registers, so they no
+#        longer repeat a 15-register save/restore for every drained sector.
+#   p17: Remove the per-cold ring occupancy calculation. process_frame has
+#        already drained every sector assigned to the frame and pack_stream
+#        proves schedule under=0, so the check always succeeded on valid data.
+#   p18: Keep cold-run count in d3 and strip/derive the cold entry directly in
+#        d2. This removes a PRG-RAM read/write increment and redundant register
+#        moves for every cold tile.
+#   p19: Disable mid-wave CDC polls only at 30fps. The 443-byte PCM write is
+#        bracketed by frame/expand polls and shorter than a sector interval;
+#        <=20fps retains the proven 256-byte wave cadence.
+#   p20: Restore the p18 512-byte 30fps wave poll (p19 regressed S=1 to S=2)
+#        and unroll control-block copying from 16 to 32 bytes per loop. This
+#        halves the branch overhead while preserving the exact byte stream.
+#   p21: Copy control blocks in 44-byte MOVEM batches and clear the absent
+#        22-byte debug block with five longs plus one word. This reduces the
+#        per-frame PRG-to-Word-RAM copy cost without changing output bytes.
+#   p22: Restore p20's faster MOVE.L control copy and add a full-bitmap-byte
+#        path. A 0xFF byte processes eight consecutive updated cells without
+#        per-cell LSR/BCC, targeting the 854/896-update startup frames.
+#   e17: Raise requested startup PCM arming from 32 to 45 frames. The pack
+#        clamps it from AUDIO bytes/frame with a 0x200 safety margin below
+#        SYNC_MAX (45 frames at 30fps, 22 at 15fps).
+#   e190: Treat unwanted deep-black palette entries as nonexistent for
+#         colour reproduction. Every mosaic line carries a forced darkest
+#         entry (in practice pure black); under Bayer dithering a soft dark
+#         halo (source luminance 14-62) quantizes onto it and shows as
+#         isolated too-black specks. A segment now lends its deep-black
+#         entries (RGB333 level sum at most 2) to the quantizer only when
+#         the segment's own Bayer-view pixels are actually black at 3% or
+#         more (Sonic OP: only its one dark segment; Bad Apple: 57%, all
+#         kept). The entries stay in CRAM; assignment and indexing simply
+#         never select them elsewhere. The default dither stays bayer.
+#   p153: Pace playback wave-RAM writes to the RF5C164 spec. The official
+#         MEGA-CD PCM manual (4-5) requires 16 or more source clock cycles
+#         between external wave memory writes while the IC is sounding; the
+#         issue-15 MOVEP.L batch writer strobed every ~6-10 cycles, and the
+#         real chip answers over-fast writes with dropped or corrupted
+#         bytes: continuous periodic hiss on hardware during playback
+#         (issue #81), invisible on emulators and the EverDrive FPGA which
+#         do not model the minimum access period. While sounding the writer
+#         now spaces strobes 20 CPU cycles apart (same 12.5 MHz clock
+#         domain); the boot prefill runs with sounding suspended, where
+#         writes are unrestricted, and keeps the MOVEP fast path.
+#   p154: Extend the RF5C164 access-period compliance to every remaining PCM
+#         access. The wave writer sets control-register bit 7 on every bank
+#         select, so by the manual's own definition the IC is sounding on
+#         every call: p153's "sounding suspended" boot-prefill exemption did
+#         not exist, and the untimed BODY-arm prefill (the first audio the
+#         listener hears) still ran the MOVEP burst. The burst path is
+#         removed outright, so there is one always-paced writer and no state
+#         in which a batched wave write is reachable. Separately, an
+#         internal-register write needs 384 cycles before the next access to
+#         the IC, which the wave-RAM bank select in the control register also
+#         is: the first byte of a bank followed it after 16 cycles and could
+#         still land in the previously selected bank. Every internal-register
+#         write in the writer, pcm_on and pcm_boot_init is now followed by an
+#         explicit 390-cycle delay. Cost is under 0.2% of a frame at 30 fps.
+# e195: exact output-frame ranges for independent CLI multipart encoding.
+# p158: menu-free multipart dispatch, separate specialized player modules,
+#       bounded ISO reads and checked loader memory ownership.
+# p159: reject stale finite-read prefixes and clear the scroll plane on replay.
+# e196: optional seam-aware resident fallbacks during motion.
+# e197: add a lower-amplitude ordered dither for filtered sources.
+# e198: adaptive display updates and advance tile loads on PAL 25.
+# e199: search spatial motion matches and reserve prefetch for hard cuts.
+date=20261115
+e=201
+p=159

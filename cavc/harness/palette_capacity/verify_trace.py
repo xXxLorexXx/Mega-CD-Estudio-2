@@ -1,0 +1,138 @@
+#!/usr/bin/env python3
+"""Check every synthetic movie frame against actual LOGVDP writes."""
+
+import argparse
+import csv
+import gzip
+import re
+import struct
+import sys
+from pathlib import Path
+
+import numpy as np
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "tools"))
+import cavc_routing
+
+
+WRITE = re.compile(
+    r"(VRAM|CRAM) 0x([0-9a-f]+) write -> 0x([0-9a-f]+) \(([0-9a-f]+)\)")
+
+
+def verify(directory: Path, trace: Path, output: Path, min_loops: int) -> None:
+    header = (directory / "HEADER.DAT").read_bytes()
+    frames = cavc_routing.frame_count_from_header(header)
+    table = (directory / "paltab.bin").read_bytes()
+    segments = len(table) // 128
+    index = (directory / "palidx.bin").read_bytes()
+    frame_segments = []
+    cursor = active = 0
+    for frame in range(frames):
+        while cavc_routing.palette_switch_value(
+                *struct.unpack_from(">HH", index, cursor))[0] <= frame:
+            active = cavc_routing.palette_switch_value(
+                *struct.unpack_from(">HH", index, cursor))[1]
+            cursor += 4
+        assert 0 <= active < segments
+        frame_segments.append(active)
+    # LOGVDP prints the VDP's packed 9-bit CRAM value, not the CPU bus word.
+    palettes = [tuple(
+        ((w & 0xE00) >> 3) | ((w & 0xE0) >> 2) | ((w & 0xE) >> 1)
+        for w in struct.unpack_from(">64H", table, segment * 128))
+        for segment in range(segments)]
+    vram = bytearray(65536)
+    cram = [0] * 64
+    hud = []
+    pending = None
+    rows = []
+    counter_faults = []
+    expected_lines = np.arange(40 * 28) % 4
+    expected_patterns = np.full((40 * 28, 32), 0x22, np.uint8)
+    unique_frame0 = (directory / "unique-frame0.flag").exists()
+    if unique_frame0:
+        indices = np.arange(40 * 28) + 0x1000
+        expected_patterns[:, 0] = indices >> 8
+        expected_patterns[:, 1] = indices & 255
+
+    def finish_frame():
+        nonlocal pending
+        if pending is None:
+            return
+        frame, digits = pending
+        expected_frame = len(rows) % frames
+        assert frame == expected_frame, ("frame order", frame, expected_frame)
+        segment = frame_segments[frame]
+        assert tuple(cram) == palettes[segment], ("CRAM", frame, segment)
+        assert digits[4] == segment % 16, ("HUD segment", frame, digits[4])
+        if digits[5:8] != [0, 0, 0]:
+            counter_faults.append((frame, digits[5:8]))
+        entries = np.frombuffer(vram, ">u2", count=2048, offset=0xE000).reshape(
+            32, 64)[:28, :40].reshape(-1)
+        assert np.array_equal((entries >> 13) & 3, expected_lines), ("palette lines", frame)
+        patterns = np.frombuffer(vram, np.uint8).reshape(2048, 32)[entries & 0x7FF]
+        expected_patterns[0, :2] = (1, 255) if frame == frames - 1 else ((0x10, 0) if unique_frame0 else (0x22, 0x22))
+        assert np.array_equal(patterns, expected_patterns), ("patterns", frame)
+        rows.append((len(rows) // frames, frame, segment, digits[4], *digits[5:8]))
+        pending = None
+
+    with gzip.open(trace, "rt", errors="replace") as source:
+        for line in source:
+            if " write -> " not in line:
+                continue
+            match = WRITE.search(line)
+            if not match:
+                continue
+            kind, raw_address, raw_word, raw_pc = match.groups()
+            address, word, pc = (int(value, 16) for value in (raw_address, raw_word, raw_pc))
+            if pc & 0xFF0000 != 0xFF0000:
+                continue
+            if kind == "CRAM":
+                cram[(address & 0x7E) // 2] = word
+                continue
+            address &= 0xFFFF
+            if address == 0xE000:
+                # Finish the displayed state before the next movie NT is written.
+                finish_frame()
+            struct.pack_into(">H", vram, address, word)
+            if not 0xF000 <= address < 0xF050:
+                continue
+            if address == 0xF000:
+                hud = []
+            if address == 0xF000 + len(hud) * 2 and 1744 <= (word & 0x7FF) < 1760:
+                hud.append(word & 15)
+            else:
+                hud = []
+            if len(hud) == 40:
+                frame = int("".join(f"{digit:x}" for digit in hud[:4]), 16)
+                expected = len(rows) % frames
+                if frame != 0xFFFF or expected == 0xFFFF:
+                    assert frame == (expected & 0xFFFF), ("HUD frame", frame, expected)
+                    assert pending is None
+                    pending = (expected, hud)
+                hud = []
+    finish_frame()
+    complete_loops = len(rows) // frames
+    assert complete_loops >= min_loops, ("complete loops", complete_loops, min_loops)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with output.open("w", encoding="utf-8", newline="") as target:
+        writer = csv.writer(target, delimiter="\t", lineterminator="\n")
+        writer.writerow(("loop", "frame", "palette_segment", "hud_palette_low4",
+                         "sector_slip", "control_desync", "audio_resync"))
+        writer.writerows(rows)
+    assert not counter_faults, ("recovery counters", counter_faults[0],
+                                "affected rows", len(counter_faults), "TSV", str(output))
+    print(f"PASS: {len(rows)} displayed frames, {complete_loops} complete loops, "
+          f"all {segments} palettes and every cell/pattern exact; DicBuf entry 511 exact")
+    print(output)
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--fixture", type=Path, required=True)
+    parser.add_argument("--trace", type=Path, required=True)
+    parser.add_argument("--tsv", type=Path, required=True)
+    parser.add_argument("--min-loops", type=int, default=1)
+    args = parser.parse_args()
+    if args.tsv.suffix != ".tsv":
+        parser.error("--tsv must use the .tsv extension")
+    verify(args.fixture, args.trace, args.tsv, args.min_loops)

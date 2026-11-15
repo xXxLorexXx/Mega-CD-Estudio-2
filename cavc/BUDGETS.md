@@ -1,0 +1,504 @@
+EN / [JP](#jp)
+
+# SEGA-CD FMV Budgets
+
+This note collects the first-order tile, DMA, and CD raw-read budgets used when
+choosing encoder targets. Numbers are estimates for NTSC 60 Hz playback.
+
+## Assumptions
+
+- Tile size: 8x8 pixels.
+- Pattern payload: 32 bytes per 4bpp tile.
+- Raw tile update from CD: 34 bytes per tile, counted as 32 bytes pattern plus
+  2 bytes name-table entry.
+- CD rate: 150 KiB/s = 153,600 bytes/s.
+- ADPCM control audio uses about 11,150 bytes/s at the supported cadences.
+  Exact per-frame sizes are documented in `CONFIG.md` and `ADPCM.md`.
+- Raw video CD budget after that audio allowance: about 142,450 bytes/s.
+- The theory table uses `tools/layout_preview.py` timing constants converted to
+  pattern tiles.
+- Tile counts below use pattern bytes only. Name-table DMA still needs to be
+  budgeted separately in a real frame.
+- H40's exact full-width 16:9 height is 180 pixels, which is 22.5 tile rows.
+  The geometry below uses the tile-aligned fit that stays under that height:
+  320x176.
+
+## Screen Geometry
+
+The codec outputs H40: 320x224 visible pixels, a 40x28 tile grid, 1,120 tiles
+in total. The tile-aligned 16:9 area inside it is 320x176 (40x22), or 880
+tiles.
+
+## Theory DMA Per VBlank
+
+| Mode | Active lines | Blanking lines | DMA words/VBlank | Pattern tiles/VBlank |
+|---|---:|---:|---:|---:|
+| H40 | 224 | 38 | 3,888 | 243 |
+
+## DMA Update Budget Per Video Frame
+
+This is the average DMA capacity available per encoded video frame, using the
+GPGX `dmabench` measured values below. Each cell gives exact average DMA words,
+then the number of complete 16-word pattern tiles. At 24 fps, the average is
+2.5 VBlanks per video frame, so the real scheduler would alternate shorter and
+longer gaps.
+
+| Mode | 15 fps words / tiles | 24 fps words / tiles | 30 fps words / tiles |
+|---|---:|---:|---:|
+| H40 | 14,656 / 916 | 9,160 / 572 | 7,328 / 458 |
+
+## CD Raw Read Budget Per Video Frame
+
+The raw-read budget does not depend on the display geometry. This table is the
+CD budget left after the ADPCM allowance above, expressed as raw tile updates;
+it is not a replacement for the exact per-profile scheduler.
+
+| Frame rate | Raw tiles/frame |
+|---|---:|
+| 15 fps | 279 |
+| 24 fps | 174 |
+| 30 fps | 139 |
+
+## Empirical measurement — `dmabench`
+
+Reusable measurement build. `make dmabench` builds `out/DMABENCH.iso`. With the
+default `DMABENCH_RUNS=0`, it binary-searches the largest `Main-RAM → VRAM` DMA
+that finishes inside one VBlank and prints, top-left:
+
+- `W xxxx` = max words per VBlank (hex)
+- `F xxxx` = derived tiles/frame ≈ `(W/16) * 3`
+
+Source: `boot/dmabench_ip.s` (+ `dmabench_boot.s`, stub SP = `cdcbench_sp`).
+**Run it on ares / real hardware for authoritative numbers** — Genesis Plus GX
+is lenient and over-reports.
+
+### Measured (Genesis Plus GX)
+
+| Mode  | DMA words/VBlank | Pattern tiles/VBlank | note |
+|-------|-----------------:|---------------------:|------|
+| H40   | 3,664 | 229 | `W 0E50`; `out/DMABENCH_h40.cue`, screenshot `tmp/dmabench_h40_clean_sheet.jpg` |
+| *ares* | TBD | TBD | run the ISO to fill in |
+
+### Mid-VBlank DMA start (measured)
+
+`make dmabench DMABENCH_DELAY=N` waits N raster lines after the VBlank rise
+(calibrated busy-wait, ~49 dbra iterations per line) before issuing the DMA,
+then binary-searches the largest transfer that still completes inside the same
+VBlank.
+
+The fits check needs more than the VBlank flag: a huge transfer crosses the
+whole active display and completes inside the **next** frame's VBlank with the
+flag set again, so the delayed search converges on an impossible wrap solution.
+`dmabench` therefore also proves same-window completion with a Gate-Array
+stopwatch bound (`FIT_MAX_TICKS`); the guard reproduces the full-window number
+within the 8-word search granularity (H40 `W 0E43` vs `0E50`).
+
+Measured (Genesis Plus GX), words per VBlank against the delay:
+
+| Mode | delay 0 | 10 lines | 19 lines | 29 lines | per-line slope |
+|------|--------:|---------:|---------:|---------:|---------------:|
+| H40  | 3,651 (`W 0E43`) | 2,622 (`W 0A3E`) | 1,708 (`W 06AC`) | 679 (`W 02A7`) | 101.6-102.9 |
+
+Screenshots: `tmp/dmabench_h40_d{10,19,29}_result.png`.
+
+- Capacity falls **linearly** with the start delay. The consecutive-point
+  slopes are constant within measurement granularity and equal the theory
+  per-line rate (3,888 words / 38 lines = 102.3).
+  The per-line DMA rate of the remaining window does not degrade: a mid-VBlank
+  start has no extra rate penalty beyond the lines already lost.
+- The delay-0 total sits about 200-250 words below `slope x 38`: a fixed
+  per-window overhead (VBlank-rise poll latency, DMA register setup, and the
+  completion margin), not a rate effect.
+- Player consequence: the `bf_start_vbudget` rule "full budget only from a
+  proven blank head" stays correct and is not overly pessimistic — a late
+  start loses exactly the elapsed lines' capacity, and there is no cliff
+  beyond that loss. As with every `dmabench` number, confirm on ares / real
+  hardware before relying on the absolute values.
+
+### Repaired Word-RAM multi-run DMA (measured)
+
+The multi-run mode measures the current Main-player whole-run path instead of a
+single Main-RAM DMA:
+
+```sh
+make dmabench DMABENCH_RUNS=N DMABENCH_REPAIR=1
+make dmabench DMABENCH_RUNS=N DMABENCH_REPAIR=0
+```
+
+The shared Sub benchmark program establishes 1M/1M mode and hands a settled
+physical Word-RAM bank to Main. Before timing, Main divides the total payload
+as evenly as possible into `N` 22-byte `O_LOADS v2` records. The timed loop pops
+the pre-swizzled registers from Word RAM, issues each DMA as `src+2` with the
+full length and normal destination, waits for completion, restores the normal
+destination command, and CPU-writes the destination's first word. This matches
+the DEBUG player's unsplit Word-RAM whole-run path, including its logical-word
+accounting and four-unit budget bookkeeping. `DMABENCH_REPAIR=0` keeps the same
+run division, records, source offset, DMA setup, trigger, and completion wait,
+but omits the repair-specific bookkeeping, command restore, source load/check,
+and CPU write.
+
+`W` is the maximum total payload words that complete inside one H40 VBlank.
+`E` is the direct Gate-Array stopwatch result for a fixed 1,024-word payload,
+in 30.72 us ticks, so its slope is independent of the shrinking `W` ceiling.
+All values below are decimal even though the benchmark displays hexadecimal.
+The binary search leaves a range of at most seven words, so 2,495 and an
+earlier 2,499 reading for 16 repaired runs are the same measurement bucket.
+
+| Runs | Repaired `W` words/VBlank | No-repair `W` words/VBlank | Repaired `E` ticks | No-repair `E` ticks |
+|---:|---:|---:|---:|---:|
+| 1 | 3,656 | 3,668 | 22 | 22 |
+| 4 | 3,427 | 3,475 | 27 | 26 |
+| 8 | 3,114 | 3,225 | 34 | 32 |
+| 16 | 2,495 | 2,714 | 46 | 42 |
+| 24 | 1,883 | 2,205 | 59 | 52 |
+| 32 | 1,265 | 1,687 | 72 | 62 |
+
+Linear fits over all six points give:
+
+- Repaired elapsed time: `E = 20.625 + 1.603 * runs` ticks, `R² = 0.99976`.
+  The slope is 49.24 us/run and differs by only 1.3% from the independently
+  observed Bad Apple full-playback HUD coefficient of 1.624 ticks/run.
+- No-repair elapsed time: `E = 21.110 + 1.286 * runs` ticks,
+  `R² = 0.99938`, or 39.52 us/run.
+- Repaired payload ceiling: `W = 3732.84 - 77.14 * runs` words,
+  `R² = 0.999994`.
+- No-repair payload ceiling: `W = 3733.11 - 63.82 * runs` words,
+  `R² = 0.999984`.
+
+The 1.603-tick slope is therefore the cost of one complete repaired run, not
+the repair alone. Subtracting the paired no-repair control isolates the repair
+sequence at 0.317 tick = 9.73 us per run, or 13.32 words/run of lost H40 payload
+capacity. The remaining 1.286 ticks/run and 63.82 words/run are the common
+record-pop, DMA-register, trigger, and completion-poll cost of another run.
+
+The H40 player payload budget is 3,200 words. In this isolated measurement, four
+repaired runs still allow 3,427 words, while eight allow only 3,114. The fitted
+crossing is about seven runs, so the fixed 3,200-word budget is not by itself a
+proof that an arbitrarily fragmented transfer fits one VBlank. The existing
+four-unit `CPU_VDP_WORD_COST` charges the one CPU data-port write; it is not a
+complete time model for the whole repair sequence or the common per-run setup.
+
+These are Genesis Plus GX results with no simultaneous Sub access to the other
+Word-RAM bank. The managed LOGVDP core SHA-256 is
+`51cfd71f338865288e274b271b8ce0d9a1d3dc415688f14db963a29555d9b4ac`.
+Re-measure on ares and real hardware before turning either fitted slope into a
+production budget or run cap.
+
+### The binding limit is the complete pipeline
+
+The pure-DMA ceiling is **not** a sufficient playback limit. Each frame also
+includes:
+
+- Sub-CPU `expand_frame`: 16 PRG→Word-RAM words per cold pop plus interleaved
+  `pump_poll` CD drain.
+- Main-CPU: Word-RAM→Main-RAM stage copy, shadow blit, VBlank-split tile DMA
+  (a full-frame wait each time the per-VBlank word budget `md_vbudget` is
+  exhausted), flip.
+- The two CPUs serialize at the swap handshake.
+
+The cold cap must therefore be qualified with the complete encoder, stream,
+Sub-CPU, Main-CPU, audio, and CD-pump path. A pure DMA benchmark cannot justify
+raising it by itself.
+
+### Encoder cap
+
+Every encode profile supplies its cold-tile ceiling as the required
+`[encoder].cold_cap` value. There is no fps-derived fallback or separate
+diagnostic override. A lower temporary comparison value is expressed by an
+ordinary profile and follows the same artifact and pipeline handoff as the
+qualified profile. Raising a qualified value requires a new source-specific
+full-path qualification.
+
+The pack asserts that every timed frame's realized new-tile loads stay within
+the effective encoded cap and does not re-cap the stream. Frame 0 is exempt
+because `HEADER.DAT` loads it before timed playback. Cells that cannot be
+updated within the cap appear as Miss in the analysis category map, except
+inside an adopted hardware-scroll window, where they appear as Scrl. An
+adopted scroll frame further clamps its per-frame cold/Prg ceiling to
+`SCROLL_SINGLETON_COLD_FRACTION` (0.30) of the qualified cap because its
+fragmented colds transfer as single-run setups (see
+[`CONFIG.md`](CONFIG.md)).
+
+`boot/movieplay_ip.s` sets the VBlank word budget (`md_vbudget`) from
+`VB_WORDS` = 3200. That is below the GPGX ceiling of 3664 words/VBlank.
+Re-check against the ares `dmabench` value before raising it.
+
+## Empirical measurement — `cpuvrambench`
+
+Reusable measurement build for the CPU side of the same budget:
+`make cpuvrambench` builds
+`out/CPUVRAMBENCH.iso`. It binary-searches the largest CPU data-port write
+burst that finishes inside one VBlank, using the player's transfer form
+(`move.l (a0)+,(VDP_DATA).l` in 8-word blocks plus a `move.w` tail, the
+`bf_bw` / `bf_bword` shape), and prints the same top-left rows as `dmabench`:
+
+- `W xxxx` = max CPU-written words per VBlank (hex)
+- `F xxxx` = derived tiles/frame ≈ `(W/16) * 3`
+
+Active-display writes are deliberately not measured: the VDP FIFO is only
+4 words deep, so active-scan CPU writes stall on FIFO slots almost
+immediately and are not a budget path.
+
+Source: `boot/cpuvrambench_ip.s` (+ `cpuvrambench_boot.s`, stub SP =
+`cdcbench_sp`). **Run it on ares / real hardware for authoritative numbers.**
+
+### Measured (Genesis Plus GX)
+
+| Mode | CPU words/VBlank | `dmabench` DMA words/VBlank | DMA/CPU ratio | note |
+|------|-----------------:|----------------------------:|--------------:|------|
+| H40  | 1,160            | 3,664                       | 3.16          | `W 0488`; `out/CPUVRAMBENCH_h40.cue`, screenshot `tmp/cpuvrambench_h40_result.png` |
+| *ares* | TBD            |                             |               | run the ISO to fill in |
+
+The limiter is 68000 instruction time (measured ≈ 16 cycles/word against the
+move.l loop's theoretical ≈ 14.5 plus poll and command-setup overhead), not VDP
+slot supply, which is far above the CPU's demand during blanking.
+
+`CPU_VDP_WORD_COST = 4` in `boot/movieplay_ip.s` charges one CPU-written VDP
+word as four DMA words inside the VBlank budget. The measured GPGX ratio is
+3.16, so the constant over-charges CPU words and stays on the safe side.
+Re-measure the ratio on ares / real hardware before lowering it.
+
+---
+
+<a id="jp"></a>
+
+# SEGA-CD FMVの予算
+
+この文書は、encoder targetを選ぶときに使うtile、DMA、CD raw-readの一次予算を
+まとめます。数値はNTSC 60 Hz再生の見積もりです。
+
+## 前提
+
+- Tile sizeは8x8 pixelです。
+- Pattern payloadは4bpp tileあたり32 byteです。
+- CDからのRaw tile updateは、32-byte patternと2-byte name-table entryを合わせて
+  1 tileあたり34 byteとして数えます。
+- CD rateは150 KiB/s、つまり153,600 byte/sです。
+- ADPCM control audioは、対応cadenceで約11,150 byte/sを使います。正確な
+  frameごとのsizeは`CONFIG.md`と`ADPCM.md`に記載します。
+- このaudio allowanceを引いたRaw videoのCD予算は約142,450 byte/sです。
+- 理論表は`tools/layout_preview.py`のtiming constantをpattern tileへ換算します。
+- 下記のtile数はpattern byteだけを数えます。実frameではname-table DMAを別に
+  予算化する必要があります。
+- H40で横幅全体を使う正確な16:9の高さは180 pixel、つまり22.5 tile rowです。
+  下記のgeometryでは、その高さ以下に収まるtile-aligned fitの320x176を使います。
+
+## Screen geometry
+
+Codecの出力はH40です。Visible resolutionは320x224 pixel、tile gridは40x28、
+合計1,120 tileです。その内側のtile-aligned 16:9 areaは320x176（40x22）で、
+880 tileです。
+
+## VBlankあたりの理論DMA
+
+| Mode | Active lines | Blanking lines | DMA words/VBlank | Pattern tiles/VBlank |
+|---|---:|---:|---:|---:|
+| H40 | 224 | 38 | 3,888 | 243 |
+
+## Video frameあたりのDMA update予算
+
+下表は、encode済みvideo frameごとに使える平均DMA capacityです。値は
+下記GPGX `dmabench`の実測値を使います。各cellは、正確な平均DMA word数、
+その次に16 wordの完全なpattern tile数を示します。24 fpsではvideo frameあたり
+平均2.5 VBlankなので、実schedulerは短い間隔と長い間隔を交互に使います。
+
+| Mode | 15 fps words / tiles | 24 fps words / tiles | 30 fps words / tiles |
+|---|---:|---:|---:|
+| H40 | 14,656 / 916 | 9,160 / 572 | 7,328 / 458 |
+
+## Video frameあたりのCD raw-read予算
+
+Raw-read予算は表示geometryに依存しません。下表は上記ADPCM allowanceを引いたCD予算を
+raw tile update数で表したもので、profileごとの正確なschedulerの代わりではありません。
+
+| Frame rate | Raw tiles/frame |
+|---|---:|
+| 15 fps | 279 |
+| 24 fps | 174 |
+| 30 fps | 139 |
+
+## 実測 — `dmabench`
+
+再利用可能なmeasurement buildです。`make dmabench`は`out/DMABENCH.iso`を
+buildします。既定の
+`DMABENCH_RUNS=0`では、1 VBlank内に完了する最大の`Main-RAM → VRAM` DMAを
+binary searchし、左上に次を表示します。
+
+- `W xxxx` = VBlankあたりの最大word数（hex）
+- `F xxxx` = 導出したtiles/frame、約`(W/16) * 3`
+
+Sourceは`boot/dmabench_ip.s`です（`dmabench_boot.s`と、stub SP =
+`cdcbench_sp`も使用）。**権威ある数値にはaresまたは実機で実行してください。**
+Genesis Plus GXは判定が緩く、大きすぎる値を報告します。
+
+### 実測値（Genesis Plus GX）
+
+| Mode | DMA words/VBlank | Pattern tiles/VBlank | note |
+|---|---:|---:|---|
+| H40 | 3,664 | 229 | `W 0E50`、`out/DMABENCH_h40.cue`、screenshot `tmp/dmabench_h40_clean_sheet.jpg` |
+| *ares* | TBD | TBD | ISOを実行して記入 |
+
+### VBlank途中開始のDMA（実測）
+
+`make dmabench DMABENCH_DELAY=N`は、VBlank立ち上がりから
+Nライン（較正済みbusy-wait、約49 dbra/ライン）待ってからDMAを発行し、同じVBlank内に
+完了する最大転送をbinary searchします。
+
+fits判定はVBlankフラグだけでは不十分です。巨大な転送はactive display全体を跨いで
+**次の**frameのVBlank中に完了し、フラグが再び立っているため、遅延ありの探索は
+物理的に不可能なwrap解に収束します。そのため
+`dmabench`はGate Array stopwatchの上限（`FIT_MAX_TICKS`）で同一window内完了も
+証明します。このguardは全window値を探索粒度（8語）以内で再現します
+（H40 `W 0E43` vs `0E50`）。
+
+実測（Genesis Plus GX）、遅延に対するVBlankあたり語数:
+
+| Mode | delay 0 | 10ライン | 19ライン | 29ライン | ラインあたり傾き |
+|------|--------:|---------:|---------:|---------:|-----------------:|
+| H40  | 3,651 (`W 0E43`) | 2,622 (`W 0A3E`) | 1,708 (`W 06AC`) | 679 (`W 02A7`) | 101.6〜102.9 |
+
+Screenshot: `tmp/dmabench_h40_d{10,19,29}_result.png`。
+
+- 容量は開始遅延に対して**線形**に減ります。隣接点の傾きは測定粒度内で一定で、
+  理論のラインあたりレート（3,888語/38ライン = 102.3）と
+  一致します。残りwindowのラインあたりDMAレートは劣化しません。VBlank途中開始に、
+  失ったライン分を超える追加のレートペナルティはありません。
+- delay 0の合計は`傾き × 38`より約200〜250語小さい値です。これはwindowあたりの
+  固定overhead（VBlank立ち上がりのpoll遅れ、DMA register設定、完了margin）であり、
+  レートの効果ではありません。
+- Playerへの帰結: `bf_start_vbudget`の「証明されたblank headからのみ全budget」の
+  ruleは正しく、過度に悲観的でもありません。遅い開始は経過ライン分の容量を正確に
+  失うだけで、それを超える崖はありません。他の`dmabench`値と同様、絶対値に依存する
+  前にares / 実機で確認してください。
+
+### 先頭word補修付きWord RAM多run DMA（実測）
+
+多run modeは、単一のMain-RAM DMAではなく、現行Main playerのwhole-run経路を
+測ります。
+
+```sh
+make dmabench DMABENCH_RUNS=N DMABENCH_REPAIR=1
+make dmabench DMABENCH_RUNS=N DMABENCH_REPAIR=0
+```
+
+共有Sub benchmark programが1M/1M modeを設定し、settle済みの物理Word-RAM bankをMainへ
+渡します。Mainは計時前に総payloadをできるだけ均等な`N`本の22-byte
+`O_LOADS v2` recordへ分けます。計時loopはWord RAMからpre-swizzle済みregisterを
+popし、各DMAを`src+2`、full length、normal destinationで発行します。そして完了を
+待ち、normal destination commandを復元し、destinationの先頭wordをCPU writeします。
+これはDEBUG playerの未分割Word-RAM whole-run経路と同じで、logical-word集計と4-unitの
+budget簿記も含みます。`DMABENCH_REPAIR=0`はrun分割、record、source offset、
+DMA setup、trigger、完了待ちを同じに保ち、補修固有のbudget簿記、command復元、
+source load/check、CPU writeだけを省いた対照です。
+
+`W`は、1回のH40 VBlank内に完了する総payloadの最大word数です。`E`は、固定
+1,024-word payloadに対するGate-Array stopwatchの直接値で、単位は30.72 us tickです。
+そのため、その傾きは縮小する`W` ceilingに影響されません。Benchmarkの画面表示は
+16進ですが、下表はすべて10進値です。Binary searchには最大7 wordの幅が残るため、
+補修あり16 runの2,495と、先に得た2,499は同じ測定bucketです。
+
+| Runs | 補修あり`W` words/VBlank | 補修なし`W` words/VBlank | 補修あり`E` ticks | 補修なし`E` ticks |
+|---:|---:|---:|---:|---:|
+| 1 | 3,656 | 3,668 | 22 | 22 |
+| 4 | 3,427 | 3,475 | 27 | 26 |
+| 8 | 3,114 | 3,225 | 34 | 32 |
+| 16 | 2,495 | 2,714 | 46 | 42 |
+| 24 | 1,883 | 2,205 | 59 | 52 |
+| 32 | 1,265 | 1,687 | 72 | 62 |
+
+6点すべての直線fitは次の値です。
+
+- 補修ありの経過時間: `E = 20.625 + 1.603 * runs` ticks、`R² = 0.99976`。
+  傾きは49.24 us/runで、別に観測したBad Apple全編再生HUDの1.624 ticks/runとの差は
+  1.3%だけです。
+- 補修なしの経過時間: `E = 21.110 + 1.286 * runs` ticks、
+  `R² = 0.99938`、または39.52 us/runです。
+- 補修ありのpayload ceiling: `W = 3732.84 - 77.14 * runs` words、
+  `R² = 0.999994`です。
+- 補修なしのpayload ceiling: `W = 3733.11 - 63.82 * runs` words、
+  `R² = 0.999984`です。
+
+したがって1.603-tickの傾きは、完全な補修付きrun 1本のcostであり、補修だけの
+costではありません。対の補修なし結果を引くと、補修sequence固有分はrunあたり
+0.317 tick = 9.73 us、H40 payload capacityの減少では13.32 words/runと分かります。
+残る1.286 ticks/runと63.82 words/runは、別runに共通のrecord pop、DMA register、trigger、
+完了pollのcostです。
+
+H40 playerのpayload budgetは3,200 wordです。この単独実測では、補修あり4 runは
+3,427 wordを許しますが、8 runは3,114 wordしか許しません。Fitの交点は約7 runであり、
+固定3,200-word budgetだけでは、任意に分断された転送が1 VBlankに収まる証明には
+なりません。現行の4-unit `CPU_VDP_WORD_COST`は、CPU data-port write 1語をchargeします。
+これは補修sequence全体や共通のrunごとのsetupを表す完全な時間modelではありません。
+
+これらは、Subが反対側のWord-RAM bankを同時accessしていないGenesis Plus GXでの結果です。
+管理LOGVDP coreのSHA-256は
+`51cfd71f338865288e274b271b8ce0d9a1d3dc415688f14db963a29555d9b4ac`です。どちらのfit傾きも、
+production budgetまたはrun capへ変える前にaresと実機で測り直してください。
+
+### 制約になるのはpipeline全体
+
+Pure-DMA ceilingだけでは再生上限を決められません。各frameには次の処理も含まれます。
+
+- Sub CPUの`expand_frame`: cold popごとに16 wordをPRGからWord-RAMへ送り、その間に
+  `pump_poll`でCDをdrainします。
+- Main CPU: Word-RAMからMain-RAMへのstage copy、shadow blit、VBlankに分割したtile DMA、
+  flipを行います。VBlankごとのword予算`md_vbudget`を使い切るたびに1 display frame
+  待ちます。
+- 2つのCPUはswap handshakeで直列化されます。
+
+したがってcold capは、encoder、stream、Sub CPU、Main CPU、audio、CD pumpを含む
+完全な経路でqualificationする必要があります。Pure DMA benchmarkだけではcap引き上げの
+根拠になりません。
+
+### Encoder cap
+
+すべてのencode profileが、必須の`[encoder].cold_cap`としてcold-tile ceilingを指定
+します。fps由来fallbackや別の診断overrideはありません。比較用に小さい値を使う場合も
+通常のprofileへ書き、qualification済みprofileと同じartifact・pipeline handoffを通し
+ます。Qualification済みの値を引き上げる場合は、source固有の全経路qualificationを
+新しく行います。
+
+Packは各timed frameの実new-tile loadがencode時のeffective cap以内にあることをassertし、
+streamへ別のcapをかけません。Frame 0は`HEADER.DAT`によってtimed playback前にload
+されるため対象外です。Cap内で更新できないcellは、解析category mapでMissとして表示します。
+ただし採用hardware-scroll window中はScrlとして表示します。採用scroll frameはさらに、
+frameごとのcold/Prg上限を認定済みcapの`SCROLL_SINGLETON_COLD_FRACTION`（0.30）へ
+clampします。断片化したcoldが単独run setupとして転送されるためです
+（[`CONFIG.md`](CONFIG.md)参照）。
+
+`boot/movieplay_ip.s`は`VB_WORDS` = 3200からVBlank word予算`md_vbudget`を
+設定します。これはGPGX ceiling（3664 word/VBlank）より小さい値です。引き上げる
+前に、aresの`dmabench`値と照合してください。
+
+## 実測 — `cpuvrambench`
+
+同じ予算のCPU側を測る再利用可能なmeasurement buildです。
+`make cpuvrambench`が
+`out/CPUVRAMBENCH.iso`をbuildします。1VBLANKに収まる最大のCPU data port書き込みを
+二分探索します。転送形はplayerの実経路（`move.l (a0)+,(VDP_DATA).l`の8語ブロック +
+`move.w`端数、`bf_bw` / `bf_bword`と同形）で、`dmabench`と同じ左上表示を出します:
+
+- `W xxxx` = VBlankあたりの最大CPU書き込み語数（hex）
+- `F xxxx` = 換算タイル/コマ ≈ `(W/16) * 3`
+
+Active中は意図的に測りません: VDP FIFOは4語深しかなく、active scan中のCPU書きは
+ほぼ即座にFIFO slot待ちになるため、予算経路ではありません。
+
+Sourceは`boot/cpuvrambench_ip.s`です（`cpuvrambench_boot.s`と、stub SP =
+`cdcbench_sp`）。**Authoritativeな値はares / 実機で測り直してください。**
+
+### 実測値（Genesis Plus GX）
+
+| Mode | CPU語/VBlank | `dmabench` DMA語/VBlank | DMA/CPU比 | note |
+|------|-------------:|------------------------:|----------:|------|
+| H40  | 1,160        | 3,664                   | 3.16      | `W 0488`、`out/CPUVRAMBENCH_h40.cue`、screenshot `tmp/cpuvrambench_h40_result.png` |
+| *ares* | TBD        |                         |           | ISOを実行して記入 |
+
+律速はVDP slot供給ではなく68000の命令時間
+（実測 ≈ 16 cycle/語。move.lループの理論値 ≈ 14.5にpollとcommand設定のoverheadが
+乗った値）で、blanking中のslot供給はCPUの需要を大きく上回ります。
+
+`boot/movieplay_ip.s`の`CPU_VDP_WORD_COST = 4`は、CPUで書く1 VDP語をVBlank予算上
+DMA 4語としてchargeします。GPGX実測の比は3.16なので、この定数は
+CPU語を多めにchargeする安全側です。引き下げる前にares / 実機で比を測り直して
+ください。
