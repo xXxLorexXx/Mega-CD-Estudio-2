@@ -2279,8 +2279,11 @@ def main():
             or frozen_list.shape != recomputed_list.shape
             or not np.array_equal(frozen_list, recomputed_list)):
         raise SystemExit("pack: shadow update cycle model differs from frozen sim decision")
-    if np.any(update_lists & (recomputed_list >= recomputed_legacy)):
-        frame = int(np.flatnonzero(update_lists & (recomputed_list >= recomputed_legacy))[0])
+    optional_lists = update_lists & (
+        frame_types != shadow_updates.FRAME_SCROLL)
+    if np.any(optional_lists & (recomputed_list >= recomputed_legacy)):
+        frame = int(np.flatnonzero(
+            optional_lists & (recomputed_list >= recomputed_legacy))[0])
         raise SystemExit(f"pack: selected shadow list is not faster at frame {frame}")
     blocks, source_pcm_chunks = build_control(
         log, per, n_upd, audio_path, supply_plan.sources, update_lists,
