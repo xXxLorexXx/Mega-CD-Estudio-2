@@ -390,14 +390,14 @@ class StudioLayout:
         ttk.Label(brand, text="Mega CD Estudio", style="Title.TLabel").pack(anchor="w")
         self.tagline = ttk.Label(brand, text="Vídeo para Sega Mega CD", style="BrandNote.TLabel")
         self.tagline.pack(anchor="w")
-        badge = tk.Canvas(self.header, width=px(108), height=px(30), bg=BG,
+        badge = tk.Canvas(self.header, width=px(126), height=px(30), bg=BG,
                           highlightthickness=0, bd=0)
         badge.pack(side="right")
-        w, h, r = px(108), px(30), px(12)
+        w, h, r = px(126), px(30), px(12)
         badge.create_oval(0, 0, 2*r, h-1, fill="#352b4f", outline="")
         badge.create_rectangle(r, 0, w-r, h-1, fill="#352b4f", outline="")
         badge.create_oval(w-2*r, 0, w-1, h-1, fill="#352b4f", outline="")
-        badge.create_text(w/2, h/2, text="VERSIÓN 13", fill="#e2d6ff", font=(FONT, 10, "bold"))
+        badge.create_text(w/2, h/2, text="VERSIÓN 14.1", fill="#e2d6ff", font=(FONT, 10, "bold"))
 
         self.nav = Surface(root, px, padding=px(4), fill="#1a1925", radius=12)
         self.nav.pack(side="top", fill="x", pady=(0, px(13)))

@@ -13,6 +13,8 @@ import sys
 import tempfile
 import time
 
+from runtime_paths import desktop_workspace
+
 
 job = Path(sys.argv[1]).resolve()
 settings = json.loads((job / "job.json").read_text(encoding="utf-8"))
@@ -31,15 +33,22 @@ os.environ["OPENBLAS_NUM_THREADS"] = "1"
 os.environ["M68K_PREFIX"] = "/usr/bin/m68k-linux-gnu-"
 os.environ["PYTHON"] = sys.executable
 os.environ["ASTRA_PROGRESS_FILE"] = str(job / "progress.jsonl")
-# The image sequence and numeric cache live on Linux storage. Source videos
-# and finished discs remain on the Windows volume.
-workspace_root = Path(os.environ.get("CAVC_WORKSPACE_ROOT",
-                     str(Path.home() / ".local/share/mega-cd-estudio/cavc81-workspace")))
+# Keep temporary frames together so per-part materialization can use hardlinks.
+default_workspace = Path.home() / ".local/share/mega-cd-estudio/cavc81-workspace"
+override = os.environ.get("CAVC_WORKSPACE_ROOT")
+if override:
+    workspace_root = Path(override)
+else:
+    seconds = sum(float(item.get("length") or item.get("duration") or 0)
+                  for item in settings["sources"])
+    workspace_root = desktop_workspace(default_workspace, round(seconds * fps), width, height)
 workspace_root.mkdir(parents=True, exist_ok=True)
 workspace = tempfile.TemporaryDirectory(prefix=job.name + "-", dir=workspace_root)
 atexit.register(workspace.cleanup)
 os.environ["CAVC_WORKSPACE_ROOT"] = workspace.name
-os.environ.setdefault("SEGACD_RESOURCE_ROOT", str(workspace_root / "resources"))
+os.environ.setdefault("SEGACD_RESOURCE_ROOT", str(Path(override or default_workspace) / "resources"))
+if workspace_root != default_workspace:
+    print(f"Fotogramas temporales en {workspace_root}", flush=True)
 # Accept jobs from the previous Windows launcher as well.
 encoding_profile = settings.get("profile", "fast" if settings.get("fast", True) else "detailed")
 if encoding_profile not in ("fast", "detailed", "sharp"):
@@ -58,7 +67,10 @@ if settings.get("acceleration") != "cpu":
         os.environ["ASTRA_INPUT_CUDA"] = "1"
 os.environ["ASTRA_DESKTOP_PARTS"] = "1"
 os.environ["ASTRA_PART_WORKERS"] = str(settings.get("part_workers", 1))
-os.environ["ASTRA_HOST_FREE"] = str(shutil.disk_usage(job).free)
+# 14.1: each part seeks to its own range of the source (bit-identical frames)
+# instead of one whole-film extraction that needs tens of GB of free space.
+os.environ["ASTRA_SEEK_EXTRACT"] = "1"
+os.environ["ASTRA_DISABLE_SHARED_INPUT"] = "1"
 lore_audio = ('audio_rate = 18000\naudio_filter = "loudnorm=I=-19:TP=-2:LRA=11"'
               if lore else "")
 lore_video = 'output_dither = "soft-bayer"' if lore else ""
@@ -69,7 +81,8 @@ os.environ.setdefault("CBRSIM_LOOP_PROFILE", "0")
 
 import av_config
 import sim_artifact_cache
-from astra_capacity import CD_BYTES, MAX_PARTS, estimate
+from astra_capacity import (CD_BYTES, MAX_PARTS, MAX_PART_FRAMES, MAX_TOTAL_PARTS, MEMORY_FIXED,
+                            MEMORY_PER_FRAME, SCENE_SLACK, estimate, part_limit)
 from encode_config import load_profile
 from astra_progress import emit
 from video_geometry import HAR_NUM, HAR_DEN, parse_ratio, raw_filter
@@ -206,11 +219,34 @@ algorithm = "{settings['palette']}"
 frames = max(2, round(duration * fps))
 parts, estimated_iso_bytes = estimate(duration, fps, settings["part_minutes"],
                                       settings.get("preview_mp4", False))
-if parts > MAX_PARTS:
-    raise SystemExit(f"CAVC y LORE admiten hasta {MAX_PARTS} partes por CD.")
-if not settings["preview"] and estimated_iso_bytes > CD_BYTES:
+multi_disc = bool(settings.get("multi_disc", False)) and not settings["preview"]
+limit = part_limit(fps, settings["part_minutes"], settings.get("preview_mp4", False), frames)
+scene_split = bool(settings.get("scene_split")) and parts > 1
+slack = SCENE_SLACK if scene_split else 1.0
+if frames > MAX_PART_FRAMES and limit > MAX_PART_FRAMES:
+    # Long chapters need memory in proportion to their length. Shorten them to
+    # what this WSL session can hold instead of failing an hour later.
+    available = next((int(line.split()[1]) * 1024 for line in Path("/proc/meminfo").read_text().splitlines()
+                      if line.startswith("MemAvailable:")), 0)
+    fits = int((available * 0.85 - MEMORY_FIXED) // MEMORY_PER_FRAME / slack)
+    if available and fits < limit:
+        limit = max(MAX_PART_FRAMES, fits)
+        parts, estimated_iso_bytes = estimate(duration, fps, limit / (60 * fps),
+                                              settings.get("preview_mp4", False))
+        print(f"Memoria de WSL disponible: {available / 1024**3:.1f} GB. Los capítulos se acortan "
+              f"a {limit // fps // 60}:{limit // fps % 60:02d} ({parts} capítulos) para que quepan.",
+              flush=True)
+# Hard ceiling per chapter: the nominal length plus the shot-change slack.
+os.environ["ASTRA_PART_LIMIT_FRAMES"] = str(round(limit * slack))
+if parts > (MAX_TOTAL_PARTS if multi_disc else MAX_PARTS):
+    raise SystemExit(f"CAVC y LORE admiten hasta {MAX_PARTS} partes por CD. "
+                     "Elige capítulos más largos.")
+if not settings["preview"] and estimated_iso_bytes > CD_BYTES and not multi_disc:
     raise SystemExit(f"La estimación conservadora de {codec} supera la capacidad "
-                     "de un CD de 80 minutos. Divide la película en varios discos.")
+                     "de un CD de 80 minutos. Activa «Dividir en varios CD» o divide la película.")
+if scene_split:
+    os.environ["ASTRA_SCENE_SPLIT"] = "1"
+    print("Los cortes entre capítulos se ajustarán a un cambio de escena cercano.", flush=True)
 source_stamp = sim_artifact_cache.source_stamp(Path(source).resolve())
 source_hash = sim_artifact_cache.source_identity(source)["sha256"]
 os.environ["ASTRA_SOURCE_PROOF"] = json.dumps([source_stamp, source_hash])
@@ -222,7 +258,8 @@ if parts == 1:
     encode = (sys.executable, "-u", "tools/sim.py", config)
 else:
     encode = (sys.executable, "-u", "tools/multipart.py", config,
-              "--parts", str(parts), "--security-region", region)
+              "--parts", str(parts), "--security-region", region,
+              *(("--multi-disc",) if multi_disc else ()))
 if not run(*encode, allow_retry=not fast and region != "eu"):
     print("Reintentando con prelectura de patrones desactivada…", flush=True)
     profile.write_text(profile.read_text(encoding="utf-8").replace(
@@ -234,30 +271,55 @@ emit("build")
 if parts == 1:
     run("make", "disc", f"CONFIG={config}", f"SECURITY_REGION={region}")
 
-images = list(Path("out").glob(f"{job.name}*_release.iso"))
-if len(images) != 1:
-    raise SystemExit(f"No se identificó la ISO generada por {codec}.")
-iso = images[0]
+def disc_checks(iso):
+    cue = iso.with_suffix(".cue")
+    with iso.open("rb") as stream:
+        header = stream.read(512)
+    expected = {"jp": b"J", "us": b"U", "eu": b"E"}[region]
+    if header[:14] != b"SEGADISCSYSTEM" or header[0x1F0:0x1F1] != expected:
+        raise SystemExit(f"Cabecera o región incorrecta en la ISO: {iso.name}")
+    if not cue.is_file() or iso.name not in cue.read_text(encoding="utf-8") or iso.stat().st_size > CD_BYTES:
+        raise SystemExit(f"CUE incompleto o imagen mayor de 700 MiB: {iso.name}")
+    return cue
+
+
+disc_list = []
 if parts == 1:
+    images = list(Path("out").glob(f"{job.name}*_release.iso"))
+    if len(images) != 1:
+        raise SystemExit(f"No se identificó la ISO generada por {codec}.")
+    iso = images[0]
     from multipart_build import verify_iso
     verify_iso(iso, job / "disc")
     from player_constants import parse_header_sector
     with (job / "disc" / "HEADER.DAT").open("rb") as stream:
         frames = parse_header_sector(stream.read(2048)).frames
+    receipt = None
+    disc_list.append({"iso": iso, "parts": 1, "frames": frames})
 else:
-    receipts = list(Path("out").glob(f"{job.name}*/multipart*_release.json"))
-    receipt = next(json.loads(path.read_text(encoding="utf-8"))
-                   for path in receipts
-                   if Path(json.loads(path.read_text(encoding="utf-8"))["iso"]).name == iso.name)
-    frames = sum(item["frames"] for item in receipt["items"])
-cue = iso.with_suffix(".cue")
-with iso.open("rb") as stream:
-    header = stream.read(512)
-expected = {"jp": b"J", "us": b"U", "eu": b"E"}[region]
-if header[:14] != b"SEGADISCSYSTEM" or header[0x1F0:0x1F1] != expected:
-    raise SystemExit("Cabecera o región incorrecta en la ISO.")
-if not cue.is_file() or iso.name not in cue.read_text(encoding="utf-8") or iso.stat().st_size > CD_BYTES:
-    raise SystemExit("CUE incompleto o imagen mayor de 700 MiB.")
+    receipts = [json.loads(path.read_text(encoding="utf-8"))
+                for path in Path("out").glob(f"{job.name}*/multipart*_release.json")]
+    receipts = [item for item in receipts if (Path("out") / Path(item["iso"]).name).is_file()]
+    split = sorted((item for item in receipts if item.get("disc")), key=lambda item: item["disc"][0])
+    if split:
+        count = split[0]["disc"][1]
+        if [item["disc"] for item in split] != [[i, count] for i in range(1, count + 1)]:
+            raise SystemExit(f"Faltan discos de {codec}: se esperaban {count}.")
+        receipts = split
+    else:
+        receipts = [item for item in receipts if not item.get("disc")]
+        if len(receipts) != 1:
+            raise SystemExit(f"No se identificó la ISO generada por {codec}.")
+    for item in receipts:
+        # Receipts hold absolute WSL paths; Windows joins result paths to cavc/.
+        disc_list.append({"iso": Path("out") / Path(item["iso"]).name, "parts": len(item["items"]),
+                          "frames": sum(part["frames"] for part in item["items"])})
+    receipt = {"items": [part for item in receipts for part in item["items"]]}
+    frames = sum(disc["frames"] for disc in disc_list)
+    iso = disc_list[0]["iso"]
+for disc in disc_list:
+    disc["cue"] = disc_checks(disc["iso"])
+cue = disc_list[0]["cue"]
 def digest(path):
     with path.open("rb") as stream:
         return hashlib.file_digest(stream, "sha256").hexdigest()
@@ -291,6 +353,9 @@ sim_artifact_cache.source_identity(source)
 emit("ready")
 (job / "result.json").write_text(json.dumps({
     "iso": str(iso), "cue": str(cue), "parts": parts, "frames": frames,
+    "discs": [{"iso": str(disc["iso"]), "cue": str(disc["cue"]), "parts": disc["parts"],
+               "frames": disc["frames"], "iso_sha256": digest(disc["iso"]),
+               "cue_sha256": digest(disc["cue"])} for disc in disc_list],
     "region": region, "codec": codec, "profile": encoding_profile, "preview": str(preview.relative_to(Path.cwd())) if preview else None,
     "iso_sha256": digest(iso), "cue_sha256": digest(cue),
     "checks": ["packed_stream", "disc_image"],

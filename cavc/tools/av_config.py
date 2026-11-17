@@ -279,7 +279,11 @@ NTSC_VSYNC = 60_000 / 1001
 PAL = os.environ.get("ASTRA_CAVC_REGION") == "eu"
 PHYSICAL_VSYNC = Fraction(53_203_424, 3420 * 313) if PAL else Fraction(53_693_175, 3420 * 262)
 NOMINAL_VSYNC = 50 if PAL else NTSC_VSYNC
-CD_SECTORS_PER_VBLANK = Fraction(3, 2) if PAL else Fraction(1001, 800)
+LEGACY_PAL_SECTORS_PER_VBLANK = Fraction(3, 2)
+# Fit the physical PAL rate into the player's 16-bit phase accumulator.
+PAL_CD_SECTORS_PER_VBLANK = (Fraction(75 * 3420 * 313, 53_203_424)
+                             .limit_denominator(4096))
+CD_SECTORS_PER_VBLANK = PAL_CD_SECTORS_PER_VBLANK if PAL else Fraction(1001, 800)
 _INTEGER_VBLANK_TOLERANCE = 0.01
 # Fixed display pacing is currently practical through N=4.  Larger intervals
 # would regularly need more than the routing format's five useful sectors per
@@ -423,20 +427,20 @@ def fixed_cd_sector_rate(vsync_n):
     return numerator // divisor, modulus // divisor
 
 
-def cd_sector_rate_steps(fps):
+def cd_sector_rate_steps(fps, *, exact_pal=True):
     """Return per-cadence-step CD numerators and their shared modulus.
 
-    Each VBlank supplies 1001/800 of a CD sector. A periodic display cadence
-    therefore needs a periodic physical-deadline accumulator too; replacing a
-    2/3 pattern with its average would overfund the first short interval.
+    Use the region's sector clock for each interval. The flag on an older
+    PAL stream can select the original nominal 50-Hz schedule.
     """
     value = float(fps)
     if value <= 0:
         raise ValueError(f"fps must be positive, got {fps!r}")
     cadence = vblank_cadence_pattern(value)
     if cadence is not None:
-        numerators = tuple(CD_SECTORS_PER_VBLANK.numerator * interval for interval in cadence)
-        modulus = CD_SECTORS_PER_VBLANK.denominator
+        rate = LEGACY_PAL_SECTORS_PER_VBLANK if PAL and not exact_pal else CD_SECTORS_PER_VBLANK
+        numerators = tuple(rate.numerator * interval for interval in cadence)
+        modulus = rate.denominator
         divisor = modulus
         for numerator in numerators:
             divisor = math.gcd(divisor, numerator)

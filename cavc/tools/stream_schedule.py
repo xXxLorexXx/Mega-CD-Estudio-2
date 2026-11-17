@@ -439,10 +439,10 @@ def select_shadow_update_lists(
     }
 
 
-def rate_deltas(frame_count, fps):
+def rate_deltas(frame_count, fps, *, exact_pal=True):
     """Return the CD-1x sector allowance for BODY frames 1..N-1."""
     try:
-        rate_steps, rate_mod = av_config.cd_sector_rate_steps(fps)
+        rate_steps, rate_mod = av_config.cd_sector_rate_steps(fps, exact_pal=exact_pal)
     except ValueError as exc:
         raise ScheduleError(str(exc)) from exc
     out = np.zeros(int(frame_count), np.int64)
@@ -454,7 +454,7 @@ def rate_deltas(frame_count, fps):
     return out
 
 
-def rate_match_sectors(payload_sectors, control_sectors, *, fps):
+def rate_match_sectors(payload_sectors, control_sectors, *, fps, exact_pal=True):
     """Apply the player's bounded CD-rate accumulator to a routing table.
 
     The accumulator remains identical to the player, but an accepted
@@ -466,7 +466,7 @@ def rate_match_sectors(payload_sectors, control_sectors, *, fps):
     n_ctrl = np.asarray(control_sectors, np.int64)
     if n_pay.shape != n_ctrl.shape or n_pay.ndim != 1:
         raise ValueError("payload and control sectors must be equal-length vectors")
-    ratedelta = rate_deltas(len(n_pay), fps)
+    ratedelta = rate_deltas(len(n_pay), fps, exact_pal=exact_pal)
     fsec = np.zeros(len(n_pay), np.int64)
     lead_trace = np.zeros(len(n_pay), np.int64)
     lead = 0

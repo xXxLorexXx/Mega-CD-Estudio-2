@@ -1386,6 +1386,9 @@
 # e197: add a lower-amplitude ordered dither for filtered sources.
 # e198: adaptive display updates and advance tile loads on PAL 25.
 # e199: search spatial motion matches and reserve prefetch for hard cuts.
-date=20261115
-e=201
-p=159
+# e202/p160: match PAL disc scheduling to the physical clock and recover boot reads.
+# p161: keep the loader's Word-RAM mode and distinguish startup timeout stages.
+# p162: read the initial movie metadata with the resident player in one extent.
+date=20261116
+e=202
+p=162

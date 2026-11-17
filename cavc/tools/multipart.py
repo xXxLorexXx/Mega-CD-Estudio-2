@@ -17,6 +17,7 @@ import subprocess
 import sys
 import time
 import uuid
+from fractions import Fraction
 
 import astra_extract
 from astra_progress import emit
@@ -29,7 +30,12 @@ import tmpfs_workspace
 from source_range import frame_range
 
 ROOT = Path(__file__).resolve().parents[1]
-MAX_PARTS = encode_config.MAX_MULTIPART_PARTS
+MAX_PARTS = encode_config.MAX_MULTIPART_PARTS      # parts on one physical disc
+MAX_DISCS = 8
+MAX_TOTAL_PARTS = MAX_PARTS * MAX_DISCS            # parts of one film over several discs
+CD_BYTES = 360_000 * 2048
+DISC_FIXED_BYTES = 3 * 1024**2                     # boot, loader, ISO records and reserve
+PART_FIXED_BYTES = 0x5000 + 0x10000 + 64 * 1024    # Main/Sub players and per-file padding
 PACKED_FILES = ("HEADER.DAT", "BODY.DAT", "MOVIE.DAT", "paltab.bin", "palidx.bin")
 
 
@@ -53,8 +59,8 @@ def write_json(path, value):
 
 
 def split_frames(frames, parts, offset=0):
-    if type(parts) is not int or not 1 <= parts <= MAX_PARTS:
-        raise ValueError(f"parts must be within 1..{MAX_PARTS}")
+    if type(parts) is not int or not 1 <= parts <= MAX_TOTAL_PARTS:
+        raise ValueError(f"parts must be within 1..{MAX_TOTAL_PARTS}")
     if frames < parts * 2:
         raise ValueError("each part needs at least two output frames")
     count, extra = divmod(frames, parts)
@@ -67,6 +73,130 @@ def split_frames(frames, parts, offset=0):
         result.append((start, end))
         start = end
     return result
+
+
+def scene_cuts(profile, name, total):
+    """Frame indices where a new shot starts, strongest first per region.
+
+    One pass over the prepared source: blackdetect marks fades to black and
+    the scene score marks hard cuts. Returns {frame: strength} with black
+    gaps weighted above ordinary cuts.
+    """
+    source = profile.section("source")
+    fps = Fraction(str(source["fps"]))
+    work = ROOT / "tmp" / name
+    work.mkdir(parents=True, exist_ok=True)
+    metadata = work / "scene-cuts.txt"
+    threshold = os.environ.get("ASTRA_SCENE_THRESHOLD", "0.30")
+    with resource_tokens.acquire_tokens("cpu", count=1):
+        record, _ = run_logged([
+            "ffmpeg", "-hide_banner", "-nostats", "-threads", "0",
+            "-t", str(source["duration"]), "-i", source["path"],
+            "-map", source.get("video_map", "0:V:0"), "-an",
+            "-vf", (f"fps={source['fps']},blackdetect=d=0.12:pix_th=0.10,"
+                    f"select='gt(scene,{threshold})',"
+                    f"metadata=print:file='{metadata.as_posix()}'"),
+            "-f", "null", "-",
+        ], name + "-scenes")
+    cuts = {}
+    current = None
+    for line in metadata.read_text(errors="replace").splitlines() if metadata.exists() else ():
+        if line.startswith("frame:") and "pts_time:" in line:
+            current = round(Fraction(line.split("pts_time:")[1].split()[0]) * fps)
+        elif current is not None and "lavfi.scene_score=" in line:
+            score = float(line.split("=", 1)[1])
+            if 2 <= current <= total - 2:
+                cuts[current] = max(cuts.get(current, 0.0), score)
+    for line in Path(record["log"]).read_text(errors="replace").splitlines():
+        if "black_start:" in line and "black_end:" in line:
+            fields = dict(part.split(":", 1) for part in line.split() if ":" in part)
+            try:
+                start = Fraction(fields["black_start"]) * fps
+                end = Fraction(fields["black_end"]) * fps
+            except (KeyError, ValueError, ZeroDivisionError):
+                continue
+            middle = round((start + end) / 2)
+            if 2 <= middle <= total - 2:
+                cuts[middle] = max(cuts.get(middle, 0.0), 2.0)
+    return cuts
+
+
+def snap_ranges(frames, parts, offset, cuts, limit):
+    """Even split moved to nearby shot changes without exceeding `limit` frames."""
+    nominal = split_frames(frames, parts, offset)
+    if parts == 1 or not cuts:
+        return nominal
+    window = min(max(25, frames // parts // 7), 1200)    # about +-14 %, at most ~48 s at 25 FPS
+    result = []
+    start = offset
+    end_total = offset + frames
+    for index in range(1, parts):
+        ideal = nominal[index][0]
+        remaining = parts - index
+        low = max(start + 2, end_total - remaining * limit, ideal - window)
+        high = min(start + limit, end_total - 2 * remaining, ideal + window)
+        if low > high:
+            # Keep the feasible even boundary; the window offered no room.
+            boundary = min(max(ideal, start + 2), start + limit)
+        else:
+            candidates = [(frame, strength) for frame, strength in cuts.items()
+                          if low <= frame <= high]
+            if candidates:
+                # Strongest change wins; distance to the even split breaks ties.
+                boundary = max(candidates, key=lambda item: (
+                    round(item[1], 1), -abs(item[0] - ideal)))[0]
+            else:
+                boundary = min(max(ideal, low), high)
+        result.append((start, boundary))
+        start = boundary
+    result.append((start, end_total))
+    if any(end - begin < 2 or end - begin > limit for begin, end in result):
+        return nominal
+    return result
+
+
+def valid_ranges(ranges, bounds, parts):
+    if len(ranges) != parts or not ranges:
+        return False
+    if ranges[0][0] != bounds[0] or ranges[-1][1] != bounds[1]:
+        return False
+    return all(b - a >= 2 and b - a <= cavc_routing.MAX_FRAMES and (index == 0 or ranges[index - 1][1] == a)
+               for index, (a, b) in enumerate(ranges))
+
+
+def part_bytes(profile):
+    folder = ROOT / profile.artifact_dir
+    return sum((folder / name).stat().st_size for name in ("HEADER.DAT", "BODY.DAT")) + PART_FIXED_BYTES
+
+
+def group_discs(sizes, capacity=CD_BYTES, per_disc=MAX_PARTS):
+    """Consecutive parts per physical disc, balanced, each within capacity."""
+    usable = capacity - DISC_FIXED_BYTES
+    if any(size > usable for size in sizes):
+        raise ValueError("one part alone exceeds a CD; choose shorter chapters")
+    total = sum(sizes)
+    count = max(-(-total // usable), -(-len(sizes) // per_disc), 1)
+    while count <= MAX_DISCS:
+        groups, current, used = [], [], 0
+        target = total / count
+        consumed = 0
+        for index, size in enumerate(sizes):
+            left = count - len(groups) - 1
+            over = used + size > usable or len(current) >= per_disc
+            # Close the disc at the part boundary nearest its balanced share.
+            past = current and left > 0 and consumed + size / 2 > target * (len(groups) + 1)
+            if current and (over or past):
+                groups.append(current)
+                current, used = [], 0
+            current.append(index)
+            used += size
+            consumed += size
+        groups.append(current)
+        if len(groups) == count and all(sum(sizes[i] for i in g) <= usable and len(g) <= per_disc
+                                        for g in groups):
+            return groups
+        count += 1
+    raise ValueError(f"the film needs more than {MAX_DISCS} CDs")
 
 
 def toml_text(data):
@@ -159,9 +289,13 @@ def run_logged(command, name, *, env=None, handoff=None):
 def input_identity(profile, parts):
     environment = dict(os.environ)
     encode_config.apply_profile_env(profile, environment)
-    return {"schema": 1, "parts": parts, "encoder": analysis_logs.encoder_version(),
-            "source": sim_artifact_cache.source_identity(profile.data["source"]["path"]),
-            "settings": sim_artifact_cache.effective_environment(environment)}
+    identity = {"schema": 1, "parts": parts, "encoder": analysis_logs.encoder_version(),
+                "source": sim_artifact_cache.source_identity(profile.data["source"]["path"]),
+                "settings": sim_artifact_cache.effective_environment(environment)}
+    if os.environ.get("ASTRA_SCENE_SPLIT") == "1":
+        # Only new options extend the identity, so earlier checkpoints resume.
+        identity["split"] = {"scene": True, "limit": int(os.environ.get("ASTRA_PART_LIMIT_FRAMES", "0"))}
+    return identity
 
 
 def count_frames(profile, name):
@@ -184,7 +318,7 @@ AUDIO_NAME = "audio_22k05_s16_mono.wav"
 
 
 def prepare_shared(profile, fallback_frames=None):
-    """Prepare one indexed, lossless raster and filtered audio on the Linux filesystem."""
+    """Prepare one indexed, lossless raster and filtered audio for all parts."""
     if os.environ.get("ASTRA_DESKTOP_PARTS") != "1":
         return None, fallback_frames
     if os.environ.get("ASTRA_DISABLE_SHARED_INPUT") == "1":
@@ -193,24 +327,35 @@ def prepare_shared(profile, fallback_frames=None):
     encode_config.apply_profile_env(profile, env)
     master, raw = astra_extract.filters(env)
     folder = Path(env["CAVC_WORKSPACE_ROOT"]) / "source-frames"
-    copies = 1 if master == raw else 2
-    dimensions = int(env["CBRSIM_W"]) * int(env["CBRSIM_H"])
-    frames = round(float(env["CBRSIM_DURATION"]) * float(env["CBRSIM_FPS"])) + 2
-    estimate = frames * copies * (dimensions * 3 + 8192) + 4 * 1024**3
-    if estimate > min(shutil.disk_usage(folder.parent).free,
-                      int(env["ASTRA_HOST_FREE"])):
-        print("Poco espacio para una extracción compartida. Se leerá por tramos.", flush=True)
+    volumes = {folder.parent: 5, ROOT: 2}
+    # The WSL virtual disk can grow on the Windows system volume even when
+    # Linux reports much more space inside its virtual filesystem.
+    system_volume = Path("/mnt/c")
+    if system_volume.is_mount():
+        other_drive = folder.is_relative_to(Path("/mnt")) and not folder.is_relative_to(system_volume)
+        volumes[system_volume] = 2 if other_drive else 5
+
+    def retain_space():
+        if any(shutil.disk_usage(volume).free < reserve * 1024**3
+               for volume, reserve in volumes.items()):
+            raise astra_extract.SharedInputSpaceError("shared extraction storage reserve")
+
+    try:
+        retain_space()
+        if folder.is_dir():
+            shutil.rmtree(folder)
+        folder.mkdir()
+        print("Extracción compartida de vídeo y audio en Linux…", flush=True)
+        emit("prepare")
+        workers = resource_tokens.requested_cpu_workers()
+        with resource_tokens.acquire_tokens("cpu", count=workers):
+            astra_extract.extract(folder, env, master, raw, workers=workers,
+                                  audio_name=AUDIO_NAME, shared=True, disk_guard=retain_space)
+    except astra_extract.SharedInputSpaceError:
+        if folder.is_dir():
+            shutil.rmtree(folder)
+        print("La extracción compartida alcanzó la reserva de espacio. Se leerá por tramos.", flush=True)
         return None, fallback_frames
-    if folder.is_dir():
-        # A retry with the same source and filters may use this job's completed raster.
-        shutil.rmtree(folder)
-    folder.mkdir()
-    print("Extracción compartida de vídeo y audio en Linux…", flush=True)
-    emit("prepare")
-    workers = resource_tokens.requested_cpu_workers()
-    with resource_tokens.acquire_tokens("cpu", count=workers):
-        astra_extract.extract(folder, env, master, raw, workers=workers,
-                              audio_name=AUDIO_NAME, shared=True)
     return folder, sum(1 for _ in (folder / "master").glob("*.png"))
 
 
@@ -232,13 +377,28 @@ def prepare(profile, parts, total=None, identity=None):
         bounds = frame_range(profile.section("source")) or (0, total)
         if bounds[1] > total:
             raise ValueError("profile source range exceeds decoded source frames")
+        ranges = split_frames(bounds[1]-bounds[0], parts, bounds[0])
+        split = "even"
+        if identity.get("split", {}).get("scene") and parts > 1:
+            limit = identity["split"]["limit"] or max(b - a for a, b in ranges)
+            limit = min(limit, cavc_routing.MAX_FRAMES)
+            cuts = scene_cuts(profile, stem, total)
+            ranges = snap_ranges(bounds[1]-bounds[0], parts, bounds[0], cuts, limit)
+            split = "scene"
+            moved = sum(1 for a, b in zip(ranges, split_frames(bounds[1]-bounds[0], parts, bounds[0]))
+                        if a != b)
+            print(f"multipart: {len(cuts)} cambios de escena; {moved} cortes ajustados a una escena", flush=True)
         plan = {"identity": identity, "stem": stem, "profile": str(profile.path),
-                "source_frames": total, "ranges": split_frames(bounds[1]-bounds[0], parts, bounds[0])}
+                "source_frames": total, "split": split, "ranges": [list(r) for r in ranges]}
         write_json(plan_file, plan)
     bounds = frame_range(profile.section("source")) or (0, plan["source_frames"])
-    expected = [list(pair) for pair in split_frames(bounds[1]-bounds[0], parts, bounds[0])]
-    if [list(pair) for pair in plan["ranges"]] != expected or plan["stem"] != stem:
-        raise ValueError("multipart plan ranges or output stem differ")
+    if plan.get("split") == "scene":
+        if not valid_ranges([tuple(r) for r in plan["ranges"]], bounds, parts) or plan["stem"] != stem:
+            raise ValueError("multipart plan ranges or output stem differ")
+    else:
+        expected = [list(pair) for pair in split_frames(bounds[1]-bounds[0], parts, bounds[0])]
+        if [list(pair) for pair in plan["ranges"]] != expected or plan["stem"] != stem:
+            raise ValueError("multipart plan ranges or output stem differ")
     directory = work / "profiles"
     directory.mkdir(parents=True, exist_ok=True)
     profiles = []
@@ -330,15 +490,19 @@ def parse_args(argv=None):
                "See README.md: Multipart encoding (CLI).")
     parser.add_argument("profile", type=Path)
     parser.add_argument("--parts", type=int, metavar="N",
-                        help=f"Number of parts (1..{MAX_PARTS}); overrides [multipart].parts")
+                        help=f"Number of parts (1..{MAX_TOTAL_PARTS}); overrides [multipart].parts")
+    parser.add_argument("--multi-disc", action="store_true",
+                        help="Split the parts over as many 80-minute CDs as needed")
     parser.add_argument("--part", type=int, metavar="K",
                         help="Encode only part K (1-based); omission completes all parts")
     parser.add_argument("--build-only", action="store_true", help="Build from already completed parts")
     parser.add_argument("--debug", action="store_true", help="Include the playback DEBUG HUD")
     parser.add_argument("--security-region", choices=("jp", "us", "eu"), default="jp")
     args = parser.parse_args(argv)
-    if args.parts is not None and not 1 <= args.parts <= MAX_PARTS:
-        parser.error(f"--parts must be within 1..{MAX_PARTS}")
+    if args.parts is not None and not 1 <= args.parts <= MAX_TOTAL_PARTS:
+        parser.error(f"--parts must be within 1..{MAX_TOTAL_PARTS}")
+    if args.parts is not None and args.parts > MAX_PARTS and not args.multi_disc:
+        parser.error(f"more than {MAX_PARTS} parts require --multi-disc")
     if args.part is not None and args.part < 1:
         parser.error("--part must be within 1..--parts (1-based)")
     if args.part is not None and args.build_only:
@@ -392,14 +556,20 @@ def main():
                     raise ValueError("decoded frame count differs from the resumed plan")
                 environment["ASTRA_PREPARED_INPUT"] = str(shared)
         workers = min(len(pending), int(os.environ.get("ASTRA_PART_WORKERS", "1")), 2)
-        if workers > 1:
-            memory = next((int(line.split()[1]) for line in Path("/proc/meminfo").read_text().splitlines()
-                           if line.startswith("MemAvailable:")), 0)
-            if memory < 12 * 1024**2 or (os.cpu_count() or 1) < 8:
-                workers = 1
-                print("Recursos para una parte a la vez. Se continúa secuencialmente.", flush=True)
-            else:
-                environment["CBRSIM_WORKERS"] = str(max(2, resource_tokens.requested_cpu_workers() // 2))
+        memory = next((int(line.split()[1]) for line in Path("/proc/meminfo").read_text().splitlines()
+                       if line.startswith("MemAvailable:")), 0) * 1024
+        longest = max((end - start for start, end in plan["ranges"]), default=0)
+        from astra_capacity import part_memory
+        need = part_memory(longest)
+        # Up to ~3:20 chapters keep the measured 12 GiB rule for two parts in flight;
+        # longer chapters need two estimated peaks.
+        floor = 12 * 1024**3 if longest <= 5200 else 2 * need
+        if workers > 1 and (memory < floor or (os.cpu_count() or 1) < 8):
+            workers = 1
+            print("Recursos para una parte a la vez. Se continúa secuencialmente.", flush=True)
+        elif workers > 1:
+            environment["CBRSIM_WORKERS"] = str(max(2, resource_tokens.requested_cpu_workers() // 2))
+
         def convert(number, part):
             print(f"multipart: part {number}/{args.parts}: frames {plan['ranges'][number - 1]}", flush=True)
             return encode_part(plan, number, part, env=environment)
@@ -421,7 +591,28 @@ def main():
         os.environ.pop("ASTRA_PROGRESS_PART", None)
         emit("build")
         import multipart_build
-        multipart_build.build(plan, profiles, records, debug=args.debug, region=args.security_region)
+        # A rebuild may group the parts differently: drop earlier disc images
+        # and receipts of this plan so only the new set is published.
+        for stale in [*(ROOT / "out").glob(f"{plan['stem']}*.iso"),
+                      *(ROOT / "out").glob(f"{plan['stem']}*.cue"),
+                      *(ROOT / "out" / plan["stem"]).glob("multipart*.json")]:
+            stale.unlink(missing_ok=True)
+        if not args.multi_disc:
+            if len(profiles) > MAX_PARTS:
+                raise ValueError(f"one disc holds at most {MAX_PARTS} parts")
+            multipart_build.build(plan, profiles, records, debug=args.debug, region=args.security_region)
+            return 0
+        capacity = int(os.environ.get("ASTRA_TEST_DISC_BYTES", CD_BYTES))   # tests only
+        groups = group_discs([part_bytes(profile) for profile in profiles], capacity)
+        if len(groups) == 1:
+            multipart_build.build(plan, profiles, records, debug=args.debug, region=args.security_region)
+            return 0
+        print(f"multipart: {len(groups)} discos: " + "; ".join(
+            f"disco {i}: partes {g[0]+1}-{g[-1]+1}" for i, g in enumerate(groups, 1)), flush=True)
+        for index, group in enumerate(groups, 1):
+            multipart_build.build(plan, [profiles[i] for i in group], [records[i] for i in group],
+                                  debug=args.debug, region=args.security_region,
+                                  disc=(index, len(groups)), numbers=[i + 1 for i in group])
     return 0
 
 

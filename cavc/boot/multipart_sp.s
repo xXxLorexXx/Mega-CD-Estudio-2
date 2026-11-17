@@ -10,6 +10,7 @@
 .equ CDBIOS,       0x00005F22
 .equ CDB_STAT,     0x00005E80
 .equ BIOS_DRV_INIT,0x0010
+.equ BIOS_CDB_CHK, 0x0080
 .equ BIOS_CDB_STAT,0x0081
 .equ BIOS_CDC_STOP,0x0089
 .equ BIOS_CDC_STAT,0x008A
@@ -24,6 +25,7 @@
 .equ COMCMD1,      SUB_GA_BASE+0x0012
 .equ COMSTAT0,     SUB_GA_BASE+0x0020
 .equ COMSTAT1,     SUB_GA_BASE+0x0022
+.equ CDC_MODE_ABS_W, SUB_GA_BASE+0x0004-0x01000000
 
 .equ SUB_BANK_1M,  0x000C0000
 .equ ISO_BUF,      0x00067000
@@ -81,8 +83,15 @@ sp_main:
 	ori.b	#0x04, (SUB_GA_BASE+0x37).l	/* HOCK: enable CDD communication */
 	ori.b	#0x3C, (SUB_GA_BASE+0x33).l	/* IEN: enable CDC/drive interrupts */
 	move.w	#0x2000, sr
+	/* Real-hardware fix: the loader is re-entered after every part, after
+	   long periods with Sub interrupts masked. Restart the CDD exchange
+	   before any directory read (same sequence as the bootstrap and the
+	   original multipart loader). */
 	lea	drv_init_tracklist, a0
 	BIOSCALL BIOS_DRV_INIT
+0:
+	BIOSCALL BIOS_CDB_CHK
+	bcs.s	0b
 1:
 	BIOSCALL BIOS_CDB_STAT
 	andi.b	#0xF0, (CDB_STAT).w
@@ -174,9 +183,9 @@ load_selected:
 	move.l	d0, (MULTIPART_LOADER_INFO_ADDR+24).w
 	move.l	d1, (MULTIPART_LOADER_INFO_ADDR+28).w
 
-	/* The selected SP module is read to boot ISO scratch first.  ISO extents are
-	   sector-rounded, while the resident SP slot is only 5 KiB; copying the
-	   exact file length avoids spilling a third sector into ADP-IDX. */
+	/* This extent contains the executable plus the first HEADER sectors.
+	   Leave those sectors in boot scratch for the player, and copy only the
+	   executable into the fixed 5 KiB resident slot. */
 	move.w	d6, d0
 	lsl.w	#2, d0
 	lea	loader_player_sp_names, a0
@@ -185,11 +194,11 @@ load_selected:
 	move.l	d0, (MULTIPART_SELECTED_SP_INFO_ADDR).l
 	move.l	d1, (MULTIPART_SELECTED_SP_INFO_ADDR+4).l
 	move.l	d2, (MULTIPART_SELECTED_SP_INFO_ADDR+8).l
-	tst.l d2
-	beq loader_error
-	cmpi.l #5120, d2
+	cmpi.l #PLAYER_SP_MEDIA_OFFSET+2048, d2
+	blo loader_error
+	cmpi.l #PLAYER_SP_PACKAGE_LIMIT, d2
 	bhi loader_error
-	btst #0, d2
+	andi.l #2047, d2
 	bne loader_error
 	move.l	(MULTIPART_SELECTED_SP_INFO_ADDR).l, d0
 	move.l	(MULTIPART_SELECTED_SP_INFO_ADDR+4).l, d1
@@ -197,7 +206,14 @@ load_selected:
 	bsr	read_cd
 	lea	ISO_BUF.l, a0
 	lea	PLAYER_SP_BASE.l, a1
-	move.l	(MULTIPART_SELECTED_SP_INFO_ADDR+8).l, d0
+	moveq	#0, d0
+	move.w	PLAYER_SP_MODULE_LIMIT(a0), d0
+	cmpi.w	#32, d0
+	blo	loader_error
+	cmpi.w	#PLAYER_SP_MODULE_LIMIT, d0
+	bhi	loader_error
+	btst	#0, d0
+	bne	loader_error
 	lsr.w	#1, d0
 	beq.s	selected_sp_ready
 	subq.w	#1, d0
@@ -247,24 +263,34 @@ read_cd:
 	blo.s	1b
 	movea.l	a5, a0
 	BIOSCALL BIOS_ROM_READN
+2:
+	BIOSCALL BIOS_CDB_CHK
+	bcs.s	2b
 	move.w	#75, 16(a5)
 read_stat:
 	BIOSCALL BIOS_CDC_STAT
 	bcs.s	read_stat
 read_data:
+	move.b	#3, (CDC_MODE_ABS_W).w
 	BIOSCALL BIOS_CDC_READ
-	bcc.s	read_data
+	bcs.s	read_stat
 read_transfer:
 	movea.l	8(a5), a0
 	lea	12(a5), a1
 	BIOSCALL BIOS_CDC_TRN
-	bcc.s	read_transfer
+	bcc.s	read_trn_ok
+	BIOSCALL BIOS_CDC_ACK
+	subq.w	#1, 16(a5)
+	bne.w	read_stat
+	bra	loader_error
+read_trn_ok:
 	BIOSCALL BIOS_CDC_ACK
 	MULTIPART_CHECK_SECTOR read_stat
 	addq.l	#1, (a5)
 	addi.l	#0x0800, 8(a5)
 	subq.l	#1, 4(a5)
 	bne.w	read_stat
+	BIOSCALL BIOS_CDC_STOP
 	movem.l	(sp)+, d0-d7/a0-a6
 	rts
 

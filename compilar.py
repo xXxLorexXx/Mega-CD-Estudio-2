@@ -11,7 +11,7 @@ ROOT=Path(__file__).resolve().parent
 os.chdir(ROOT)
 scratch=Path(os.environ.get('MEGACD_BUILD_DIR',str(ROOT/'compilacion'))).resolve()
 scratch.mkdir(parents=True,exist_ok=True)
-arguments=['--noconfirm','--clean','--onefile','--windowed','--name','Mega CD Estudio 13',
+arguments=['--noconfirm','--clean','--onefile','--windowed','--name','Mega CD Estudio 14.1',
            '--distpath',str(ROOT),'--workpath',str(scratch/'build'),'--specpath',str(scratch),
            '--collect-submodules','numba','--collect-submodules','llvmlite',
            '--hidden-import','Mega_Cd_Grabador_de_Video_Beta',

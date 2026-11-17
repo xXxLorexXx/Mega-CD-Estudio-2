@@ -9,6 +9,7 @@
 .equ CDBIOS,        0x00005F22
 .equ CDB_STAT,      0x00005E80
 .equ BIOS_DRV_INIT, 0x0010
+.equ BIOS_CDB_CHK,  0x0080
 .equ BIOS_CDB_STAT, 0x0081
 .equ BIOS_CDC_STOP, 0x0089
 .equ BIOS_CDC_STAT, 0x008A
@@ -17,20 +18,25 @@
 .equ BIOS_CDC_ACK,  0x008D
 .equ BIOS_ROM_READN,0x0020
 
-.equ SUB_GA_BASE,   0x00FF8000
-.equ MEMMODE,       SUB_GA_BASE+0x0002
-.equ COMCMD1,       SUB_GA_BASE+0x0012
-.equ COMSTAT0,      SUB_GA_BASE+0x0020
-.equ SUB_BANK_1M,   0x000C0000
-.equ ISO_BUF,       0x00067000
-.equ SP_STACK,      0x0007FF00
+.equ SUB_GA_BASE,      0x00FF8000
+.equ MEMMODE,          SUB_GA_BASE+0x0002
+.equ COMCMD1,          SUB_GA_BASE+0x0012
+.equ COMSTAT0,         SUB_GA_BASE+0x0020
+.equ MEMMODE_B_ABS_W,  0xFFFF8003
+.equ CDC_MODE_ABS_W,   0xFFFF8004
+.equ GA_STOPWATCH_ABS_W, 0xFFFF800C
+.equ COMCMD1_ABS_W,    0xFFFF8012
+.equ COMSTAT0_ABS_W,   0xFFFF8020
+.equ SUB_BANK_1M,      0x000C0000
+.equ ISO_BUF,          0x00067000
+.equ SP_STACK,         0x0007FF00
 .equ LOADER_SP_WORD_OFF,   0x0001E000
 .equ LOADER_SP_WORD_ENTRY, 0x000DE000
 .equ MULTIPART_WORD_SWAP_STUB, 0x00007F50
 .equ MULTIPART_INT_STUB,     0x00007F64	/* after the 20-byte bank-switch stub */
 .equ BIOS_USERCALL2_TGT, 0x00005F36
 .equ BIOS_USERCALL3_TGT, 0x00005F3C
-.equ MULTIPART_RETURN_ROUTINE, 0x0000D680	/* PRG-resident multipart return */
+.equ MULTIPART_RETURN_ROUTINE, 0x0000D640	/* PRG-resident multipart return */
 .equ MULTIPART_LOADER_INFO,    0x00007F20
 .equ LOADER_IMAGE_OFF,     0x00000000
 .equ LOADER_IP_SECTORS,    10
@@ -78,6 +84,9 @@ sp_main:
 	move.w	#0x2000, sr
 	lea	drv_init_tracklist, a0
 	BIOSCALL BIOS_DRV_INIT
+0:
+	BIOSCALL BIOS_CDB_CHK
+	bcs.s	0b
 1:
 	BIOSCALL BIOS_CDB_STAT
 	andi.b	#0xF0, (CDB_STAT).w
@@ -128,25 +137,43 @@ read_cd:
 	move.l	a0, 8(a5)
 	movea.l	a5, a0
 	BIOSCALL BIOS_CDC_STOP
+	move.w	(GA_STOPWATCH_ABS_W).w, d2
+1:
+	move.w	(GA_STOPWATCH_ABS_W).w, d3
+	sub.w	d2, d3
+	andi.w	#0x0FFF, d3
+	cmpi.w	#3256, d3
+	blo.s	1b
+	movea.l	a5, a0
 	BIOSCALL BIOS_ROM_READN
+2:
+	BIOSCALL BIOS_CDB_CHK
+	bcs.s	2b
 	move.w	#75, 16(a5)
 read_stat:
 	BIOSCALL BIOS_CDC_STAT
 	bcs.s	read_stat
 read_data:
+	move.b	#3, (CDC_MODE_ABS_W).w
 	BIOSCALL BIOS_CDC_READ
-	bcc.s	read_data
+	bcs.s	read_stat
 read_transfer:
 	movea.l	8(a5), a0
 	lea	12(a5), a1
 	BIOSCALL BIOS_CDC_TRN
-	bcc.s	read_transfer
+	bcc.s	read_trn_ok
+	BIOSCALL BIOS_CDC_ACK
+	subq.w	#1, 16(a5)
+	bne.w	read_stat
+	bra	loader_error
+read_trn_ok:
 	BIOSCALL BIOS_CDC_ACK
 	MULTIPART_CHECK_SECTOR read_stat
 	addq.l	#1, (a5)
 	addi.l	#0x0800, 8(a5)
 	subq.l	#1, 4(a5)
 	bne.w	read_stat
+	BIOSCALL BIOS_CDC_STOP
 	movem.l	(sp)+, d0-d7/a0-a6
 	rts
 
@@ -195,33 +222,33 @@ install_multipart_return_routine:
 
 multipart_return_image:
 1:
-	tst.w	(COMCMD1).l			/* Main requests the loader return */
+	tst.w	(COMCMD1_ABS_W).w		/* Main requests the loader return */
 	beq.s	1b
 	move.l	(MULTIPART_LOADER_INFO+8).w, d0	/* saved LOADERIP extent */
 	moveq	#LOADER_IP_SECTORS, d1
 	lea	(SUB_BANK_1M+LOADER_IMAGE_OFF).l, a0
-	bsr.w	mr_read_cd
-	bchg	#0, (MEMMODE+1).l		/* loader image becomes Main-visible */
-	bsr.w	mr_settle
-	move.w	#STAT_LOADER_IP_READY, (COMSTAT0).l
+	bsr.s	mr_read_cd
+	bchg	#0, (MEMMODE_B_ABS_W).w		/* loader image becomes Main-visible */
+	bsr.s	mr_settle
+	move.w	#STAT_LOADER_IP_READY, (COMSTAT0_ABS_W).w
 2:
-	tst.w	(COMCMD1).l			/* Main drops the request when its
+	tst.w	(COMCMD1_ABS_W).w		/* Main drops the request when its
 						   LOADERIP copy is complete */
 	bne.s	2b
-	bchg	#0, (MEMMODE+1).l		/* Sub owns the bank again */
-	bsr.w	mr_settle
+	bchg	#0, (MEMMODE_B_ABS_W).w		/* Sub owns the bank again */
+	bsr.s	mr_settle
 	move.l	(MULTIPART_LOADER_INFO).w, d0		/* saved LOADERSP extent */
 	moveq	#LOADER_SP_SECTORS, d1
 	lea	(SUB_BANK_1M+LOADER_SP_WORD_OFF).l, a0
-	bsr.w	mr_read_cd
-	bchg	#0, (MEMMODE+1).l
-	bsr.w	mr_settle
-	bsr.w	mr_read_cd			/* same packet: second bank copy */
+	bsr.s	mr_read_cd
+	bchg	#0, (MEMMODE_B_ABS_W).w
+	bsr.s	mr_settle
+	bsr.s	mr_read_cd			/* same packet: second bank copy */
 	jmp	(LOADER_SP_WORD_ENTRY).l
 
 mr_settle:
 1:
-	btst	#1, (MEMMODE+1).l
+	btst	#1, (MEMMODE_B_ABS_W).w
 	bne.s	1b
 	rts
 
@@ -233,25 +260,45 @@ mr_read_cd:
 	move.l	a0, 8(a5)
 	movea.l	a5, a0
 	BIOSCALL BIOS_CDC_STOP
+	move.w	(GA_STOPWATCH_ABS_W).w, d2
+1:
+	move.w	(GA_STOPWATCH_ABS_W).w, d3
+	sub.w	d2, d3
+	andi.w	#0x0FFF, d3
+	cmpi.w	#3256, d3
+	blo.s	1b
+	movea.l	a5, a0
 	BIOSCALL BIOS_ROM_READN
+2:
+	BIOSCALL BIOS_CDB_CHK
+	bcs.s	2b
 	move.w	#75, 16(a5)
 mr_stat:
 	BIOSCALL BIOS_CDC_STAT
 	bcs.s	mr_stat
 mr_data:
+	move.b	#3, (CDC_MODE_ABS_W).w
 	BIOSCALL BIOS_CDC_READ
-	bcc.s	mr_data
+	bcs.s	mr_stat
 mr_trn:
 	movea.l	8(a5), a0
 	lea	12(a5), a1
 	BIOSCALL BIOS_CDC_TRN
-	bcc.s	mr_trn
+	bcc.s	mr_trn_ok
+	BIOSCALL BIOS_CDC_ACK
+	subq.w	#1, 16(a5)
+	bne.w	mr_stat
+	move.w	#0xDEAD, (COMSTAT0_ABS_W).w
+mr_err:
+	bra.s	mr_err
+mr_trn_ok:
 	BIOSCALL BIOS_CDC_ACK
 	MULTIPART_CHECK_SECTOR mr_stat
 	addq.l	#1, (a5)
 	addi.l	#0x0800, 8(a5)
 	subq.l	#1, 4(a5)
 	bne.w	mr_stat
+	BIOSCALL BIOS_CDC_STOP
 	movem.l	(sp)+, d0-d7/a0-a6
 	rts
 	.align	2

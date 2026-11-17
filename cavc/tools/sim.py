@@ -1559,9 +1559,9 @@ def main(demoted_fade_anchors=frozenset(), arrays=None):
         or os.environ.get("CBRSIM_SMOOTH_MOTION_FALLBACK", "0") == "1"
         or os.environ.get("CBRSIM_MOTION_COMPENSATION", "0") == "1"
     )
-    with _parallel_phase(
-            "Palette", worker_limit=12, use_gpu=True):
+    with _parallel_phase("Frame features", worker_limit=12):
         frame_cache = FrameFeatureCache(frames, arrays=arrays, store_luma=need_motion_luma)
+    with _parallel_phase("Palette", worker_limit=12, use_gpu=True):
         try:
             _global_pals, seg_pals, frame_seg, seg_bounds, palette_stats = segment_and_train(
                 frames, frame_cache=frame_cache)

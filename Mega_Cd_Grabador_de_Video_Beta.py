@@ -2623,7 +2623,7 @@ class MegaCDVideoStudioApp(StudioLayout, CavcStudio):
 
     def __init__(self, root):
         self.root = root
-        self.root.title("Mega CD Estudio 13")
+        self.root.title("Mega CD Estudio 14.1")
         self.root.configure(bg=BG)
         self._init_window_geometry()
 
@@ -3341,7 +3341,7 @@ class MegaCDVideoStudioApp(StudioLayout, CavcStudio):
                 if settings.get("auto_burn"):
                     if disc_count>1:messagebox.showinfo("Varios CD preparados","Se iniciará la grabación del primer CD. Para los demás, cambie el CD virgen y use Elegir disco.")
                     self.start_burn_cd()
-                else:messagebox.showinfo("Disco creado y verificado — Mega CD Estudio 13",
+                else:messagebox.showinfo("Disco creado y verificado — Mega CD Estudio 14.1",
                     f"Carpeta: {out_dir}\n\nDiscos: {disc_count} | Total: {mb:.2f} MiB | Máx. 700 MiB por CD\nCapítulos lógicos: {result['plan']['logical_chapters']}\n"
                     f"Archivos CIN: {len(result['jobs'])}\nFPS solicitados: {result['requested_fps']} | efectivos: {result['fps']}\nGPU en codificación Cinepak: {result['gpu_encode_jobs']} CIN\n"
                     f"Audio: {settings['audio_mode']}\nMenú START: {'Activado' if settings['enable_osd'] else 'Desactivado'}\n"

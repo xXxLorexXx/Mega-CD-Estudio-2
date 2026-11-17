@@ -17,6 +17,11 @@ IP_BYTES = 0x5000
 WORD_BYTES = 0x2000
 STUB = 0x7F50
 STATE = 0xFF9900
+SECTOR = 2048
+SP_MODULE_LIMIT = 0x1400
+SP_MEDIA_OFFSET = 0x1800
+SP_PACKAGE_BASE = 0x67000
+SP_PACKAGE_LIMIT = 0x10000
 
 
 def tool(name):
@@ -55,6 +60,9 @@ def sub_include(count, entries):
         "MULTIPART_LOADER_INFO_ADDR": 0x7F20, "MULTIPART_SELECTED_SP_INFO_ADDR": 0x7F42,
         "MULTIPART_WORD_SWAP_STUB": STUB, "MULTIPART_LOADER_RUNTIME_ADDR": 0x7F70,
         "PLAYER_SP_BASE": 0x6000, "CMD_LOADER_LOAD": 0x52,
+        "PLAYER_SP_MODULE_LIMIT": SP_MODULE_LIMIT,
+        "PLAYER_SP_MEDIA_OFFSET": SP_MEDIA_OFFSET,
+        "PLAYER_SP_PACKAGE_LIMIT": SP_PACKAGE_LIMIT,
         "STAT_LOADER_READY": 0x8005, "STAT_LOADER_IP_READY": 0x8006,
         "STAT_PLAYER_READY": 0x8007,
     }
@@ -170,8 +178,34 @@ def verify_iso(iso, staged):
                 raise ValueError(f"ISO payload differs: {path.name}")
 
 
-def build(plan, profiles, records, *, debug, region):
+def package_sub_player(module, header, output):
+    """Read the player and its initial metadata in one loader operation."""
+    code = module.read_bytes()
+    if not 32 <= len(code) <= SP_MODULE_LIMIT or len(code) % 2:
+        raise ValueError(f"Sub player exceeds its fixed resident slot: {module}")
+    with header.open('rb') as source:
+        packet = source.read(SECTOR)
+        fields = player_constants.parse_header_sector(packet)
+        media_bytes = (fields.paltab_sec + fields.dic_sectors) * SECTOR
+        media = source.read(media_bytes)
+    if len(media) != media_bytes:
+        raise ValueError(f"Truncated startup metadata: {header}")
+    prefix = code.ljust(SP_MODULE_LIMIT, b'\0') + len(code).to_bytes(2, 'big')
+    size = SP_MEDIA_OFFSET + len(packet) + len(media)
+    if size > SP_PACKAGE_LIMIT:
+        raise ValueError(f"Startup data exceeds the loader buffer: {header}")
+    output.write_bytes(prefix.ljust(SP_MEDIA_OFFSET, b'\0') + packet + media)
+
+
+def build(plan, profiles, records, *, debug, region, disc=None, numbers=None):
+    """Build one physical disc. `disc` = (index, count) when the film spans
+    several CDs; `numbers` are then the film-wide part numbers on this disc."""
+    numbers = list(numbers) if numbers is not None else list(range(1, len(profiles) + 1))
+    if len(numbers) != len(profiles):
+        raise ValueError("part numbers do not match the disc's parts")
     work = ROOT / "tmp" / plan["stem"]
+    if disc is not None:
+        work = work / f"disc{disc[0]}"
     directory = work/"build"
     directory.mkdir(parents=True, exist_ok=True)
     count = len(profiles)
@@ -189,11 +223,13 @@ def build(plan, profiles, records, *, debug, region):
     for number, (profile, record) in enumerate(zip(profiles, records), 1):
         module = ROOT/profile.build_dir
         module.mkdir(parents=True, exist_ok=True)
-        (module/"multipart_player.inc").write_text(f".equ MULTIPART_RETURN_ENTRY, {reentry}\n")
+        (module/"multipart_player.inc").write_text(
+            f".equ MULTIPART_RETURN_ENTRY, {reentry}\n"
+            f".equ MULTIPART_MEDIA_PREFIX, {SP_PACKAGE_BASE + SP_MEDIA_OFFSET}\n")
         with stem_lock(profile.sim_stem):
             run_logged(["make", "movieplay-module", f"CONFIG={profile.path.relative_to(ROOT)}",
                         f"DEBUG={int(debug)}", "MULTIPART=1", f"SECURITY_REGION={region}",
-                        "--assume-old=moviepack"], f"{plan['stem']}-part{number:03}-player")
+                        "--assume-old=moviepack"], f"{plan['stem']}-part{numbers[number-1]:03}-player")
         folder = ROOT/profile.artifact_dir
         expected = sp_extension.adpcm_preload_image(
             ima_adpcm.full_tables(), (module/"movieplay_sp_ext.bin").read_bytes())
@@ -214,12 +250,18 @@ def build(plan, profiles, records, *, debug, region):
         entries.append(ip_entry)
         sub_entries.append(sp_entry)
         files = {}
-        for path, name in zip((ip, sp, folder/"HEADER.DAT", folder/"BODY.DAT"), names(number)):
-            shutil.copyfile(path, staged/name)
-            files[name] = {"bytes": path.stat().st_size, "sha256": digest(path)}
-        items.append({"part": number, "profile": str(profile.path), "frames": record["frames"],
+        header = folder/"HEADER.DAT"
+        for path, name in zip((ip, sp, header, folder/"BODY.DAT"), names(number)):
+            output = staged/name
+            if path == sp:
+                package_sub_player(sp, header, output)
+            else:
+                shutil.copyfile(path, output)
+            files[name] = {"bytes": output.stat().st_size, "sha256": digest(output)}
+        items.append({"part": numbers[number-1], "disc_part": number,
+                      "profile": str(profile.path), "frames": record["frames"],
                       "profile_sha256": profile.sha256,
-                      "range": plan["ranges"][number-1], "files": files,
+                      "range": plan["ranges"][numbers[number-1]-1], "files": files,
                       "ip_entry": ip_entry, "sp_entry": sp_entry})
     (directory/"multipart_ip.inc").write_text(main_include(sizes, entries))
     (directory/"multipart_sp.inc").write_text(sub_include(count, sub_entries))
@@ -229,7 +271,7 @@ def build(plan, profiles, records, *, debug, region):
     for obj, first, last, capacity in (
         (directory/"multipart_ip.o", "multipart_copy", "multipart_copy_end", STATE-0xFF8880),
         (directory/"multipart_boot_sp.o", "multipart_word_swap_stub_image", "multipart_word_swap_stub_image_end", 20),
-        (directory/"multipart_boot_sp.o", "multipart_return_image", "multipart_return_image_end", 0xD800-0xD680),
+        (directory/"multipart_boot_sp.o", "multipart_return_image", "multipart_return_image_end", 0xD800-0xD640),
     ):
         length = symbol(obj, last)-symbol(obj, first)
         if not 0 < length <= capacity or length % 2:
@@ -240,10 +282,15 @@ def build(plan, profiles, records, *, debug, region):
     if not iso_tool:
         raise FileNotFoundError("mkisofs/genisoimage is required")
     suffix = ("" if region == "jp" else f"_{region}") + ("" if debug else "_release")
-    iso = ROOT/"out"/f"{plan['stem']}{suffix}.iso"
+    label = "" if disc is None else f"-disc{disc[0]}of{disc[1]}"
+    iso = ROOT/"out"/f"{plan['stem']}{label}{suffix}.iso"
     pending = work/"multipart.pending.iso"
+    volume = "CAVC_MULTIPART" if disc is None else f"CAVC_DISC{disc[0]}OF{disc[1]}"
     run_logged([iso_tool, "-iso-level", "1", "-G", directory/"multipart_boot.bin",
-                "-pad", "-V", "CAVC_MULTIPART", "-o", pending, staged], plan["stem"]+"-iso")
+                "-pad", "-V", volume, "-o", pending, staged], plan["stem"]+"-iso")
+    if pending.stat().st_size > 360_000 * 2048:
+        pending.unlink()
+        raise ValueError(f"disc image exceeds an 80-minute CD: {iso.name}")
     verify_iso(pending, staged)
     os.replace(pending, iso)
     cue = iso.with_suffix(".cue")
@@ -251,11 +298,12 @@ def build(plan, profiles, records, *, debug, region):
     manifest = {"schema": 1, "identity": plan["identity"], "versions": analysis_logs.av_versions(),
                 "profile": plan["profile"], "parts": count, "stem": plan["stem"],
                 "debug": debug, "region": region, "iso": str(iso), "cue": str(cue),
+                "disc": list(disc) if disc is not None else None,
                 "iso_sha256": digest(iso), "items": items,
                 "trace_pc_start": symbol(directory/"multipart_ip.o", "multipart_trace_begin", 0xFF0000),
                 "trace_pc_end": symbol(directory/"multipart_ip.o", "multipart_trace_end", 0xFF0000),
                 "state_address": STATE}
-    receipt = ROOT/"out"/plan["stem"]/f"multipart{suffix}.json"
+    receipt = ROOT/"out"/plan["stem"]/f"multipart{label}{suffix}.json"
     write_json(receipt, manifest)
     print(f"multipart: verified ISO {iso}\nCUE {cue}\nManifest {receipt}", flush=True)
     return manifest

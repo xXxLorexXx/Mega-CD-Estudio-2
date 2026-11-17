@@ -203,6 +203,7 @@ def parse_header_sector(sector: bytes) -> PlayerConstants:
             f"0x{expected_signature:08X}")
 
     vblank_cadence = bool(features & cavc_routing.FEATURE_VBLANK_CADENCE)
+    exact_pal = bool(features & cavc_routing.FEATURE_PAL_CD_CLOCK)
     known_features = (
         cavc_routing.FEATURE_COLD_RUNS
         | cavc_routing.FEATURE_VBLANK_CADENCE
@@ -213,11 +214,14 @@ def parse_header_sector(sector: bytes) -> PlayerConstants:
         | cavc_routing.FEATURE_BOOT_VRAM_SIDECAR
         | cavc_routing.FEATURE_WORDBUF_RING
         | cavc_routing.FEATURE_SCROLL
+        | cavc_routing.FEATURE_PAL_CD_CLOCK
     )
     unknown_features = features & ~known_features
     if unknown_features:
         raise ValueError(
             f"HEADER.DAT uses reserved feature bits 0x{unknown_features:04X}")
+    if exact_pal and not (av_config.PAL and vblank_cadence):
+        raise ValueError("The physical PAL CD clock requires a PAL VBlank cadence")
     pattern_supply_enabled = bool(features & cavc_routing.FEATURE_PATTERN_SUPPLY)
     indexed_dicbuf = bool(features & cavc_routing.FEATURE_DICBUF_INDEXED_RUNS)
     scroll_enabled = bool(features & cavc_routing.FEATURE_SCROLL)
@@ -247,7 +251,7 @@ def parse_header_sector(sector: bytes) -> PlayerConstants:
             raise ValueError(
                 f"VBlank-cadence header vsync_n={vsync_n} disagrees with "
                 f"fps={fps_int} (expected {cadence[0]})")
-        sec_steps, sec_mod = av_config.cd_sector_rate_steps(fps_int)
+        sec_steps, sec_mod = av_config.cd_sector_rate_steps(fps_int, exact_pal=exact_pal)
     else:
         cadence = ()
         sec_steps, sec_mod = (75,), fps_int
@@ -427,6 +431,9 @@ def render_include(constants: PlayerConstants) -> str:
         value = getattr(constants, name)
         width = 8 if value > 0xFFFF or name in {"signature", "font_addr"} else 4
         lines.append(f".equ PC_{name.upper()}, 0x{value:0{width}X}")
+    rate = av_config.PAL_CD_SECTORS_PER_VBLANK
+    lines.append(f".equ PAL_CD_STEP, {rate.numerator}")
+    lines.append(f".equ PAL_CD_MOD, {rate.denominator}")
     lines.append("")
     return "\n".join(lines)
 

@@ -9,7 +9,8 @@ import time
 import tkinter as tk
 from tkinter import filedialog, messagebox
 
-from cavc.tools.astra_capacity import CD_BYTES, MAX_PART_FRAMES, estimate
+from cavc.tools.astra_capacity import (CD_BYTES, MAX_PART_FRAMES, discs as disc_count,
+                                       estimate, part_limit, part_memory)
 from megacd_cavc import (
     CavcCancelled,
     cavc_cache_bytes,
@@ -40,10 +41,14 @@ class CavcStudio:
         self.cavc_palette = tk.StringVar(value="MOSAIC-GM")
         self._field(card, "Paletas dinámicas", self.cavc_palette, ["MOSAIC-GM", "STL4"])
         self.cavc_parts = tk.StringVar(value="Automático")
-        self._field(card, "Duración máxima por parte", self.cavc_parts,
-                    ["Automático", "1 min", "2 min", "3 min", "5 min", "10 min"])
+        self._field(card, "Duración de cada capítulo", self.cavc_parts,
+                    ["Automático", "1 min", "2 min", "3 min", "5 min", "10 min", "15 min"])
         self.cavc_parts_tip = self._wrap(card, style="Body.TLabel")
         self.cavc_parts_tip.pack(fill="x", pady=(0, self.px(8)))
+        self.cavc_scene = tk.BooleanVar(value=True)
+        self._check(card, "Cortar los capítulos en un cambio de escena", self.cavc_scene)
+        self.cavc_multi = tk.BooleanVar(value=True)
+        self._check(card, "Dividir en varios CD si la película no cabe", self.cavc_multi)
         self.cavc_parallel = tk.BooleanVar(value=False)
         self._check(card, "Codificar hasta dos partes a la vez", self.cavc_parallel)
         self.cavc_detail = tk.BooleanVar(value=False)
@@ -69,6 +74,7 @@ class CavcStudio:
             self.codec_var, self.cavc_size, self.cavc_fps, self.cavc_fit,
             self.cavc_palette, self.cavc_parts, self.cavc_speed, self.cavc_clip,
             self.cavc_mp4, self.cavc_parallel, self.cavc_detail,
+            self.cavc_scene, self.cavc_multi,
         ))
 
     def _sync_preview_label(self, *_):
@@ -92,11 +98,7 @@ class CavcStudio:
                     fill="x", pady=(0, self.px(8)), before=self.cavc_clip_row)
         self.cavc_card.title_label.configure(text="LORE · vídeo adaptativo" if lore else
                                  "CAVC · vídeo a pantalla completa")
-        nominal = 25 if pal or lore else int(self.cavc_fps.get() or 30)
-        minutes, seconds = divmod(MAX_PART_FRAMES // nominal, 60)
-        self.cavc_parts_tip.configure(
-            text=f"Límite habitual: {minutes}:{seconds:02d} por parte a {nominal} FPS. "
-                 "Las partes se reproducen en orden dentro del mismo CD.")
+        self._update_parts_tip()
         if lore:
             self.cavc_fps_control.configure(values=("15–25 (PAL)",), state="disabled",
                                            textvariable="")
@@ -115,6 +117,27 @@ class CavcStudio:
             if pal else "NTSC · 15, 24 o 30 FPS · audio ADPCM mono a 22,05 kHz."
         ))
 
+    def _chapter_minutes(self):
+        text = self.cavc_parts.get().split()[0]
+        return int(text) if text.isdigit() else 0
+
+    def _update_parts_tip(self):
+        if not hasattr(self, "cavc_parts_tip"):
+            return
+        pal = self._get_selected_region() == "E"
+        nominal = 25 if pal or self._uses_lore() else int(self.cavc_fps.get() or 30)
+        minutes = self._chapter_minutes()
+        frames = part_limit(nominal, minutes)
+        shown, rest = divmod(frames // nominal, 60)
+        text = (f"Capítulos de hasta {shown}:{rest:02d} a {nominal} FPS. Entre capítulo y capítulo "
+                "el Mega CD se detiene unos 4 s en negro para cargar el siguiente.")
+        if frames > MAX_PART_FRAMES:
+            need = part_memory(frames) / 1024**3
+            text += (f" Cada capítulo necesita unos {need:.0f} GB de memoria al codificar; "
+                     "si WSL no tiene tanta, el programa acortará los capítulos al máximo "
+                     "que quepa y lo indicará al empezar.")
+        self.cavc_parts_tip.configure(text=text)
+
     def _uses_cavc(self):
         return hasattr(self, "codec_var") and self.codec_var.get() in ("CAVC", "LORE")
 
@@ -127,8 +150,8 @@ class CavcStudio:
         self.tree.heading("chapters", text="Partes")
         lore = self._uses_lore()
         fps = 25 if lore else int(self.cavc_fps.get() or 30)
-        part_text = self.cavc_parts.get().split()[0]
-        part_min = int(part_text) if part_text.isdigit() else 0
+        part_min = self._chapter_minutes()
+        self._update_parts_tip()
         total_duration = sum(video["duration"] for video in self.videos)
         total_parts, total_bytes = estimate(total_duration, fps, part_min, self.cavc_mp4.get())
         total_mb = total_bytes / 1024**2 if self.videos else 0.0
@@ -148,7 +171,10 @@ class CavcStudio:
         rate = "15–25" if lore else self.cavc_fps.get()
         profile = "Movimiento adaptativo" if lore else self.cavc_speed.get()
         pct = (total_bytes / CD_BYTES) * 100.0 if self.videos else 0.0
-        over = " · EXCEDE 1 CD" if pct > 100 else ""
+        over = ""
+        if pct > 100:
+            over = (f" · {disc_count(total_bytes)} CD" if self.cavc_multi.get()
+                    else " · EXCEDE 1 CD")
         self.cap_label.configure(text=(
             f"{codec} · {self.cavc_size.get()} · {rate} FPS · est. {total_mb:.1f} / {CD_BYTES/1024**2:.1f} MiB ({pct:.1f}%) · {total_parts if self.videos else 0} parte(s){over}"))
         self.picture_summary.set(
@@ -258,15 +284,22 @@ class CavcStudio:
         if preview:
             output = str(Path(tempfile.gettempdir()) / f"MegaCdEstudio_{codec}")
         fps = 25 if lore else int(self.cavc_fps.get())
-        part_text = self.cavc_parts.get().split()[0]
-        part_minutes = int(part_text) if part_text.isdigit() and not preview else 0
+        part_minutes = self._chapter_minutes() if not preview else 0
+        multi_disc = not preview and self.cavc_multi.get()
         if not preview:
             _, est_bytes = estimate(seconds, fps, part_minutes, self.cavc_mp4.get())
-            if est_bytes > CD_BYTES:
+            if est_bytes > CD_BYTES and not multi_disc:
                 messagebox.showwarning(
                     f"Excede la capacidad del CD ({codec})",
                     f"La estimación para {seconds/60:.1f} minutos supera un CD de 80 minutos. "
-                    "Divide la película entre varios discos.")
+                    "Activa «Dividir en varios CD si la película no cabe» en Ajustes.")
+                return
+            if est_bytes > CD_BYTES and not messagebox.askyesno(
+                    f"Varios CD ({codec})",
+                    f"La película ({seconds/60:.0f} min) no cabe en un CD. Se crearán unos "
+                    f"{disc_count(est_bytes)} discos, cada uno en su carpeta «Disco N de M». ¿Continuar?"):
+                return
+            if not self._check_free_space(seconds, fps):
                 return
         auto_burn = not preview and self.auto_burn_var.get()
         settings = {
@@ -283,6 +316,8 @@ class CavcStudio:
             "part_minutes": part_minutes,
             "part_workers": 2 if self.cavc_parallel.get() else 1,
             "detail_motion": self.cavc_detail.get(),
+            "scene_split": not preview and self.cavc_scene.get(),
+            "multi_disc": multi_disc,
         }
         self._conversion_cancel_event.clear()
         self.is_converting = self._conversion_running = True
@@ -305,7 +340,13 @@ class CavcStudio:
             if not active or self._conversion_cancel_event.is_set():
                 return
             elapsed = int(time.monotonic() - started)
-            self.status_var.set(f"{job_label} · {stage} · {elapsed // 60}:{elapsed % 60:02d} transcurridos")
+            text = f"{job_label} · {stage} · {elapsed // 60}:{elapsed % 60:02d} transcurridos"
+            done = self.progress_var.get()
+            if 10 <= done < 99 and elapsed > 120:
+                # Linear projection of the percentage reported by the encoder.
+                left = round(elapsed * (100 - done) / done / 60)
+                text += f" · quedan ~{left} min" if left >= 1 else " · menos de 1 min"
+            self.status_var.set(text)
 
         def tick():
             if active:
@@ -347,10 +388,21 @@ class CavcStudio:
             self.fusion_btn.configure(state="normal")
             elapsed = int(time.monotonic() - started)
             display_rate = "15–25 FPS nominales" if lore else f"{result['fps_effective']:.2f} FPS"
-            self.status_var.set(f"{codec} listo · {result['parts']} parte(s) · {display_rate} · "
+            discs = result.get("discs") or []
+            disc_text = f" · {len(discs)} CD" if len(discs) > 1 else ""
+            self.status_var.set(f"{codec} listo · {result['parts']} capítulo(s){disc_text} · {display_rate} · "
                                 f"{elapsed // 60}:{elapsed % 60:02d}")
             if preview and result["preview"]:
                 os.startfile(folder / result["preview"])
+            elif len(discs) > 1:
+                lines = "\n".join(f"• {Path(disc['iso']).parent.name}: {disc['parts']} capítulos"
+                                   for disc in discs)
+                messagebox.showinfo(
+                    f"{len(discs)} discos {codec} creados",
+                    f"{folder}\n\n{lines}\n\nGraba el .CUE de cada carpeta en un CD-R distinto. "
+                    "Disco 1 queda seleccionado; usa «Elegir disco…» para los demás.")
+                if auto_burn:
+                    self.start_burn_cd()
             elif auto_burn:
                 self.start_burn_cd()
             else:
@@ -365,6 +417,26 @@ class CavcStudio:
                 self.root.after(0, complete, folder, result)
 
         threading.Thread(target=work, daemon=True).start()
+
+    def _check_free_space(self, seconds, fps):
+        """Warn before a long conversion when the system drive is nearly full."""
+        frames = round(seconds * fps)
+        # Temporary frames of the two parts in flight, the WSL disk image growth
+        # and the finished ISO copies; Windows itself needs headroom as well.
+        need = 12 * 1024**3 + min(frames, 2 * 9000) * 320 * 224 * 6 + int(seconds * 160_000)
+        drive = Path(os.environ.get("SystemDrive", "C:") + "\\")
+        try:
+            free = shutil.disk_usage(drive).free
+        except OSError:
+            return True
+        if free >= need:
+            return True
+        return messagebox.askyesno(
+            "Poco espacio libre",
+            f"Quedan {free / 1024**3:.1f} GB libres en {drive} y la conversión puede necesitar "
+            f"unos {need / 1024**3:.0f} GB (fotogramas temporales de WSL e imágenes ISO).\n\n"
+            "Si se llena el disco, la conversión fallará y Windows puede ir lento. "
+            "Libera espacio antes de continuar.\n\n¿Convertir de todos modos?")
 
     def _launch_disc_in_ares(self):
         path = self.last_cue_path or self.last_iso_path

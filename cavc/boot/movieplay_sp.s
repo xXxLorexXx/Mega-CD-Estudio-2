@@ -15,6 +15,7 @@
 .equ CDBIOS,      0x00005F22
 .equ CDB_STAT,    0x00005E80
 .equ BIOS_DRV_INIT, 0x0010
+.equ BIOS_CDB_CHK,  0x0080
 .equ BIOS_CDB_STAT, 0x0081
 .equ BIOS_CDC_STOP, 0x0089
 .equ BIOS_CDC_STAT, 0x008A
@@ -149,6 +150,16 @@
 /* The 68000 absolute-word form sign-extends 0x800C to the same 24-bit bus
    address and saves two bytes in the DEBUG diagnostic image. */
 .equ GA_STOPWATCH_ABS_W,GA_STOPWATCH-0x01000000
+.equ MEMMODE_ABS_W,     MEMMODE-0x01000000
+.equ MEMMODE_B_ABS_W,   MEMMODE+1-0x01000000
+.equ COMCMD0_ABS_W,     COMCMD0-0x01000000
+.equ COMCMD1_ABS_W,     COMCMD1-0x01000000
+.equ COMSTAT0_ABS_W,    COMSTAT0-0x01000000
+.equ COMSTAT1_ABS_W,    COMSTAT1-0x01000000
+.equ COMSTAT2_ABS_W,    COMSTAT2-0x01000000
+.equ SUB_GA_IEN_ABS_W,  SUB_GA_BASE+0x0033-0x01000000
+.equ SUB_GA_HOCK_ABS_W, SUB_GA_BASE+0x0037-0x01000000
+.equ CDC_MODE_ABS_W,    SUB_GA_BASE+0x0004-0x01000000
 
 .equ SUB_BANK_1M, 0x000C0000
 .equ MAIN_WORD_DELTA, 0x00140000 /* Main 0x200000 view minus Sub 0x0C0000 */
@@ -296,6 +307,10 @@
 .equ APPLY_END,   APPLY_BASE+APPLY_SIZE   /* 0x7F800 */
 .equ ROUTING_TMP, 0x0007B000        /* boot限定。最大frame0 staging直後の未使用APPLY 16KB */
 .equ ROUTING_TMP_BYTES, 16384
+.equ BOOT_PRG_SECTOR, ROUTING_TMP+ROUTING_TMP_BYTES
+.if BOOT_PRG_SECTOR+2336 > SP_STACK-0x500
+.error "BIOS startup sector buffer overlaps the Sub stack reserve"
+.endif
 .if RING_END != WORD_PENDING3
 .error "fourth pending Word sector must begin at the physical PrgBuf end"
 .endif
@@ -413,10 +428,18 @@
 .equ STAT_BOOT_STAGE, 0x8001		/* sidecar/Dic stage ready for one-time Main copy */
 .equ STAT_READY, 0x8003
 .equ STAT_END,   0x8004			/* 全フレーム再生完了(MDは15秒待って CMD_STREAM 再送) */
+.equ BOOT_READ_HEADER,  0xBA41
+.equ BOOT_READ_PRELOAD, 0xBA42
+.equ BOOT_READ_FRAME0,  0xBA43
+.equ BOOT_READ_FRAME1,  0xBA44
 
 .macro BIOSCALL code
 	move.w	#\code, d0
 	jsr	CDBIOS
+.endm
+
+.macro BOOT_PHASE stage
+	move.w	#(0xB500+\stage), (COMSTAT2_ABS_W).w
 .endm
 
 .text
@@ -441,61 +464,92 @@ sp_jmptbl:
 .global sp_init
 sp_init:
 	move.w	#0x2700, sr
-	andi.w	#0xFFFA, (MEMMODE).l
 .ifndef MULTIPART
-	move.w	#0, (COMSTAT0).l
+	andi.w	#0xFFFA, (MEMMODE_ABS_W).w
+	move.w	#0, (COMSTAT0_ABS_W).w
 .endif
-	move.w	#0, (COMSTAT1).l
+	move.w	#0, (COMSTAT1_ABS_W).w
+	BOOT_PHASE 1
 	rts
 
 .ifdef MULTIPART
 .global multipart_player_entry
 multipart_player_entry:
 	bsr.s	sp_init
-	bra.w	sp_main
+	/* Fall through to sp_main. A short branch to the next instruction
+	   has displacement zero, the encoding for a word extension. */
 .endif
 
 .global sp_main
 sp_main:
 command_loop:
-	tst.w	(COMCMD0).l
-	bne	1f
-	bra	command_loop
+	tst.w	(COMCMD0_ABS_W).w
+	bne.s	1f
+	bra.s	command_loop
 1:
-	cmp.w	#CMD_STREAM, (COMCMD0).l
-	beq	do_stream
-	move.w	(COMCMD0).l, (COMSTAT0).l
+	cmp.w	#CMD_STREAM, (COMCMD0_ABS_W).w
+	beq.s	do_stream
+	move.w	(COMCMD0_ABS_W).w, (COMSTAT0_ABS_W).w
 2:
-	tst.w	(COMCMD0).l
-	bne	2b
-	move.w	#0, (COMSTAT0).l
-	bra	sp_main
+	tst.w	(COMCMD0_ABS_W).w
+	bne.s	2b
+	move.w	#0, (COMSTAT0_ABS_W).w
+	bra.s	sp_main
 
 do_stream:
 	movea.l	#SP_STACK, sp
-	move.w	#CMD_STREAM, (COMSTAT0).l
+	move.w	#CMD_STREAM, (COMSTAT0_ABS_W).w
+	clr.w	pcm_running			/* stopped before any untimed boot read */
 	/* BIOSのCDCセクタ管理は割り込み駆動。IENを立てsrを下げないと、連続読みで
 	   ポーリングの隙間にセクタが化け/欠ける(実証: XOR不一致)。元プレイヤと同じ設定。 */
-	ori.b	#0x04, (SUB_GA_BASE+0x37).l	/* HOCK: enable CDD communication */
-	ori.b	#0x3C, (SUB_GA_BASE+0x33).l	/* IEN: enable INT2-5 (timer/CDD/CDC) */
+	ori.b	#0x04, (SUB_GA_HOCK_ABS_W).w	/* HOCK: enable CDD communication */
+	ori.b	#0x3C, (SUB_GA_IEN_ABS_W).w	/* IEN: enable INT2-5 (timer/CDD/CDC) */
 	move.w	#0x2000, sr			/* enable ints BEFORE the BIOS calls */
-.ifndef MULTIPART
-	andi.b	#0xFA, (MEMMODE+1).l
-.endif
+.ifdef MULTIPART
+	/* The loader already owns a settled 1M bank. Preserve its bank mapping
+	   across the resident program replacement. */
+	BOOT_PHASE 2
+	btst	#2, (MEMMODE_B_ABS_W).w
+	bne.s	1f
+	move.w	#0xB502, (COMSTAT1_ABS_W).w
+	bra	bad_header
+1:
+	/* Real-hardware fix (Mega-CD 2 PAL): the resident player waits for
+	   CMD_STREAM with every Sub interrupt masked (sp_init), so the BIOS
+	   CDD exchange can stall on a physical drive. Main runs with its own
+	   interrupts disabled and never raised the Sub INT2 whose BIOS handler
+	   restarts a stalled exchange, so ROM_READN was never served: the
+	   startup counter stayed at 0000 and the read failed with BA42 after
+	   4 x 3.5 s. Emulators latch the missed CDD interrupt and hide this.
+	   Re-initialize the drive here exactly as the single-part player and
+	   the original multipart player do. Word RAM and the loader's SP-GAP
+	   extents are not touched by DRV_INIT. */
 	lea	drv_init_tracklist, a0
 	BIOSCALL BIOS_DRV_INIT
-1:
+2:
+	BIOSCALL BIOS_CDB_CHK
+	bcs.s	2b
+3:
 	BIOSCALL BIOS_CDB_STAT
 	andi.b	#0xF0, (CDB_STAT).w
-	bne	1b
-.ifdef MULTIPART
-	/* Qualified SP-GAP: saved HEADER/BODY extents, after BIOS init. */
+	bne.s	3b
+	/* Qualified SP-GAP: saved HEADER/BODY extents, after bootstrap BIOS init. */
 	lea	0x00007F30.w, a0
 	move.l	(a0)+, header_lba
 	move.l	(a0)+, header_total
 	move.l	(a0)+, body_lba
 	move.l	(a0)+, body_total
 .else
+	andi.b	#0xFA, (MEMMODE_B_ABS_W).w
+	lea	drv_init_tracklist, a0
+	BIOSCALL BIOS_DRV_INIT
+0:
+	BIOSCALL BIOS_CDB_CHK
+	bcs.s	0b
+1:
+	BIOSCALL BIOS_CDB_STAT
+	andi.b	#0xF0, (CDB_STAT).w
+	bne.s	1b
 	bsr	init_iso9660
 	lea	file_header, a0
 	bsr	find_file		/* d0=LBA, d1=sector count */
@@ -505,15 +559,16 @@ do_stream:
 	bsr	find_file
 	move.l	d0, body_lba
 	move.l	d1, body_total
+	bset	#2, (MEMMODE_B_ABS_W).w
+	bsr	swap_settle
 .endif
-	bset	#2, (MEMMODE+1).l
 stream_start:
 	/* Every replay reloads the immutable startup file, builds frame 0 while the
 	   timed reader is idle, then starts BODY.DAT from its own ISO extent. */
 	clr.w	slip_count
 	clr.l	desync_count			/* desync_count + adjacent resync_count */
-	clr.w	(COMSTAT1).l
-	clr.w	(COMSTAT2).l
+	clr.w	(COMSTAT1_ABS_W).w
+	BOOT_PHASE 3
 	clr.l	drain_frame
 .ifdef INCLUDE_WORDBUF_RING
 	clr.w	word_pending_count
@@ -524,9 +579,14 @@ stream_start:
 .endif
 	move.b	#0xFF, (PCM_ONOFF).l		/* extension initializes the channel after HEADER load */
 	clr.w	pcm_running
+	move.w	#BOOT_READ_HEADER, boot_read_error
 .ifdef INCLUDE_AUDIO_FD_DITHER
 	clr.w	audio_fd_phase
 .endif
+.ifdef MULTIPART
+	/* The loader fetched the header and boot stage with the resident module. */
+	lea	MULTIPART_MEDIA_PREFIX, a0
+.else
 	move.l	header_lba, d0
 	move.l	header_total, d1
 	bsr	issue_file_readn		/* complete startup file */
@@ -534,13 +594,14 @@ stream_start:
 	moveq	#HEADER_SECTORS, d0
 	lea	PAD_SCR, a0
 	bsr	drain_lin
+.endif
 	/* ヘッダ解析(>4sHHHHHHHH + >LLLL + mode@36)。焼き込み定数を廃し実行時に読む */
 .ifdef PLAYER_SPECIALIZED
 	/* The generated constants came from contract bytes 4..61; magic bytes 0..3
 	   are identifying data only. A different
 	   profile has a different signature at offset 192 and must stop before any
 	   immediate geometry/timing value can reach the hot path. */
-	cmpi.l	#PC_SIGNATURE, (PAD_SCR+192).l
+	cmpi.l	#PC_SIGNATURE, 192(a0)
 	beq.s	1f
 	move.w	#0xBAD1, (COMSTAT1).l
 	bra	bad_header
@@ -551,7 +612,6 @@ stream_start:
 .endif
 	clr.w	lead
 .else
-	lea	PAD_SCR, a0
 	moveq	#0, d1
 	move.b	37(a0), d1
 	swap	d1
@@ -652,6 +712,12 @@ pm_set:
 	cmpi.l	#50, d4
 	bne	bad_header
 	move.w	d3, d1
+	btst	#3, h_features			/* feature 0x0800: physical PAL CD clock */
+	beq.s	7f
+	mulu.w	#PAL_CD_STEP, d1
+	move.w	#PAL_CD_MOD, d2
+	bra.s	2f
+7:
 	mulu.w	#3, d1
 	moveq	#2, d2
 	bra.s	2f
@@ -699,7 +765,7 @@ pm_set:
 .endif
 	bra.s	header_accepted
 bad_header:
-	bra	bad_header
+	bra.s	bad_header
 header_accepted:
 	/* MDへヘッダ写しを渡す(frame0と同じバンクに書く=swap後にMDが読める) */
 	lea	(O_HDR).l, a1
@@ -710,6 +776,17 @@ header_accepted:
 	/* The boot stage and DicBuf are handed to Main before frame 0 exists. Main
 	   copies them to their persistent Main-RAM/VRAM homes and returns this bank,
 	   allowing the same front-of-bank bytes to become O_LOADS and WordBuf. */
+.ifdef MULTIPART
+	lea	MULTIPART_MEDIA_PREFIX+2048, a0
+	lea	O_PALTAB_STAGE, a1
+	moveq	#PC_PALTAB_SEC, d0
+	bsr	copy_boot_sectors
+.if PC_DIC_SECTORS > 0
+	lea	DIC_STAGE, a1
+	moveq	#PC_DIC_SECTORS, d0
+	bsr	copy_boot_sectors
+.endif
+.else
 	.ifdef PLAYER_SPECIALIZED
 	moveq	#PC_PALTAB_SEC, d0
 	.else
@@ -726,19 +803,24 @@ header_accepted:
 	bsr	drain_lin_staged
 .endif
 .endif
+.endif
 	/* This handoff is an intentional HEADER read boundary. Stop the finite
 	   boot read before Main owns the bank; no arriving sector is allowed to
 	   turn the copy interval into an unexpected slip. */
+	BOOT_PHASE 4
+.ifndef MULTIPART
 	BIOSCALL BIOS_CDC_STOP
-	bchg	#0, (MEMMODE+1).l
+.endif
+	bchg	#0, (MEMMODE_B_ABS_W).w
 	bsr	swap_settle
-	move.w	#STAT_BOOT_STAGE, (COMSTAT0).l
+	move.w	#STAT_BOOT_STAGE, (COMSTAT0_ABS_W).w
 1:
-	tst.w	(COMCMD1).l
+	tst.w	(COMCMD1_ABS_W).w
 	beq.s	1b
-	bchg	#0, (MEMMODE+1).l
+	BOOT_PHASE 5
+	bchg	#0, (MEMMODE_B_ABS_W).w
 	bsr	swap_settle
-	clr.w	(COMSTAT0).l
+	clr.w	(COMSTAT0_ABS_W).w
 	/* Restart at the first unread HEADER sector. reseek_readn deliberately
 	   preserves the original file anchor used by exact MSF recovery. */
 	.ifdef PLAYER_SPECIALIZED
@@ -747,9 +829,19 @@ header_accepted:
 	moveq	#HEADER_SECTORS, d0
 	add.w	h_paltab_sec, d0
 	.endif
+	move.w	#BOOT_READ_PRELOAD, boot_read_error
+	BOOT_PHASE 6
+.ifdef MULTIPART
+	move.l	header_total, d1
+	sub.l	d0, d1
+	ble	bad_header
+	add.l	header_lba, d0
+	bsr	issue_file_readn
+.else
 	add.l	header_lba, d0
 	move.l	stream_remaining, d1
 	bsr	reseek_readn
+.endif
 
 	/* The five-sector image holds the unchanged 8,800-byte ADPCM tables,
 	   followed by the checked boot extension in existing sector padding.
@@ -779,14 +871,14 @@ header_accepted:
 	lea	WORD_BUF0, a0
 	bsr	drain_lin_staged
 .endif
-	bchg	#0, (MEMMODE+1).l
+	bchg	#0, (MEMMODE_B_ABS_W).w
 	bsr	swap_settle
 .if PC_WR1_SECTORS > 0
 	moveq	#PC_WR1_SECTORS, d0
 	lea	WORD_BUF1, a0
 	bsr	drain_lin_staged
 .endif
-	bchg	#0, (MEMMODE+1).l
+	bchg	#0, (MEMMODE_B_ABS_W).w
 	bsr	swap_settle
 .endif
 	/* WordBuf boot contents are the first ring turn. The timed writer starts
@@ -836,9 +928,10 @@ pb_lp:
 	lea	0x800(a0), a0
 	move.l	a0, ring_tail
 	subq.w	#1, d7
-	move.w	d7, (COMSTAT1).l		/* boot UI: remaining PrgBuf preload sectors */
+	move.w	d7, (COMSTAT1_ABS_W).w		/* boot UI: remaining PrgBuf preload sectors */
 	bne	pb_lp
 pb_done:
+	BIOSCALL BIOS_CDC_STOP
 	/* Clearing all 64 KiB of wave RAM is intentionally outside the finite
 	   HEADER read. Running this extension while sectors are still arriving
 	   leaves a long unpumped interval and can lose the next sector. The staged
@@ -891,6 +984,8 @@ pb_done:
 	cmp.l	d1, d0
 	blo	bad_header
 	move.l	body_lba, d0
+	move.w	#BOOT_READ_FRAME0, boot_read_error
+	BOOT_PHASE 7
 	bsr	issue_file_readn
 
 	/* The first arm region contains one decoded PCM chunk per sector. Live
@@ -937,6 +1032,7 @@ frame0_handoff:
 	/* One CMD_STREAM command spans startup. Hand frame 0 to Main with the
 	   suffix still stopped; Main shows frame=FFFF, builds and flips frame=0000, then
 	   clears CMD_STREAM to launch the first timed BODY read. */
+	BOOT_PHASE 8
 	bchg	#0, (MEMMODE+1).l
 	bsr	swap_settle
 .ifdef INCLUDE_WORDBUF_RING
@@ -948,6 +1044,8 @@ frame0_ready_wait:
 	bne.s	frame0_ready_wait
 
 timed_suffix_start:
+	move.w	#BOOT_READ_FRAME1, boot_read_error
+	BOOT_PHASE 9
 	/* The frame-0 flip has happened. Start the one continuous timed read now.
 	   ROM_READN has a startup interval before its first 75 Hz sector. Keep PCM
 	   stopped through that interval, then start it immediately after the first
@@ -998,6 +1096,7 @@ startup_ready:
 	   PCM has already run through the slot remainder, so frame 1 reaches the
 	   next VBlank at the ordinary source-audio position instead of inheriting
 	   ROM_READN's startup delay. */
+	clr.w	(COMSTAT2_ABS_W).w
 	move.w	#0, (COMSTAT0).l
 .equ ISO_HOLD_F0, 0			/* ISO診断: frame0 表示直後に静止(frame0単体の健全性確認) */
 .if ISO_HOLD_F0
@@ -1205,23 +1304,24 @@ xor_acc:
    CMD_STREAM(再開)を待って stream_start へ(=15秒待ちはMD側が数える) */
 movie_end:
 1:
-	cmp.w	#CMD_SWAP, (COMCMD0).l
-	bne	1b
-	bchg	#0, (MEMMODE+1).l
+	cmp.w	#CMD_SWAP, (COMCMD0_ABS_W).w
+	bne.s	1b
+	bchg	#0, (MEMMODE_B_ABS_W).w
 	bsr	swap_settle
-	move.w	#STAT_END, (COMSTAT0).l
+	move.w	#STAT_END, (COMSTAT0_ABS_W).w
 2:
-	tst.w	(COMCMD0).l
-	bne	2b
-	move.w	#0, (COMSTAT0).l
+	tst.w	(COMCMD0_ABS_W).w
+	bne.s	2b
+	move.w	#0, (COMSTAT0_ABS_W).w
 	move.b	#0xFF, (PCM_ONOFF).l		/* 全chオフ(静音) */
 .ifdef MULTIPART
+	BIOSCALL BIOS_CDC_STOP
 	/* The PRG return stub survives replacement of both player images. */
-	jmp	0x0000D680.l
+	jmp	0x0000D640.l
 .endif
 3:
-	cmp.w	#CMD_STREAM, (COMCMD0).l	/* MDの再開指示を待つ */
-	bne	3b
+	cmp.w	#CMD_STREAM, (COMCMD0_ABS_W).w	/* MDの再開指示を待つ */
+	bne.s	3b
 	bra	stream_start
 
 /* Start one finite ISO file read. d0=absolute LBA, d1=sector count.
@@ -1241,21 +1341,7 @@ issue_file_readn:
 	move.l	d0, (a5)
 	move.l	d1, 4(a5)
 	move.l	#SUB_BANK_1M, 8(a5)
-	movea.l	a5, a0
-	BIOSCALL BIOS_CDC_STOP
-.ifdef MULTIPART
-	/* Let STOP retire the preceding CDC request before READN re-arms it.
-	   This finite-file boundary is outside timed delivery, with PCM stopped. */
-	move.w	(GA_STOPWATCH_ABS_W).w, d2
-1:
-	move.w	(GA_STOPWATCH_ABS_W).w, d3
-	sub.w	d2, d3
-	andi.w	#0x0FFF, d3
-	cmpi.w	#3256, d3
-	blo.s	1b
-.endif
-	movea.l	a5, a0
-	BIOSCALL BIOS_ROM_READN
+	bsr.s	cdc_stop_and_readn
 	move.l	read_total, stream_remaining
 	rts
 
@@ -1264,62 +1350,119 @@ issue_file_readn:
    ストリームを厳密に継続する(=品質無劣化の回復)。 */
 reseek_readn:
 	movem.l	d0-d7/a0-a6, -(sp)
+	move.l	d1, stream_remaining
+	bra.s	reseek_packet
+
+/* Retry the stopped reader with a run-in. Keep the packet end unchanged
+   and keep the logical cursor on the exact sector the caller needs. */
+reseek_boot:
+	movem.l	d0-d7/a0-a6, -(sp)
+	move.l	d1, stream_remaining
+	moveq	#16, d2
+	tst.w	boot_read_retries
+	beq.s	1f
+	moveq	#8, d2
+1:
+	cmp.l	d2, d0
+	blo.s	reseek_packet
+	sub.l	d2, d0
+	add.l	d2, d1
+reseek_packet:
 	lea	bios_packet, a5
 	move.l	d0, (a5)
 	move.l	d1, 4(a5)
 	move.l	#SUB_BANK_1M, 8(a5)
+	bsr.s	cdc_stop_and_readn
+	movem.l	(sp)+, d0-d7/a0-a6
+	rts
+
+cdc_stop_and_readn:
 	movea.l	a5, a0
 	BIOSCALL BIOS_CDC_STOP
+	tst.w	pcm_running
+	bne.s	2f
+	/* Match the loader: settle STOP, issue the finite read, then wait until
+	   the BIOS accepts the request. Keep the loader's CDC destination. */
+	move.w	(GA_STOPWATCH_ABS_W).w, d2
+1:
+	move.w	(GA_STOPWATCH_ABS_W).w, d3
+	sub.w	d2, d3
+	andi.w	#0x0FFF, d3
+	cmpi.w	#3256, d3
+	blo.s	1b
+2:
+	movea.l	a5, a0
 	BIOSCALL BIOS_ROM_READN
-	move.l	d1, stream_remaining
-	movem.l	(sp)+, d0-d7/a0-a6
+	tst.w	pcm_running
+	bne.s	4f
+	move.w	(GA_STOPWATCH_ABS_W).w, d4
+	moveq	#0, d5
+3:
+	BIOSCALL BIOS_CDB_CHK
+	bcc.s	4f
+	bsr	boot_read_tick
+	blo.s	3b
+	bra	boot_read_failed
+4:
 	rts
 
 /* 1セクタを (a0) へ CDC_TRN。連続読みをドレイン。宛先a0はBIOS呼びで壊れるので保存・再ロード。 */
 drain1:
 	move.l	a0, dr_dest
-	lea	bios_packet, a5
+.ifdef MULTIPART
+	/* Replicate the loader's Program-RAM transfer for untimed startup.
+	   The first timed slot already uses APPLY and the normal Word-RAM path. */
+	move.l	a0, dr_transfer
+	tst.w	pcm_running
+	bne.s	1f
+	cmpi.w	#BOOT_READ_FRAME1, boot_read_error
+	beq.s	1f
+	move.l	#BOOT_PRG_SECTOR, dr_transfer
 1:
+.endif
+	move.w	#3, boot_read_retries
+drain1_retry:
+	lea	bios_packet, a5
+	move.w	(GA_STOPWATCH_ABS_W).w, d4
+	moveq	#0, d5
+drain1_poll:
 	BIOSCALL BIOS_CDC_STAT
-	bcs	1b
+	bcc.s	2f
+	bsr	boot_read_tick
+	bhs	read_next_again
+	bra.s	drain1_poll
 2:
+	/* Sega BIOS resets or uses DMA modes in CDCMODE; force Sub-CPU Read (DD=3)
+	   before every CDC_READ just like Sega's own BIOS loader. */
+	move.b	#3, (CDC_MODE_ABS_W).w
 	BIOSCALL BIOS_CDC_READ
-	bcc	2b
-	move.w	#20000, d6			/* TRN有限リトライ(固着防止)。重フレームのバス競合で
-						   2000では尽きてセクタ滑り→desyncしていた。転送は本来数回で
-						   成功するので、上限を大きくしても正常時のコストは増えない。 */
-3:
+	bcc.s	1f				/* C=0: sector popped and DTTRG armed */
+	bsr	boot_read_tick
+	bhs	read_next_again
+	bra.s	drain1_poll
+1:
+.ifdef MULTIPART
+	movea.l	dr_transfer, a0
+.else
 	movea.l	dr_dest, a0			/* CDC_TRN直前に宛先を再ロード */
+.endif
 	lea	12(a5), a1
 	BIOSCALL BIOS_CDC_TRN
-	bcs	4f
-	subq.w	#1, d6
-	bne	3b
+	bcc.s	4f				/* C=0: sector + 4B header transferred */
+	/* C=1 means DSR/EDT timed out and BIOS_CDC_TRN aborted LC8951 IFCTRL (0x38/0x3A);
+	   acknowledge and reseek/recover rather than looping CDC_TRN without CDC_READ. */
 .ifdef DEBUG_SUB_POLL_GAP
 	addq.b	#1, (slip_count+1).w		/* total S only; do not carry into K */
 .else
 	addq.w	#1, slip_count			/* 回復: このセクタは失われた */
 .endif
 	BIOSCALL BIOS_CDC_ACK
-	movea.l	dr_dest, a0
-	bra	drain1
+	bra.s	read_next_again
 4:
 	BIOSCALL BIOS_CDC_ACK
 	subq.l	#1, stream_remaining
 	/* 滑り検出: セクタヘッダ(BCD分秒フレーム)の連番検査。飛び=slip_count++ */
-	lea	bios_packet+12, a0
-	moveq	#0, d1
-	move.b	(a0)+, d0
-	bsr	bcd2bin
-	move.w	d0, d1
-	mulu	#60, d1
-	move.b	(a0)+, d0
-	bsr	bcd2bin
-	add.w	d0, d1
-	mulu	#75, d1
-	move.b	(a0)+, d0
-	bsr	bcd2bin
-	add.l	d0, d1
+	bsr	msf_to_abs_frame
 	move.l	prev_msf, d2
 	bne	d1_check
 	move.l	d1, base_msf			/* 初回セクタ: ファイル先頭MSFを基準に記録 */
@@ -1328,17 +1471,16 @@ d1_check:
 	addq.l	#1, d2				/* 期待 = prev_msf+1 */
 	cmp.l	d1, d2
 	beq	d1_ok				/* 連番=OK */
-	/* Before the requested first sector, CDC can still return an older read's
-	   buffered sector. It consumes no sector of this file: discard it without
-	   reseeking or charging a timed delivery loss. An ahead-of-start sector or
-	   a gap after the first accepted sector still takes normal slip recovery. */
-	cmp.l	base_msf, d2
-	bne.s	d1_gap
+	/* Before a requested or reseeked sector, CDC can still return an older
+	   buffered or pre-seek lead-in sector (d1 < d2). It consumes no sector of
+	   this file: discard it without reseeking or charging a timed delivery
+	   loss. An ahead-of-expected sector takes normal slip recovery. */
 	cmp.l	d2, d1
 	bhs.s	d1_gap
 	addq.l	#1, stream_remaining
-	movea.l	dr_dest, a0
-	bra	drain1
+	bsr	boot_read_tick
+	bhs.s	read_next_again
+	bra	drain1_poll
 d1_gap:
 	/* MSFギャップ=滑り: 失われたセクタ(prev_msf+1=d2)へ再シークして読み直す(厳密回復)。
 	   apply は total_len 前置きの可変長ストリームで、payloadだけ「穴」を空けても control が
@@ -1356,16 +1498,74 @@ d1_gap:
 .else
 	addq.w	#1, slip_count
 .endif
-	move.l	d2, d0
-	sub.l	base_msf, d0			/* ファイル相対セクタ */
+read_next_again:
+	tst.w	pcm_running
+	bne.s	1f
+	subq.w	#1, boot_read_retries
+	bmi.s	boot_read_failed
+1:
+	move.l	prev_msf, d0
+	addq.l	#1, d0
+	sub.l	base_msf, d0
 	move.l	read_total, d1
-	sub.l	d0, d1				/* 残セクタ数 */
-	add.l	read_lba, d0			/* absolute LBA */
+	sub.l	d0, d1
+	add.l	read_lba, d0
+	tst.w	pcm_running
+	beq.s	2f
 	bsr	reseek_readn
-	movea.l	dr_dest, a0			/* drain1再入用に宛先を復元 */
-	bra	drain1				/* 再読み: CDCは今度 d2 を返す→連番に戻る */
+	bra	drain1_retry
+2:
+	bsr	reseek_boot
+	bra	drain1_retry
 d1_ok:
 	move.l	d1, prev_msf
+.ifdef MULTIPART
+	movea.l	dr_transfer, a0
+	cmpa.l	#BOOT_PRG_SECTOR, a0
+	bne.s	1f
+	movea.l	dr_dest, a1
+	bra	copy_sector
+1:
+.endif
+	rts
+
+/* Accumulate the wrapping 12-bit stopwatch on the unavailable-sector path.
+   3.5 seconds per attempt allows full-stroke optical seeks while keeping four
+   attempts (14 s) inside the Main CPU's 15 s NTSC / 18 s PAL wait budget. */
+boot_read_tick:
+	tst.w	pcm_running
+	bne.s	1f
+	moveq	#0, d3
+	move.w	(GA_STOPWATCH_ABS_W).w, d3
+	move.w	d3, d2
+	sub.w	d4, d3
+	andi.w	#0x0FFF, d3
+	move.w	d2, d4
+	add.l	d3, d5
+1:
+	cmpi.l	#113932, d5
+	rts
+
+boot_read_failed:
+	BIOSCALL BIOS_CDC_STOP
+	move.w	boot_read_error, (COMSTAT1_ABS_W).w
+	bra	bad_header
+
+msf_to_abs_frame:
+	lea	12(a5), a0
+	moveq	#0, d0
+	moveq	#0, d1
+	move.b	(a0)+, d0
+	bsr.s	bcd2bin
+	move.w	d0, d1
+	mulu	#60, d1
+	move.b	(a0)+, d0
+	bsr.s	bcd2bin
+	add.w	d0, d1
+	mulu	#75, d1
+	move.b	(a0)+, d0
+	bsr.s	bcd2bin
+	add.l	d0, d1
 	rts
 
 bcd2bin:
@@ -1716,6 +1916,21 @@ copy_sector:
 	movem.l	(a0)+, d1-d7/a2		/* final 32 bytes */
 	movem.l	d1-d7/a2, (a1)
 	rts
+
+.ifdef MULTIPART
+/* d0=sector count, a0=source, a1=destination. Continue a0 across calls. */
+copy_boot_sectors:
+	subq.w	#1, d0
+	bmi.s	2f
+1:
+	movem.l	d0/a1, -(sp)
+	bsr.s	copy_sector
+	movem.l	(sp)+, d0/a1
+	lea	2048(a1), a1
+	dbra	d0, 1b
+2:
+	rts
+.endif
 
 /* ノンブロッキング: CDCにセクタが用意できていて、受け側に余裕があれば1セクタ取り込む。
    MD待ちループから毎回呼ぶ。 */
@@ -2661,36 +2876,53 @@ read_cd:
 	move.l	d0, (a5)
 	move.l	d1, 4(a5)
 	move.l	a0, 8(a5)
-	movea.l	a5, a0
-	BIOSCALL BIOS_CDC_STOP
-	BIOSCALL BIOS_ROM_READN
+	bsr	cdc_stop_and_readn
+	move.w	#75, 16(a5)
 wait_stat:
 	BIOSCALL BIOS_CDC_STAT
 	bcs.s	wait_stat
 wait_read:
+	move.b	#3, (CDC_MODE_ABS_W).w
 	BIOSCALL BIOS_CDC_READ
-	bcc.s	wait_read
+	bcs.s	wait_stat
 wait_transfer:
 	movea.l	8(a5), a0
 	lea	12(a5), a1
 	BIOSCALL BIOS_CDC_TRN
-	bcc.s	wait_transfer
+	bcc.s	read_trn_ok
 	BIOSCALL BIOS_CDC_ACK
+	bra.s	sector_retry
+read_trn_ok:
+	BIOSCALL BIOS_CDC_ACK
+	bsr	msf_to_abs_frame
+	subi.l	#150, d1
+	cmp.l	(a5), d1
+	beq.s	sector_ok
+	blo.s	sector_retry
+	bsr	cdc_stop_and_readn
+sector_retry:
+	subq.w	#1, 16(a5)
+	bne.w	wait_stat
+	move.w	#0xBAD2, (COMSTAT1_ABS_W).w
+sector_err:
+	bra.s	sector_err
+sector_ok:
 	addq.l	#1, (a5)
 	addi.l	#0x0800, 8(a5)
 	subq.l	#1, 4(a5)
-	bne.s	wait_stat
+	bne.w	wait_stat
+	BIOSCALL BIOS_CDC_STOP
 	movem.l	(sp)+, d0-d7/a0-a6
 	rts
 
 init_iso9660:
 	movem.l	d0-d7/a0-a6, -(sp)
-	move.l	#0x10, d0
-	move.l	#2, d1
+	moveq	#0x10, d0
+	moveq	#2, d1
 	lea	ISO_BUF, a0
+	movea.l	a0, a4
 	bsr	read_cd
-	lea	ISO_BUF, a0
-	lea	156(a0), a1
+	lea	156(a4), a1
 	moveq	#0, d0
 	move.b	6(a1), d0
 	lsl.l	#8, d0
@@ -2699,28 +2931,37 @@ init_iso9660:
 	move.b	8(a1), d0
 	lsl.l	#8, d0
 	move.b	9(a1), d0
-	move.l	#0x20, d1
-	lea	ISO_BUF, a0
+	moveq	#0x20, d1
+	movea.l	a4, a0
 	bsr	read_cd
 	movem.l	(sp)+, d0-d7/a0-a6
 	rts
 
 find_file:
-	movem.l	a1-a2/a6, -(sp)
+	movem.l	a1-a3/a6, -(sp)
 	lea	ISO_BUF, a1
+	lea	ISO_BUF+0x10000, a3
 read_filename_start:
 	movea.l	a0, a6
 	move.b	(a6)+, d0
 find_first_char:
+	cmpa.l	a3, a1
+	bhs.s	file_missing
 	movea.l	a1, a2
 	cmp.b	(a1)+, d0
 	bne.s	find_first_char
 check_chars:
 	move.b	(a6)+, d0
 	beq.s	get_info
+	cmpa.l	a3, a1
+	bhs.s	file_missing
 	cmp.b	(a1)+, d0
-	bne	read_filename_start
-	bra	check_chars
+	bne.s	read_filename_start
+	bra.s	check_chars
+file_missing:
+	move.w	#0xBAD3, (COMSTAT1_ABS_W).w
+1:
+	bra.s	1b
 get_info:
 	sub.l	#33, a2
 	moveq	#0, d0
@@ -2743,7 +2984,7 @@ get_info:
 	add.l	#2047, d1
 	moveq	#11, d2
 	lsr.l	d2, d1
-	movem.l	(sp)+, a1-a2/a6
+	movem.l	(sp)+, a1-a3/a6
 	rts
 
 .endif
@@ -3064,6 +3305,10 @@ read_total:
 	.long	0				/* sector count of the active read */
 dr_dest:
 	.long	0
+.ifdef MULTIPART
+dr_transfer:
+	.long	0
+.endif
 prev_msf:
 	.long	0
 base_msf:
@@ -3201,6 +3446,10 @@ word_pending_count:
 .if f0_expand-drain_k != 4
 .error "Sub extension frame-0 flag layout changed"
 .endif
+boot_read_error:
+	.space 2
+boot_read_retries:
+	.space 2
 pcm_running:
 	.word	0				/* 0=play headを読まずboot-time append, 1=live sync */
 desync_count:

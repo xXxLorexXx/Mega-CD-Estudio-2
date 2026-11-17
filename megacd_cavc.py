@@ -177,6 +177,37 @@ def convert_cavc(sources, output, settings, cancel, report):
             msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
 
 
+def disc_folder_name(index, count):
+    return f"Disco {index} de {count}"
+
+
+def _stage_discs(staging, result, discs, codec):
+    """One folder per physical CD, each with its ISO, CUE and own CAVC.json."""
+    count = len(discs)
+    lines = [f"MEGA CD ESTUDIO 14.1 · {codec}: {count} discos",
+             "Graba el archivo .CUE de cada carpeta en un CD-R distinto (ImgBurn, 'Escribir imagen').",
+             "Cada disco reproduce sus capítulos en orden y vuelve a empezar al terminar.", ""]
+    for index, disc in enumerate(discs, 1):
+        folder = staging / disc_folder_name(index, count)
+        folder.mkdir()
+        for name in ("iso", "cue"):
+            source = CAVC_ROOT / disc[name]
+            shutil.copy2(source, folder / source.name)
+            disc[name] = f"{folder.name}/{source.name}"
+        info = {**result, "iso": Path(disc["iso"]).name, "cue": Path(disc["cue"]).name,
+                "disc": [index, count], "parts": disc["parts"], "frames": disc["frames"],
+                "preview": None}
+        (folder / "CAVC.json").write_text(json.dumps(info, indent=2), encoding="utf-8")
+        minutes, seconds = divmod(round(disc["frames"] / max(1, result.get("fps_effective") or 25)), 60)
+        lines.append(f"{folder.name}: {disc['parts']} capítulos · {minutes}:{seconds:02d} · {Path(disc['cue']).name}")
+    if result.get("preview"):
+        source = CAVC_ROOT / result["preview"]
+        shutil.copy2(source, staging / source.name)
+        result["preview"] = source.name
+    result["iso"], result["cue"] = discs[0]["iso"], discs[0]["cue"]
+    (staging / "LEEME_VARIOS_DISCOS.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
 def _run_cavc(job, settings, output, cancel, report):
     codec = settings.get("codec", "CAVC")
     if codec not in ("CAVC", "LORE"):
@@ -249,11 +280,17 @@ def _run_cavc(job, settings, output, cancel, report):
         dest = output / f"CD_{codec}_{settings['region'].upper()}_{datetime.now():%Y%m%d_%H%M%S}_{job.name[-6:]}"
         staging = Path(tempfile.mkdtemp(prefix=".cavc-", dir=output))
         try:
-            for name in ("iso", "cue", "preview"):
-                if result.get(name):
-                    source = CAVC_ROOT / result[name]
-                    shutil.copy2(source, staging / source.name)
-                    result[name] = source.name
+            discs = result.get("discs") or []
+            if len(discs) > 1:
+                _stage_discs(staging, result, discs, codec)
+            else:
+                for name in ("iso", "cue", "preview"):
+                    if result.get(name):
+                        source = CAVC_ROOT / result[name]
+                        shutil.copy2(source, staging / source.name)
+                        result[name] = source.name
+                if discs:
+                    discs[0].update(iso=result["iso"], cue=result["cue"])
             shutil.copy2(log, staging / f"Registro_{codec}.txt")
             (staging / "CAVC.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
             if cancel.is_set():

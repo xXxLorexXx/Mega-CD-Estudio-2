@@ -1857,6 +1857,8 @@ def write_stream(
     features = FEATURE_COLD_RUNS | FEATURE_DICBUF_INDEXED_RUNS
     if av_config.uses_vblank_cadence(FPS):
         features |= FEATURE_VBLANK_CADENCE
+        if av_config.PAL:
+            features |= cavc_routing.FEATURE_PAL_CD_CLOCK
     if supply_plan.enabled:
         features |= FEATURE_PATTERN_SUPPLY
     if any(struct.unpack_from(">H", block, 4)[0] & shadow_updates.LIST_TAG

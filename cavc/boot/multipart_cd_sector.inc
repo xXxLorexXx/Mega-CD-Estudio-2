@@ -39,8 +39,18 @@
 	blo.s	.Lsector_retry\@
 	movea.l	a5, a0
 	BIOSCALL BIOS_CDC_STOP
+	move.w	(0xFFFF800C).w, d2
+.Lsector_wait\@:
+	move.w	(0xFFFF800C).w, d3
+	sub.w	d2, d3
+	andi.w	#0x0FFF, d3
+	cmpi.w	#3256, d3
+	blo.s	.Lsector_wait\@
 	movea.l	a5, a0
 	BIOSCALL BIOS_ROM_READN
+.Lsector_chk\@:
+	BIOSCALL BIOS_CDB_CHK
+	bcs.s	.Lsector_chk\@
 .Lsector_retry\@:
 	subq.w	#1, 16(a5)
 	bne.w	\retry

@@ -38,6 +38,7 @@
 .equ GA_COMSTAT0, 0x00A12020
 .equ GA_COMSTAT1, 0x00A12022
 .equ GA_COMSTAT2, 0x00A12024
+.equ GA_INT2_REQ, 0x00A12000		/* bit 0 (IFL2): raise Sub-CPU INT2 */
 .equ GA_STOPWATCH, 0x00A1200C		/* 12-bit, 30.72 us/tick, Main read-only */
 
 .equ PROBE_BANK, 0x00200000
@@ -1977,7 +1978,8 @@ startup_write_hex:
    still free for boot errors and later desync diagnostics. */
 cmd_wait_startup:
 	move.w	d0, (GA_COMCMD0).l
-	move.w	#0xFFFF, d5			/* last displayed remaining count */
+	move.w	#0xFFFF, d5		/* last displayed remaining count */
+	move.w	#900, d6		/* 15 s NTSC / 18 s PAL without progress */
 1:
 	move.w	(GA_COMSTAT0).l, d0
 	cmp.w	#STAT_BOOT_STAGE, d0
@@ -1985,34 +1987,55 @@ cmd_wait_startup:
 	cmp.w	#STAT_READY, d0
 	beq.s	3f
 	move.w	(GA_COMSTAT1).l, d0
-	tst.w	d0				/* zero is shown only after STAT_READY */
+	tst.w	d0			/* zero is shown only after STAT_READY */
 	beq.s	7f
 	cmp.w	d5, d0
 	beq.s	7f
 	move.w	d0, d5
-	tst.w	d0				/* negative 0xBADx is directly displayable */
+	tst.w	d0			/* negative 0xBADx is directly displayable */
 	bmi.s	5f
 	bsr	startup_update_prg
+	move.w	#900, d6
 	bra.s	7f
 5:
 	bsr	startup_write_hex
+	bra.s	startup_wait_reset
 7:
-	/* The counter is frame-paced: sample Sub once per VBlank instead of
-	   hammering the gate-array registers in an unbounded Main-CPU loop. */
-	bsr	wait_vblank
-	bra	1b
+	bsr	wait_vblank_int2
+	dbra	d6, 1b
+	bra.s	startup_timeout
 6:
 	bsr	consume_boot_stage
 	move.w	#1, (GA_COMCMD1).l
+	move.w	#900, d6
 6:
 	tst.w	(GA_COMSTAT0).l
-	bne.s	6b
+	beq.s	2f
+	bsr	wait_vblank_int2
+	dbra	d6, 6b
+	bra.s	startup_timeout
+2:
 	clr.w	(GA_COMCMD1).l
+	move.w	#900, d6
 	bra	1b
 3:
 	moveq	#0, d0
 	bsr	startup_update_prg
-	rts					/* keep CMD_STREAM asserted through frame-0 flip */
+	rts			/* keep CMD_STREAM asserted through frame-0 flip */
+
+startup_timeout:
+	move.w	(GA_COMSTAT2).l, d0
+	cmpi.w	#0xB501, d0
+	blo.s	1f
+	cmpi.w	#0xB509, d0
+	bls.s	2f
+1:
+	move.w	#0xBAD5, d0
+2:
+	bsr	startup_write_hex
+startup_wait_reset:
+	bsr	wait_vblank
+	bra.s	startup_wait_reset
 .endif
 
 consume_boot_stage:
@@ -2058,9 +2081,32 @@ cmd_wait_ready:
    then prepares frame 1 behind the ordinary CMD_SWAP wait. */
 start_playback:
 	move.w	#0, (GA_COMCMD0).l
+	.ifdef PLAYER_SPECIALIZED
+	move.w	(GA_STOPWATCH).l, d2
+	moveq	#0, d3
+1:
+	tst.w	(GA_COMSTAT0).l
+	beq.s	2f
+	move.w	(GA_COMSTAT1).l, d0
+	bmi	5f
+	move.w	(GA_STOPWATCH).l, d0
+	move.w	d0, d1
+	sub.w	d2, d0
+	move.w	d1, d2
+	andi.l	#0x0FFF, d0
+	add.l	d0, d3
+	cmpi.l	#585938, d3		/* 18 s without delaying the handoff */
+	blo.s	1b
+	bra	startup_timeout
+5:
+	bsr	startup_write_hex
+	bra	startup_wait_reset
+2:
+	.else
 1:
 	tst.w	(GA_COMSTAT0).l
 	bne.s	1b
+	.endif
 	rts
 /* Boot-stage directory at stage+0x0FC0:
      "BVRM", count_A.w, count_B.w, count_C.w
@@ -2188,6 +2234,14 @@ show_frame_minus_one:
 	move.w	#0x8174, (VDP_CTRL).l		/* display on + VInt + DMA + mode 5 */
 	bsr	wait_vblank			/* make FFFF visible in at least one capture field */
 	movem.l	(sp)+, d0-d2
+	rts
+
+/* Startup waits only: request the Sub BIOS level-2 service once per VBlank,
+   as the Main BIOS VINT handler does. That BIOS handler restarts a stalled
+   CDD exchange on a physical drive. The timed playback loop is unchanged. */
+wait_vblank_int2:
+	bsr	wait_vblank
+	bset	#0, (GA_INT2_REQ).l
 	rts
 
 wait_vblank:
